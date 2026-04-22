@@ -98,7 +98,7 @@ def create_app(provider: LLMProvider | None, *, build_provider_fn=None) -> FastA
     app.add_api_route("/api/channels/restart", _api_channels_restart, methods=["POST"])
     app.add_api_route("/api/files/clear", _api_clear_files, methods=["POST"])
     app.add_api_route("/api/files", _api_list_files, methods=["GET"])
-    app.add_websocket_route("/ws/chat", _ws_chat)
+    app.add_api_websocket_route("/ws/chat", _ws_chat)
 
     return app
 

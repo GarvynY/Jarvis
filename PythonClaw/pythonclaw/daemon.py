@@ -112,8 +112,11 @@ def stop_daemon() -> None:
 
     print(f"[PythonClaw] Stopping daemon (PID {pid})...", end=" ", flush=True)
     try:
-        os.kill(pid, signal.SIGTERM)
-    except ProcessLookupError:
+        if sys.platform == "win32":
+            subprocess.call(["taskkill", "/PID", str(pid), "/F"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            os.kill(pid, signal.SIGTERM)
+    except Exception:
         print("already stopped.")
         _cleanup_pid()
         return
@@ -127,8 +130,11 @@ def stop_daemon() -> None:
     if _is_alive(pid):
         print("forcing...", end=" ", flush=True)
         try:
-            os.kill(pid, signal.SIGKILL)
-        except ProcessLookupError:
+            if sys.platform == "win32":
+                subprocess.call(["taskkill", "/PID", str(pid), "/F"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            else:
+                os.kill(pid, signal.SIGKILL)
+        except Exception:
             pass
         time.sleep(0.5)
 
@@ -220,5 +226,5 @@ def _is_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
         return True
-    except (ProcessLookupError, PermissionError):
+    except Exception:
         return False

@@ -88,17 +88,37 @@ When tasked with a daily CNY/AUD analysis:
 4. Give short-term outlook (bullish/bearish/sideways for CNY vs AUD)
 5. Note key risks and events to watch
 
+### 3. Monitor geopolitical news via Google News RSS (free, zero API credits)
+
+```bash
+# Check for new articles using default keywords (US-Iran, AUD drivers)
+python {skill_path}/news_monitor.py
+
+# Custom keywords
+python {skill_path}/news_monitor.py --keywords "Iran Hormuz" "US Iran ceasefire" "RBA rate"
+
+# Dry run (don't mark articles as seen, for use in daily report)
+python {skill_path}/news_monitor.py --no-mark-seen --format json
+```
+
+**Default keywords monitored:**
+- `US Iran ceasefire`, `Iran Hormuz strait`, `Iran nuclear deal`, `Middle East oil disruption`
+- `RBA interest rate decision`, `Australia dollar AUD`, `China Australia trade`
+
+**State file:** `~/.pythonclaw/context/news_monitor_state.json`
+
 ## Notes
 
-- Yahoo Finance ticker for CNY/AUD: `CNYAUD=X` (1 CNY = ? AUD)
-- Forex data may have small delays vs live trading feeds
-- Baseline state persists in `~/.pythonclaw/context/cnyaud_state.json`
-- No API key needed — Yahoo Finance is free
+- Real-time rate source: `open.er-api.com` (free, ~1 min delay, no key needed)
+- Historical data: yfinance `CNYAUD=X` (daily closes, free)
+- News monitoring: Google News RSS (free, no API key, zero Tavily credits)
+- Reserve Tavily (`web_search`) for daily report depth analysis only (~60 credits/month)
 
 ## Resources
 
 | File | Description |
 |------|-------------|
-| `fetch_rate.py` | Fetch current rate + 90-day history with trend stats |
-| `monitor_alert.py` | Check threshold breach vs saved baseline |
-| `jobs.example.yaml` | Sample cron job definitions to copy to `~/.pythonclaw/context/cron/jobs.yaml` |
+| `fetch_rate.py` | Real-time rate (open.er-api.com) + 90-day history (yfinance) |
+| `monitor_alert.py` | Threshold alert vs saved baseline — 0 Tavily credits |
+| `news_monitor.py` | Google News RSS keyword monitor — 0 Tavily credits |
+| `jobs.example.yaml` | Sample cron job definitions |

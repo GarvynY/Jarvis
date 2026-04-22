@@ -88,6 +88,14 @@ class AnthropicProvider(LLMProvider):
                     "content": self._convert_user_content(msg["content"]),
                 })
 
+            elif msg["role"] == "assistant":
+                # New Anthropic SDK requires assistant content to be a list
+                content = msg.get("content") or ""
+                filtered_messages.append({
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": content}] if isinstance(content, str) else content,
+                })
+
             else:
                 filtered_messages.append(msg)
 
@@ -275,23 +283,17 @@ class AnthropicProvider(LLMProvider):
         """Merge consecutive messages with the same role (Anthropic requirement)."""
         if not messages:
             return messages
+        def _to_list(content: str | list) -> list:
+            if isinstance(content, str):
+                return [{"type": "text", "text": content}] if content else []
+            return content or []
+
         merged: list[dict] = [messages[0]]
         for msg in messages[1:]:
             if msg["role"] == merged[-1]["role"]:
-                prev_content = merged[-1].get("content", "")
-                curr_content = msg.get("content", "")
-                if isinstance(prev_content, str) and isinstance(curr_content, str):
-                    merged[-1]["content"] = prev_content + "\n" + curr_content
-                elif isinstance(prev_content, list) and isinstance(curr_content, list):
-                    merged[-1]["content"] = prev_content + curr_content
-                elif isinstance(prev_content, str) and isinstance(curr_content, list):
-                    merged[-1]["content"] = [
-                        {"type": "text", "text": prev_content}
-                    ] + curr_content
-                elif isinstance(prev_content, list) and isinstance(curr_content, str):
-                    merged[-1]["content"] = prev_content + [
-                        {"type": "text", "text": curr_content}
-                    ]
+                prev = _to_list(merged[-1].get("content", ""))
+                curr = _to_list(msg.get("content", ""))
+                merged[-1]["content"] = prev + curr
             else:
                 merged.append(msg)
         return merged
