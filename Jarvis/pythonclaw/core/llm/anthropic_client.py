@@ -46,6 +46,10 @@ class AnthropicProvider(LLMProvider):
         **kwargs: Any,
     ) -> dict:
         """Build the kwargs dict for ``messages.create`` / ``stream``."""
+        # Strip internal fields added by SessionStore (e.g. _ts) — not valid API fields
+        _INTERNAL_KEYS = {"_ts"}
+        messages = [{k: v for k, v in m.items() if k not in _INTERNAL_KEYS} for m in messages]
+
         system_prompt = ""
         filtered_messages: list[dict] = []
 
