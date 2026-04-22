@@ -42,7 +42,7 @@ AUDRateAgent/
 ### 1. 依赖安装
 
 ```bash
-cd PythonClaw
+cd Jarvis
 pip install -e .
 ```
 
