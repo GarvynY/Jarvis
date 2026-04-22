@@ -1,0 +1,147 @@
+# ═══════════════════════════════════════════════════════════════════
+#  CNY/AUD 汇率监控 Agent — Cron Jobs 配置示例
+#
+#  使用方法:
+#    将此文件内容合并到 ~/.pythonclaw/context/cron/jobs.yaml
+#    (如果该文件不存在，直接复制并重命名即可)
+#
+#  时区说明:
+#    Cron 时间以服务器系统时区为准。
+#    墨尔本 AEST (UTC+10): UTC 时间减 10 小时
+#    墨尔本 AEDT (UTC+11, 夏令时): UTC 时间减 11 小时
+#
+#    示例换算 (AEST UTC+10):
+#      墨尔本 09:00 → UTC 23:00 (前一天)
+#      墨尔本 18:00 → UTC 08:00
+#      墨尔本 12:00 → UTC 02:00
+#
+#  必须先配置:
+#    - Telegram Bot Token: channels.telegram.token
+#    - 你的 Telegram Chat ID: 用 @userinfobot 获取
+#    - Tavily API Key (用于新闻搜索): tavily.apiKey
+#    - LLM Provider API Key
+# ═══════════════════════════════════════════════════════════════════
+
+jobs:
+
+  # ──────────────────────────────────────────────────────────────────
+  # 任务1: 每日早晨分析报告
+  # 执行时间: 墨尔本 9:00 AM (AEST UTC+10 → 每天 23:00 UTC)
+  # 内容: 综合金融市场 + 美伊局势 + CNY/AUD 历史走势 → 分析 & 预测
+  # ──────────────────────────────────────────────────────────────────
+  - id: cnyaud_morning_report
+    cron: "0 23 * * *"   # 每天 UTC 23:00 = 墨尔本次日 09:00 (AEST)
+    enabled: true
+    deliver_to: telegram
+    chat_id: YOUR_TELEGRAM_CHAT_ID   # ← 替换为你的 Telegram chat_id
+    prompt: |
+      你是一位专业的外汇分析师。请完成以下任务，所有回复使用中文。
+
+      ## 第一步：获取汇率数据
+      使用 cnyaud_monitor 技能，运行：
+        python {skill_path}/fetch_rate.py --period 90d --format json
+      记录当前汇率、90天趋势、波动率、线性回归方向。
+
+      ## 第二步：搜索关键新闻 (并行搜索以下3个主题)
+      使用 web_search (topic="news") 搜索以下内容:
+      1. "US Iran military tensions sanctions 2024" — 美伊军事局势最新进展
+      2. "Australian dollar AUD exchange rate RBA monetary policy" — 澳元/RBA最新动态
+      3. "China yuan CNY exchange rate PBOC capital flows" — 人民币政策与资本流动
+
+      ## 第三步：综合分析与预测
+      请输出以下结构的报告:
+
+      ### 📊 CNY/AUD 每日汇率简报
+      **当前汇率**: [填入]  |  **日期**: [今日日期]
+
+      **近期走势**:
+      - 90天变动: [涨跌%]
+      - 7日趋势: [CNY升值/贬值 X%]
+      - 波动率: [σ值]，属于[高/中/低]波动期
+
+      **关键驱动因素**:
+      1. 美伊局势: [总结最新动态及对油价→AUD的传导逻辑]
+      2. 澳洲基本面: [RBA利率预期/大宗商品/贸易数据]
+      3. 人民币端: [PBOC政策/资本管制/中美关系]
+
+      **短期预测 (1-2周)**:
+      - 方向偏向: [CNY升值 / CNY贬值 / 横盘震荡]
+      - 核心逻辑: [简洁说明]
+      - 需关注: [1-2个关键风险事件]
+
+      **换汇建议** (仅供参考，不构成投资建议):
+      [如有换汇需求，简短说明当前是否适合换汇]
+
+  # ──────────────────────────────────────────────────────────────────
+  # 任务2: 每日收盘复盘 (可选)
+  # 执行时间: 墨尔本 18:00 (AEST UTC+10 → UTC 08:00)
+  # 内容: 一日收盘后汇率回顾
+  # ──────────────────────────────────────────────────────────────────
+  - id: cnyaud_evening_recap
+    cron: "0 8 * * *"   # 每天 UTC 08:00 = 墨尔本 18:00 (AEST)
+    enabled: false       # 默认关闭，需要时改为 true
+    deliver_to: telegram
+    chat_id: YOUR_TELEGRAM_CHAT_ID
+    prompt: |
+      使用 cnyaud_monitor 技能，运行:
+        python {skill_path}/fetch_rate.py --period 7d --format json
+
+      用中文简报今日 CNY/AUD 收盘情况:
+      - 今日收盘汇率: [值]
+      - 当日涨跌幅: [+/-X.XX%]
+      - 与昨日相比: [升值/贬值]
+      - 一句话点评今日汇率走势及主要原因 (结合今日要闻，用 web_search 快速搜索 "CNY AUD exchange rate today")
+
+      格式要简洁，不超过5行。
+
+  # ──────────────────────────────────────────────────────────────────
+  # 任务3: 实时阈值监控 (每30分钟)
+  # 内容: 检测 CNY/AUD 是否波动超过阈值，超过则立即告警
+  # ──────────────────────────────────────────────────────────────────
+  - id: cnyaud_realtime_alert
+    cron: "*/30 * * * *"   # 每30分钟
+    enabled: true
+    deliver_to: telegram
+    chat_id: YOUR_TELEGRAM_CHAT_ID
+    prompt: |
+      使用 cnyaud_monitor 技能，运行阈值检测:
+        python {skill_path}/monitor_alert.py --threshold 0.3 --format json
+
+      解读 JSON 输出:
+      - 如果 "alert" 为 true:
+        立即发出告警通知，包含:
+        ① 告警内容 (alert_message 字段)
+        ② 用 web_search(topic="news") 搜索 "CNY AUD exchange rate" 获取即时原因
+        ③ 简短分析: 可能触发此波动的事件
+        格式: "⚠️ 汇率告警\n[alert_message]\n📰 可能原因: [新闻摘要]"
+
+      - 如果 "alert" 为 false:
+        静默（不发送任何消息，任务直接结束）
+        注意: 只有有告警时才发消息给用户，避免打扰！
+
+  # ──────────────────────────────────────────────────────────────────
+  # 任务4: 每周五周报 (可选)
+  # 执行时间: 墨尔本周五 17:00 (AEST UTC+10 → UTC 07:00 周五)
+  # ──────────────────────────────────────────────────────────────────
+  - id: cnyaud_weekly_summary
+    cron: "0 7 * * 5"   # UTC 每周五 07:00 = 墨尔本周五 17:00 (AEST)
+    enabled: false
+    deliver_to: telegram
+    chat_id: YOUR_TELEGRAM_CHAT_ID
+    prompt: |
+      使用 cnyaud_monitor 技能获取本周数据:
+        python {skill_path}/fetch_rate.py --period 30d --format json
+
+      同时使用 web_search 搜索本周重要事件:
+      1. "US Iran geopolitics this week"
+      2. "Australian dollar weekly performance"
+      3. "China yuan weekly outlook"
+
+      用中文生成 CNY/AUD 周报:
+
+      ### 💱 CNY/AUD 周报 (本周汇率复盘 & 下周展望)
+
+      **本周表现**: [涨跌幅，区间高低点]
+      **核心事件回顾**: [影响汇率的1-3件大事]
+      **下周关注点**: [重要数据/事件发布]
+      **下周方向判断**: [偏多/偏空/中性] + 理由
