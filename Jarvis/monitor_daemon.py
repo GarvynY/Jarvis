@@ -1,10 +1,11 @@
 """
-Standalone monitoring daemon — minimal LLM usage.
+Standalone monitoring daemon.
 
 Three monitoring modes:
   1. Rate check (every 30 min)  — no LLM, tracks 48h rolling high
-  2. News check (every 20 min)  — no LLM, RSS keyword scan
-  3. Combined alert             — LLM analysis when BOTH fire simultaneously:
+  2. News check (every 20 min)  — LLM filters relevance + brief analysis
+       "影响有限" → silent skip; real impact → send Telegram with analysis
+  3. Combined alert             — LLM analysis (with rate context) when:
        breaking news + rate drop ≥ COMBINED_THRESHOLD_PCT from 48h high
 
 Run with: python monitor_daemon.py
@@ -129,29 +130,54 @@ def _48h_high(state: dict) -> float | None:
     return max(h["cny_per_aud"] for h in history)
 
 
-# ── LLM analysis (only on combined alert) ────────────────────────────────────
+# ── LLM analysis ─────────────────────────────────────────────────────────────
 
-def _llm_combined_analysis(
+NO_IMPACT_SIGNAL = "影响有限"   # if response starts with this, skip sending
+
+def _llm_news_analysis(
     api_key: str,
-    current_cny: float,
-    high_48h: float,
-    drop_pct: float,
     articles: list[dict],
+    rate_info: dict | None = None,
 ) -> str:
-    """Call DeepSeek for a 3-sentence combined alert analysis."""
+    """
+    Call DeepSeek to analyze news impact on CNY/AUD.
+
+    - rate_info=None  → news-only check (filter + brief analysis)
+    - rate_info=dict  → combined alert (always relevant, include rate context)
+
+    Returns analysis text, or a string starting with NO_IMPACT_SIGNAL if
+    news has no meaningful CNY/AUD relevance (news-only mode only).
+    """
     from openai import OpenAI
 
-    headlines = "\n".join(
-        f"- {a['title']}" for a in articles[:5]
-    )
-    prompt = (
-        f"用中文写3句话简析以下情况对CNY/AUD汇率的影响，语气专业简洁：\n\n"
-        f"汇率：近48小时最高点 1 AUD = {high_48h:.4f} CNY，"
-        f"当前 1 AUD = {current_cny:.4f} CNY，"
-        f"跌幅 {drop_pct:.2f}%。\n\n"
-        f"同期突发新闻：\n{headlines}\n\n"
-        f"分析重点：新闻如何驱动本次汇率下跌，后续走势判断，换汇建议。"
-    )
+    headlines = "\n".join(f"- {a['title']}" for a in articles[:5])
+
+    if rate_info:
+        # Combined mode: rate context is already a strong signal, skip filter
+        rate_ctx = (
+            f"\n\n同期汇率异动：近48小时最高 1 AUD = {rate_info['high_48h']:.4f} CNY，"
+            f"当前 1 AUD = {rate_info['current_cny']:.4f} CNY，"
+            f"较高点跌幅 {rate_info['drop_pct']:.2f}%。"
+        )
+        prompt = (
+            f"以下突发新闻伴随汇率明显下跌同步出现，请用中文3句话分析：\n\n"
+            f"新闻：\n{headlines}"
+            f"{rate_ctx}\n\n"
+            f"分析重点：新闻驱动汇率下跌的逻辑、后续走势判断、换汇建议。"
+            f"语气专业简洁，不超过100字。"
+        )
+    else:
+        # News-only mode: first filter by relevance
+        prompt = (
+            f"以下是刚出现的新闻，请判断对 CNY/AUD（人民币/澳元）汇率的影响：\n\n"
+            f"{headlines}\n\n"
+            f"要求：\n"
+            f"- 如果新闻与 CNY/AUD 汇率关联不明显（如历史回顾、无关地区事件），"
+            f"只回复'{NO_IMPACT_SIGNAL}，无需关注'\n"
+            f"- 如果有实质影响，用3句话分析：驱动逻辑、方向判断、换汇建议\n"
+            f"- 语气专业简洁，不超过80字"
+        )
+
     client = OpenAI(
         api_key=api_key,
         base_url="https://api.deepseek.com/v1",
@@ -159,7 +185,7 @@ def _llm_combined_analysis(
     )
     response = client.chat.completions.create(
         model="deepseek-chat",
-        max_tokens=300,
+        max_tokens=200,
         messages=[{"role": "user", "content": prompt}],
     )
     return response.choices[0].message.content.strip()
@@ -206,9 +232,11 @@ def check_rate(state: dict, token: str, chat_id: int) -> dict | None:
     return {"data": data, "current_cny": current, "high_48h": high, "drop_pct": drop}
 
 
-def check_news(token: str, chat_id: int) -> list[dict]:
+def check_news(api_key: str, token: str, chat_id: int) -> list[dict]:
     """
-    Scan news RSS. If breaking news, send plain alert.
+    Scan news RSS. If breaking news, call LLM to filter + analyze.
+    - LLM says "影响有限" → silent skip (irrelevant news)
+    - LLM gives real analysis → send Telegram with headlines + analysis
     Returns list of new articles (empty if none).
     """
     log.info("Running news check...")
@@ -217,19 +245,29 @@ def check_news(token: str, chat_id: int) -> list[dict]:
         return []
 
     articles = data.get("new_articles", [])
-    if data.get("has_breaking"):
-        lines = "\n".join(
-            f"• {a['title']}" for a in articles[:6]
-        )
-        msg = (
-            f"🚨 <b>突发新闻</b>\n{lines}\n\n"
-            f"💡 正在监测汇率，若同步出现大幅波动将推送联合分析。"
-        )
-        _telegram_send(token, chat_id, msg)
-        log.info("News alert sent: %d new articles", len(articles))
-    else:
+    if not data.get("has_breaking"):
         log.info("News OK: no new breaking articles")
+        return []
 
+    log.info("Breaking news: %d new articles — calling LLM for relevance check", len(articles))
+    try:
+        analysis = _llm_news_analysis(api_key, articles)
+    except Exception as e:
+        log.error("LLM news analysis failed: %s", e)
+        analysis = "（分析暂时不可用）"
+
+    if analysis.startswith(NO_IMPACT_SIGNAL):
+        log.info("LLM: news not relevant to CNY/AUD, skipping alert")
+        return articles   # still return so combined check can use them
+
+    headlines = "\n".join(f"• {a['title']}" for a in articles[:5])
+    msg = (
+        f"📰 <b>CNY/AUD 相关新闻</b>\n\n"
+        f"{headlines}\n\n"
+        f"🤖 <b>影响分析</b>\n{analysis}"
+    )
+    _telegram_send(token, chat_id, msg)
+    log.info("News alert sent with LLM analysis.")
     return articles
 
 
@@ -274,9 +312,7 @@ def check_combined(
     )
 
     try:
-        analysis = _llm_combined_analysis(
-            api_key, current, high_48h, drop_pct, breaking_articles
-        )
+        analysis = _llm_news_analysis(api_key, breaking_articles, rate_info)
     except Exception as e:
         log.error("LLM analysis failed: %s", e)
         analysis = "（LLM分析暂时不可用）"
@@ -336,7 +372,7 @@ def main() -> None:
         # ── news check ────────────────────────────────────────────────────────
         if now - last_news >= NEWS_INTERVAL_SEC:
             try:
-                articles = check_news(token, chat_id)
+                articles = check_news(api_key, token, chat_id)
                 if articles:
                     pending_articles = articles
             except Exception as e:
