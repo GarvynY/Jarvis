@@ -132,52 +132,85 @@ def _48h_high(state: dict) -> float | None:
 
 # ── LLM analysis ─────────────────────────────────────────────────────────────
 
-NO_IMPACT_SIGNAL = "影响有限"   # if response starts with this, skip sending
+NO_RELEVANCE = "无关"   # per-article signal that article has no CNY/AUD impact
 
-def _llm_news_analysis(
+
+def _llm_per_article_analysis(
     api_key: str,
     articles: list[dict],
-    rate_info: dict | None = None,
+) -> list[tuple[dict, str]]:
+    """
+    For each article, generate a 1-2 sentence Chinese summary of content
+    and CNY/AUD impact. Articles with no rate relevance are marked NO_RELEVANCE.
+
+    Returns list of (article, summary) for relevant articles only.
+    """
+    from openai import OpenAI
+
+    numbered = "\n".join(
+        f"{i+1}. {a['title']}" for i, a in enumerate(articles[:8])
+    )
+    prompt = (
+        f"以下是新出现的新闻，请对每条用1-2句中文回复：先简述新闻内容，再说明对"
+        f"CNY/AUD（人民币/澳元）汇率的可能影响。\n"
+        f"如果某条与CNY/AUD汇率完全无关，只写'{NO_RELEVANCE}'。\n\n"
+        f"{numbered}\n\n"
+        f"按编号顺序回复，每条单独一行，格式示例：\n"
+        f"1. 伊朗宣布封锁霍尔木兹海峡，油价急涨；澳元作为商品货币或受提振，AUD短期偏强。\n"
+        f"2. {NO_RELEVANCE}\n"
+        f"3. RBA 暗示下月加息，澳元利差优势扩大，CNY/AUD 汇率中期承压。"
+    )
+
+    client = OpenAI(
+        api_key=api_key,
+        base_url="https://api.deepseek.com/v1",
+        timeout=60.0,
+    )
+    response = client.chat.completions.create(
+        model="deepseek-chat",
+        max_tokens=400,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    raw = response.choices[0].message.content.strip()
+
+    # Parse numbered lines back to articles
+    import re
+    result: list[tuple[dict, str]] = []
+    for i, article in enumerate(articles[:8]):
+        pattern = rf"^\s*{i+1}[.\uff0e]\s*(.+)"
+        for line in raw.splitlines():
+            m = re.match(pattern, line)
+            if m:
+                summary = m.group(1).strip()
+                if summary and NO_RELEVANCE not in summary:
+                    result.append((article, summary))
+                break
+    return result
+
+
+def _llm_combined_analysis(
+    api_key: str,
+    articles: list[dict],
+    rate_info: dict,
 ) -> str:
     """
-    Call DeepSeek to analyze news impact on CNY/AUD.
-
-    - rate_info=None  → news-only check (filter + brief analysis)
-    - rate_info=dict  → combined alert (always relevant, include rate context)
-
-    Returns analysis text, or a string starting with NO_IMPACT_SIGNAL if
-    news has no meaningful CNY/AUD relevance (news-only mode only).
+    Combined alert mode: rate context is already a strong signal.
+    Returns a single overall analysis string (3 sentences).
     """
     from openai import OpenAI
 
     headlines = "\n".join(f"- {a['title']}" for a in articles[:5])
-
-    if rate_info:
-        # Combined mode: rate context is already a strong signal, skip filter
-        rate_ctx = (
-            f"\n\n同期汇率异动：近48小时最高 1 AUD = {rate_info['high_48h']:.4f} CNY，"
-            f"当前 1 AUD = {rate_info['current_cny']:.4f} CNY，"
-            f"较高点跌幅 {rate_info['drop_pct']:.2f}%。"
-        )
-        prompt = (
-            f"以下突发新闻伴随汇率明显下跌同步出现，请用中文3句话分析：\n\n"
-            f"新闻：\n{headlines}"
-            f"{rate_ctx}\n\n"
-            f"分析重点：新闻驱动汇率下跌的逻辑、后续走势判断、换汇建议。"
-            f"语气专业简洁，不超过100字。"
-        )
-    else:
-        # News-only mode: first filter by relevance
-        prompt = (
-            f"以下是刚出现的新闻，请判断对 CNY/AUD（人民币/澳元）汇率的影响：\n\n"
-            f"{headlines}\n\n"
-            f"要求：\n"
-            f"- 如果新闻与 CNY/AUD 汇率关联不明显（如历史回顾、无关地区事件），"
-            f"只回复'{NO_IMPACT_SIGNAL}，无需关注'\n"
-            f"- 如果有实质影响，用3句话分析：驱动逻辑、方向判断、换汇建议\n"
-            f"- 语气专业简洁，不超过80字"
-        )
-
+    rate_ctx = (
+        f"近48小时最高 1 AUD = {rate_info['high_48h']:.4f} CNY，"
+        f"当前 1 AUD = {rate_info['current_cny']:.4f} CNY，"
+        f"较高点跌幅 {rate_info['drop_pct']:.2f}%。"
+    )
+    prompt = (
+        f"以下突发新闻与汇率明显下跌同步出现，请用中文3句话分析：\n\n"
+        f"新闻：\n{headlines}\n\n"
+        f"汇率：{rate_ctx}\n\n"
+        f"分析重点：新闻驱动汇率下跌的逻辑、后续走势判断、换汇建议。不超过100字。"
+    )
     client = OpenAI(
         api_key=api_key,
         base_url="https://api.deepseek.com/v1",
@@ -234,10 +267,10 @@ def check_rate(state: dict, token: str, chat_id: int) -> dict | None:
 
 def check_news(api_key: str, token: str, chat_id: int) -> list[dict]:
     """
-    Scan news RSS. If breaking news, call LLM to filter + analyze.
-    - LLM says "影响有限" → silent skip (irrelevant news)
-    - LLM gives real analysis → send Telegram with headlines + analysis
-    Returns list of new articles (empty if none).
+    Scan news RSS. If breaking news, call LLM for per-article analysis.
+    Articles with no CNY/AUD relevance are silently filtered.
+    If no relevant articles remain, nothing is sent.
+    Returns list of all new articles (for combined check).
     """
     log.info("Running news check...")
     data = _run_script("news_monitor.py")
@@ -249,25 +282,24 @@ def check_news(api_key: str, token: str, chat_id: int) -> list[dict]:
         log.info("News OK: no new breaking articles")
         return []
 
-    log.info("Breaking news: %d new articles — calling LLM for relevance check", len(articles))
+    log.info("Breaking news: %d new articles — calling LLM for per-article analysis", len(articles))
     try:
-        analysis = _llm_news_analysis(api_key, articles)
+        relevant = _llm_per_article_analysis(api_key, articles)
     except Exception as e:
-        log.error("LLM news analysis failed: %s", e)
-        analysis = "（分析暂时不可用）"
+        log.error("LLM per-article analysis failed: %s", e)
+        relevant = []
 
-    if analysis.startswith(NO_IMPACT_SIGNAL):
-        log.info("LLM: news not relevant to CNY/AUD, skipping alert")
-        return articles   # still return so combined check can use them
+    if not relevant:
+        log.info("LLM: no articles relevant to CNY/AUD, skipping alert")
+        return articles   # still return for combined check
 
-    headlines = "\n".join(f"• {a['title']}" for a in articles[:5])
-    msg = (
-        f"📰 <b>CNY/AUD 相关新闻</b>\n\n"
-        f"{headlines}\n\n"
-        f"🤖 <b>影响分析</b>\n{analysis}"
+    lines = "\n\n".join(
+        f"• <b>{a['title']}</b>\n  {summary}"
+        for a, summary in relevant
     )
+    msg = f"📰 <b>CNY/AUD 相关新闻</b>\n\n{lines}"
     _telegram_send(token, chat_id, msg)
-    log.info("News alert sent with LLM analysis.")
+    log.info("News alert sent: %d/%d articles relevant", len(relevant), len(articles))
     return articles
 
 
@@ -312,7 +344,7 @@ def check_combined(
     )
 
     try:
-        analysis = _llm_news_analysis(api_key, breaking_articles, rate_info)
+        analysis = _llm_combined_analysis(api_key, breaking_articles, rate_info)
     except Exception as e:
         log.error("LLM analysis failed: %s", e)
         analysis = "（LLM分析暂时不可用）"
