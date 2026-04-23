@@ -138,8 +138,8 @@ def _llm_combined_analysis(
     drop_pct: float,
     articles: list[dict],
 ) -> str:
-    """Call Claude Haiku for a 3-sentence combined alert analysis."""
-    import anthropic
+    """Call DeepSeek for a 3-sentence combined alert analysis."""
+    from openai import OpenAI
 
     headlines = "\n".join(
         f"- {a['title']}" for a in articles[:5]
@@ -152,13 +152,17 @@ def _llm_combined_analysis(
         f"同期突发新闻：\n{headlines}\n\n"
         f"分析重点：新闻如何驱动本次汇率下跌，后续走势判断，换汇建议。"
     )
-    client = anthropic.Anthropic(api_key=api_key, timeout=60.0)
-    response = client.messages.create(
-        model="claude-haiku-4-5-20251001",
+    client = OpenAI(
+        api_key=api_key,
+        base_url="https://api.deepseek.com/v1",
+        timeout=60.0,
+    )
+    response = client.chat.completions.create(
+        model="deepseek-chat",
         max_tokens=300,
         messages=[{"role": "user", "content": prompt}],
     )
-    return response.content[0].text.strip()
+    return response.choices[0].message.content.strip()
 
 
 # ── main check functions ───────────────────────────────────────────────────────
@@ -299,7 +303,7 @@ def main() -> None:
     cfg     = _load_config()
     token   = cfg["channels"]["telegram"]["token"]
     chat_id = cfg["channels"]["telegram"]["allowedUsers"][0]
-    api_key = cfg["llm"]["claude"]["apiKey"]
+    api_key = cfg["llm"]["deepseek"]["apiKey"]
 
     log.info(
         "Monitor daemon started | rate every %dmin | news every %dmin "
