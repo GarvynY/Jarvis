@@ -262,14 +262,19 @@ def check_rate(state: dict, token: str, chat_id: int) -> dict | None:
         _telegram_send(token, chat_id, msg)
         log.info("Simple rate alert sent.")
 
-    return {"data": data, "current_cny": current, "high_48h": high, "drop_pct": drop}
+    return {
+        "data": data, "current_cny": current, "high_48h": high, "drop_pct": drop,
+        "fetched_at": time.monotonic(),
+    }
 
 
-def check_news(api_key: str, token: str, chat_id: int) -> list[dict]:
+def check_news(api_key: str, token: str, chat_id: int,
+               rate_info: dict | None = None) -> list[dict]:
     """
     Scan news RSS. If breaking news, call LLM for per-article analysis.
     Articles with no CNY/AUD relevance are silently filtered.
     If no relevant articles remain, nothing is sent.
+    Appends current rate (from rate_info) to every outgoing message.
     Returns list of all new articles (for combined check).
     """
     log.info("Running news check...")
@@ -297,7 +302,33 @@ def check_news(api_key: str, token: str, chat_id: int) -> list[dict]:
         f"• <b>{a['title']}</b>\n  {summary}"
         for a, summary in relevant
     )
-    msg = f"📰 <b>CNY/AUD 相关新闻</b>\n\n{lines}"
+
+    # Append current rate — refresh if cache is older than 10 min, zero tokens
+    rate_footer = ""
+    RATE_STALE_SEC = 10 * 60
+    fresh = rate_info
+    if rate_info is None or (time.monotonic() - rate_info.get("fetched_at", 0)) > RATE_STALE_SEC:
+        log.info("Rate cache stale or missing — fetching fresh rate for news footer")
+        fresh_data = _run_script("monitor_alert.py", "--threshold", "999")
+        if fresh_data:
+            fresh = {
+                "current_cny": fresh_data.get("current_1_AUD_in_CNY", 0),
+                "high_48h": rate_info.get("high_48h") if rate_info else None,
+                "drop_pct": rate_info.get("drop_pct", 0) if rate_info else 0,
+                "fetched_at": time.monotonic(),
+            }
+    if fresh:
+        cny = fresh.get("current_cny", 0)
+        high = fresh.get("high_48h")
+        drop = fresh.get("drop_pct", 0)
+        high_str = f" | 48h高点 {high:.4f}" if high else ""
+        rate_footer = (
+            f"\n\n💱 <b>当前汇率</b>：1 AUD = {cny:.4f} CNY"
+            f"{high_str}"
+            f"（较高点 {drop:+.2f}%）"
+        )
+
+    msg = f"📰 <b>CNY/AUD 相关新闻</b>\n\n{lines}{rate_footer}"
     _telegram_send(token, chat_id, msg)
     log.info("News alert sent: %d/%d articles relevant", len(relevant), len(articles))
     return articles
@@ -404,7 +435,7 @@ def main() -> None:
         # ── news check ────────────────────────────────────────────────────────
         if now - last_news >= NEWS_INTERVAL_SEC:
             try:
-                articles = check_news(api_key, token, chat_id)
+                articles = check_news(api_key, token, chat_id, last_rate_info)
                 if articles:
                     pending_articles = articles
             except Exception as e:
