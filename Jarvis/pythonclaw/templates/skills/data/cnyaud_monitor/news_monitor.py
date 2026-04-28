@@ -22,6 +22,10 @@ import xml.etree.ElementTree as ET
 STATE_FILE = os.path.expanduser(
     os.path.join("~", ".pythonclaw", "context", "news_monitor_state.json")
 )
+RECENT_CACHE_FILE = os.path.expanduser(
+    os.path.join("~", ".pythonclaw", "context", "news_recent_cache.json")
+)
+_RECENT_CACHE_MAX = 20
 
 # Default keyword groups — can be overridden via --keywords
 DEFAULT_KEYWORD_GROUPS = {
@@ -57,6 +61,36 @@ def _save_state(state: dict) -> None:
     state["seen_urls"] = state.get("seen_urls", [])[-500:]
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2, ensure_ascii=False)
+
+
+# ── Recent article cache ──────────────────────────────────────────────────────
+
+def _load_recent_cache() -> list[dict]:
+    """Load cached recent articles (newest-first list)."""
+    if os.path.exists(RECENT_CACHE_FILE):
+        try:
+            with open(RECENT_CACHE_FILE, encoding="utf-8") as f:
+                return json.load(f).get("articles", [])
+        except (OSError, json.JSONDecodeError):
+            pass
+    return []
+
+
+def _save_recent_cache(articles: list[dict]) -> None:
+    """Persist articles to the recent cache, keeping the newest _RECENT_CACHE_MAX."""
+    os.makedirs(os.path.dirname(RECENT_CACHE_FILE), exist_ok=True)
+    now_utc = datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    data = {
+        "articles": articles[:_RECENT_CACHE_MAX],
+        "updated_at": now_utc,
+    }
+    with open(RECENT_CACHE_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+
+def get_recent_cached(n: int = 5) -> list[dict]:
+    """Return the n most recently fetched articles from the local cache."""
+    return _load_recent_cache()[:n]
 
 
 # ── RSS fetcher ───────────────────────────────────────────────────────────────
@@ -155,6 +189,10 @@ def check_news(
         state["seen_urls"] = list(seen)
         state["last_check"] = now_utc
         _save_state(state)
+        # Update recent article cache (prepend new articles, newest first)
+        if new_articles:
+            cached = _load_recent_cache()
+            _save_recent_cache(new_articles + cached)
 
     return {
         "new_articles": new_articles,

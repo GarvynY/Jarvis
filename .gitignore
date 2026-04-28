@@ -17,3 +17,5 @@ CLAUDE.md
 .DS_Store
 Thumbs.db
 jarvis_deploy.tar.gz
+deploy.tar.gz
+.env.deploy

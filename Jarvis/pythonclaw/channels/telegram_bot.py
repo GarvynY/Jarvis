@@ -31,10 +31,14 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import importlib.util
+import io
+import json
 import logging
 import queue as _queue
 import re
 import time
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from telegram import BotCommand, ReactionTypeEmoji, Update
@@ -52,6 +56,109 @@ if TYPE_CHECKING:
     from ..session_manager import SessionManager
 
 logger = logging.getLogger(__name__)
+
+# ── Skill directory & file paths ──────────────────────────────────────────────
+
+_SKILL_DIR = (
+    Path(__file__).parent.parent / "templates" / "skills" / "data" / "cnyaud_monitor"
+)
+_GREETED_FILE = config.PYTHONCLAW_HOME / "context" / "greeted_users.json"
+_NEWS_CACHE_FILE = config.PYTHONCLAW_HOME / "context" / "news_recent_cache.json"
+
+
+# ── Welcome messages ──────────────────────────────────────────────────────────
+
+_WELCOME_GUIDE = (
+    "👋 欢迎使用 Jarvis AI 助手！\n\n"
+    "🤖 我是你的个人智能代理，主要功能：\n"
+    "  • 实时监控 CNY/AUD 汇率波动与告警\n"
+    "  • 追踪中东局势、澳元走势等关键新闻\n"
+    "  • 支持自然语言对话和复杂任务处理\n\n"
+    "📋 快捷指令（直接发送以下文字）：\n"
+    "  最新新闻   — 拉取最新关键词新闻\n"
+    "  最新汇率   — 查看当前 CNY/AUD 汇率\n"
+    "  汇率波动   — 查看近2日汇率走势图\n\n"
+    "⚙️ 斜杠命令：\n"
+    "  /start     — 显示此信息\n"
+    "  /reset     — 重置对话（开始新会话）\n"
+    "  /status    — 查看会话状态\n"
+    "  /compact   — 压缩对话历史\n\n"
+    "💡 也可以直接输入任何问题，我会尽力回答！"
+)
+
+_RETURNING_WELCOME = (
+    "👋 欢迎回来！有什么需要帮忙的？\n\n"
+    "快捷指令：最新新闻 | 最新汇率 | 汇率波动"
+)
+
+
+# ── Module-level helpers ──────────────────────────────────────────────────────
+
+def _is_new_user(chat_id: int) -> bool:
+    """Return True if this chat_id has never been shown the welcome guide."""
+    if not _GREETED_FILE.exists():
+        return True
+    try:
+        data = json.loads(_GREETED_FILE.read_text(encoding="utf-8"))
+        return str(chat_id) not in data.get("greeted", [])
+    except Exception:
+        return True
+
+
+def _mark_greeted(chat_id: int) -> None:
+    """Record that this chat_id has received the welcome guide."""
+    data: dict = {"greeted": []}
+    if _GREETED_FILE.exists():
+        try:
+            data = json.loads(_GREETED_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    greeted = set(data.get("greeted", []))
+    greeted.add(str(chat_id))
+    data["greeted"] = sorted(greeted)
+    _GREETED_FILE.parent.mkdir(parents=True, exist_ok=True)
+    _GREETED_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
+def _get_recent_news_text(n: int = 5) -> str:
+    """Return formatted text of the n most recently cached news articles."""
+    if not _NEWS_CACHE_FILE.exists():
+        return ""
+    try:
+        data = json.loads(_NEWS_CACHE_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return ""
+    articles = data.get("articles", [])[:n]
+    if not articles:
+        return ""
+    lines = [
+        "═══════════════════════════════════",
+        "  📰 最近新闻快报（缓存）",
+        "═══════════════════════════════════",
+        f"更新时间: {data.get('updated_at', 'N/A')}",
+        f"显示最近 {len(articles)} 条",
+        "",
+    ]
+    for art in articles:
+        lines.append(f"[{art.get('keyword', '综合')}]")
+        lines.append(f"  标题: {art['title']}")
+        lines.append(f"  时间: {art.get('published', 'N/A')}")
+        if art.get("snippet"):
+            lines.append(f"  摘要: {art['snippet']}")
+        lines.append(f"  链接: {art['url']}")
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
+def _load_cnyaud(module_name: str):
+    """Dynamically load a cnyaud_monitor skill module by filename (no .py)."""
+    spec = importlib.util.spec_from_file_location(
+        f"_cnyaud_{module_name}",
+        _SKILL_DIR / f"{module_name}.py",
+    )
+    mod = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
+    spec.loader.exec_module(mod)  # type: ignore[union-attr]
+    return mod
 
 
 class TelegramBot:
@@ -134,19 +241,19 @@ class TelegramBot:
     async def _cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._check_access(update, context):
             return
-        sid = self._session_id(update.effective_chat.id)
+        chat_id = update.effective_chat.id
+        sid = self._session_id(chat_id)
         self._sm.get_or_create(sid)
-        await update.message.reply_text(
-            "\U0001f44b Hi! I'm your Jarvis agent.\n\n"
-            "Just send me a message and I'll do my best to help.\n"
-            "You can also send photos and I'll analyze them.\n\n"
-            "Commands:\n"
-            "  /start          \u2014 show this message\n"
-            "  /reset          \u2014 start a fresh session\n"
-            "  /status         \u2014 show session info\n"
-            "  /compact [hint] \u2014 compact conversation history\n"
-            "  /clear_files    \u2014 delete all downloaded files"
-        )
+
+        is_new = _is_new_user(chat_id)
+        if is_new:
+            _mark_greeted(chat_id)
+            await update.message.reply_text(_WELCOME_GUIDE)
+            recent = _get_recent_news_text()
+            if recent:
+                await update.message.reply_text(recent)
+        else:
+            await update.message.reply_text(_RETURNING_WELCOME)
 
     async def _cmd_reset(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._check_access(update, context):
@@ -194,6 +301,53 @@ class TelegramBot:
         count = _cfg.clear_files()
         await update.message.reply_text(f"Cleared {count} file(s) from the downloads folder.")
 
+    # ── Shortcut command handlers (no LLM) ───────────────────────────────────
+
+    async def _shortcut_latest_news(self, update: Update) -> None:
+        """Fetch latest news directly without LLM and send formatted result."""
+        await update.message.reply_text("📡 正在拉取最新新闻，请稍候…")
+        try:
+            nm = _load_cnyaud("news_monitor")
+            result = nm.check_news()
+            text = nm._format_text(result)
+        except Exception as exc:
+            logger.exception("[Telegram] 最新新闻 fetch failed")
+            text = f"⚠️ 获取新闻失败: {exc}"
+        for chunk in _split_message(text):
+            await update.message.reply_text(chunk)
+
+    async def _shortcut_latest_rate(self, update: Update) -> None:
+        """Fetch current CNY/AUD rate directly without LLM and send formatted result."""
+        await update.message.reply_text("📡 正在获取最新汇率，请稍候…")
+        try:
+            fr = _load_cnyaud("fetch_rate")
+            data = fr.fetch_rate()
+            text = fr._format_text(data)
+        except Exception as exc:
+            logger.exception("[Telegram] 最新汇率 fetch failed")
+            text = f"⚠️ 获取汇率失败: {exc}"
+        for chunk in _split_message(text):
+            await update.message.reply_text(chunk)
+
+    async def _shortcut_rate_chart(self, update: Update) -> None:
+        """Generate and send a 2-day CNY/AUD chart image without LLM."""
+        notice = await update.message.reply_text("📊 正在生成近2日汇率走势图，请稍候…")
+        try:
+            rc = _load_cnyaud("rate_chart")
+            png_bytes = rc.generate_2day_chart()
+            await self._app.bot.send_photo(
+                chat_id=update.effective_chat.id,
+                photo=io.BytesIO(png_bytes),
+                caption="📈 CNY/AUD 近2日汇率走势（1 AUD = ? CNY）",
+            )
+            try:
+                await notice.delete()
+            except Exception:
+                pass
+        except Exception as exc:
+            logger.exception("[Telegram] 汇率波动 chart failed")
+            await notice.edit_text(f"⚠️ 生成图表失败: {exc}")
+
     # ── Message handler (text + photos) ───────────────────────────────────────
 
     async def _handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -217,6 +371,27 @@ class TelegramBot:
             user_text = transcript
 
         if not user_text and not has_photo:
+            return
+
+        # ── First-time welcome (fires once per user, no LLM) ──────────────────
+        _cid = update.effective_chat.id
+        if _is_new_user(_cid):
+            _mark_greeted(_cid)
+            await update.message.reply_text(_WELCOME_GUIDE)
+            _recent = _get_recent_news_text()
+            if _recent:
+                await update.message.reply_text(_recent)
+
+        # ── Shortcut commands (bypass LLM entirely) ───────────────────────────
+        _cmd = user_text.strip()
+        if _cmd == "最新新闻":
+            await self._shortcut_latest_news(update)
+            return
+        if _cmd == "最新汇率":
+            await self._shortcut_latest_rate(update)
+            return
+        if _cmd == "汇率波动":
+            await self._shortcut_rate_chart(update)
             return
 
         sid = self._session_id(update.effective_chat.id)
