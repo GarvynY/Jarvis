@@ -69,7 +69,11 @@ def _save_state(state: dict) -> None:
 
 # ── telegram ─────────────────────────────────────────────────────────────────
 
-def _telegram_send(token: str, chat_id: int, text: str) -> None:
+def _telegram_send(token: str, chat_id: int | list, text: str) -> None:
+    if isinstance(chat_id, list):
+        for cid in chat_id:
+            _telegram_send(token, cid, text)
+        return
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = json.dumps(
         {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
@@ -416,7 +420,7 @@ def check_combined(
 def main() -> None:
     cfg     = _load_config()
     token   = cfg["channels"]["telegram"]["token"]
-    chat_id = cfg["channels"]["telegram"]["allowedUsers"][0]
+    chat_id = cfg["channels"]["telegram"]["allowedUsers"]
     api_key = cfg["llm"]["deepseek"]["apiKey"]
 
     log.info(

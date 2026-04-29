@@ -149,7 +149,7 @@ class CronScheduler:
         job_id: str,
         prompt: str,
         deliver_to: str | None,
-        chat_id: int | None,
+        chat_id: int | list | None,
     ) -> None:
         session_id = f"cron:{job_id}"
         logger.info("[CronScheduler] Running job '%s' (session='%s')", job_id, session_id)
@@ -163,17 +163,24 @@ class CronScheduler:
             logger.exception("[CronScheduler] Job '%s' failed: %s", job_id, exc)
             response = f"[Cron job '{job_id}' failed]\n{exc}"
 
-        if deliver_to == "telegram" and chat_id and self._telegram_bot:
-            try:
-                header = f"<b>📋 {job_id}</b>\n\n"
-                body = _md_to_html(response or "")
-                await self._telegram_bot.send_message(
-                    chat_id, header + body, parse_mode="HTML"
-                )
-            except Exception as exc:
-                logger.error(
-                    "[CronScheduler] Failed to deliver job '%s' to Telegram: %s", job_id, exc
-                )
+        if deliver_to == "telegram" and self._telegram_bot:
+            if not chat_id:
+                # No chat_id configured — broadcast to all allowedUsers
+                from .. import config as _cfg
+                chat_id = _cfg.get("channels", "telegram", "allowedUsers") or []
+            recipients = chat_id if isinstance(chat_id, list) else [chat_id]
+            header = f"<b>📋 {job_id}</b>\n\n"
+            body = _md_to_html(response or "")
+            for cid in recipients:
+                try:
+                    await self._telegram_bot.send_message(
+                        cid, header + body, parse_mode="HTML"
+                    )
+                except Exception as exc:
+                    logger.error(
+                        "[CronScheduler] Failed to deliver job '%s' to Telegram chat %s: %s",
+                        job_id, cid, exc
+                    )
 
     # ── Scheduler lifecycle ──────────────────────────────────────────────────
 
@@ -196,7 +203,8 @@ class CronScheduler:
                 continue
 
             deliver_to = job.get("deliver_to")
-            chat_id = job.get("chat_id")
+            # Support both chat_ids (list) and legacy chat_id (single int)
+            chat_id = job.get("chat_ids") or job.get("chat_id")
 
             trigger = _parse_cron(cron_expr)
             self._scheduler.add_job(

@@ -24,3 +24,6 @@ jarvis_deploy.tar.gz
 deploy.tar.gz
 .env.deploy
 pythonclaw.json
+
+# Temp / scratch
+tmp/
