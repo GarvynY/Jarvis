@@ -252,12 +252,18 @@ def check_rate(state: dict, token: str, chat_id: int) -> dict | None:
 
     # Simple rate alert (no LLM) — only when news is not breaking
     if data.get("alert"):
+        baseline  = data.get("baseline_1_AUD_in_CNY", 0)
+        raw_time  = data.get("baseline_time", "")
+        base_time = raw_time[:16].replace("T", " ") + " UTC" if raw_time else "未知"
+        # Use cny_per_aud perspective: positive = AUD appreciated (buys more CNY)
+        chg_cny = (current - baseline) / baseline * 100 if baseline else 0
+        icon, direction = ("📈", "AUD 升值") if chg_cny > 0 else ("📉", "AUD 贬值")
         msg = (
-            f"⚠️ <b>汇率波动告警</b>\n"
-            f"当前: 1 AUD = {current:.4f} CNY\n"
-            f"48小时最高点: {high:.4f} CNY\n"
-            f"较高点变动: {drop:+.2f}%\n"
-            f"数据来源: {data.get('realtime_source', 'open.er-api.com')}"
+            f"{icon} <b>{direction}  {abs(chg_cny):.2f}%</b>\n\n"
+            f"当前  1 AUD = <b>{current:.4f}</b> CNY\n"
+            f"基准  1 AUD = {baseline:.4f} CNY\n"
+            f"偏差  {chg_cny:+.2f}%   触发阈值 ±{SIMPLE_THRESHOLD_PCT}%\n\n"
+            f"基准建立: {base_time}"
         )
         _telegram_send(token, chat_id, msg)
         log.info("Simple rate alert sent.")

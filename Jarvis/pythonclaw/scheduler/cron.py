@@ -38,9 +38,11 @@ jobs:
 from __future__ import annotations
 
 import asyncio
+import html as _html
 import json
 import logging
 import os
+import re as _re
 from typing import TYPE_CHECKING
 
 import yaml
@@ -64,6 +66,51 @@ def _dynamic_jobs_file() -> str:
 
 def _default_jobs_path() -> str:
     return os.path.join(_cron_dir(), "jobs.yaml")
+
+
+# ── Markdown → Telegram HTML ──────────────────────────────────────────────────
+
+def _md_to_html(text: str) -> str:
+    """Convert LLM Markdown output to Telegram-compatible HTML.
+
+    Handles: ATX headers, **bold**, *italic*, `code`, tables, blockquotes,
+    and horizontal rules.  All text content is HTML-escaped before wrapping.
+    """
+    out: list[str] = []
+    for line in text.split("\n"):
+        # Horizontal rule → unicode divider
+        if _re.match(r"^\s*-{3,}\s*$", line):
+            out.append("─" * 22)
+            continue
+        # Table separator row (|---|---|) → skip
+        if _re.match(r"^\|[\s|:-]+\|$", line):
+            continue
+        # Table data row → cells joined
+        if _re.match(r"^\|.+\|$", line):
+            cells = [_html.escape(c.strip()) for c in line.strip("|").split("|") if c.strip()]
+            out.append("  ".join(cells))
+            continue
+        # ATX heading → bold
+        m = _re.match(r"^#{1,3}\s+(.*)", line)
+        if m:
+            out.append(f"<b>{_html.escape(m.group(1))}</b>")
+            continue
+        # Blockquote → italic
+        m = _re.match(r"^>\s+(.*)", line)
+        if m:
+            out.append(f"<i>{_html.escape(m.group(1))}</i>")
+            continue
+        # Normal line: escape first, then apply inline markdown
+        line = _html.escape(line)
+        line = _re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", line)
+        line = _re.sub(r"__(.+?)__",      r"<b>\1</b>", line)
+        line = _re.sub(r"\*([^*\n]+?)\*", r"<i>\1</i>", line)
+        line = _re.sub(r"`([^`\n]+)`",    r"<code>\1</code>", line)
+        out.append(line)
+
+    result = "\n".join(out)
+    result = _re.sub(r"\n{3,}", "\n\n", result)
+    return result.strip()
 
 
 class CronScheduler:
@@ -118,8 +165,11 @@ class CronScheduler:
 
         if deliver_to == "telegram" and chat_id and self._telegram_bot:
             try:
-                header = f"📋 Cron job: {job_id}\n\n"
-                await self._telegram_bot.send_message(chat_id, header + (response or ""))
+                header = f"<b>📋 {job_id}</b>\n\n"
+                body = _md_to_html(response or "")
+                await self._telegram_bot.send_message(
+                    chat_id, header + body, parse_mode="HTML"
+                )
             except Exception as exc:
                 logger.error(
                     "[CronScheduler] Failed to deliver job '%s' to Telegram: %s", job_id, exc

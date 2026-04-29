@@ -14,6 +14,9 @@ build/
 CLAUDE.md
 .claude/
 
+# codex
+.codex
+
 # OS
 .DS_Store
 Thumbs.db

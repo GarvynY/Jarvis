@@ -191,12 +191,16 @@ class TelegramBot:
 
     # ── Push message (called by cron / heartbeat) ─────────────────────────────
 
-    async def send_message(self, chat_id: int, text: str) -> None:
+    async def send_message(
+        self, chat_id: int, text: str, parse_mode: str | None = None
+    ) -> None:
         """Send a message to a specific chat (used by cron/heartbeat)."""
         if self._app is None:
             logger.warning("[Telegram] send_message called before bot is running")
             return
-        await self._app.bot.send_message(chat_id=chat_id, text=text)
+        await self._app.bot.send_message(
+            chat_id=chat_id, text=text, parse_mode=parse_mode
+        )
 
     # ── Access control ────────────────────────────────────────────────────────
 
