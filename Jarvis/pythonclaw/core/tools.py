@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import subprocess
 import sys
 
@@ -89,6 +90,20 @@ def configure_venv(venv_dir: str | None = None) -> str | None:
 # ── Sandbox (path restriction) ───────────────────────────────────────────────
 
 _sandbox_roots: list[str] = []
+_READ_SAFE_ROOTS: list[str] | None = None
+
+_DAILY_MEMORY_LOG_RE = re.compile(r"^\d{4}-\d{2}-\d{2}\.md$")
+_SECRET_CONTENT_RE = re.compile(
+    r"(?i)(?:"
+    r"\b(api[_-]?key|token|secret|password|bearer)\b\s*[:=]\s*[\"']?[A-Za-z0-9_\-./+=]{8,}"
+    r"|sk-[A-Za-z0-9_\-]{20,}"
+    r"|xox[baprs]-[A-Za-z0-9\-]{20,}"
+    r"|\b\d{6,12}:[A-Za-z0-9_-]{30,}\b"
+    r"|gh[pousr]_[A-Za-z0-9_]{30,}"
+    r"|AKIA[0-9A-Z]{16}"
+    r")"
+)
+_MAX_SAFE_SEND_FILE_BYTES = 2 * 1024 * 1024
 
 
 def set_sandbox(roots: list[str]) -> None:
@@ -123,6 +138,94 @@ def _resolve_in_sandbox(path: str) -> str:
     )
 
 
+def _read_safe_roots() -> list[str]:
+    """Return the Phase 8 allowlist for LLM-readable files.
+
+    Skills must remain readable because skill resources are part of normal
+    agent execution. Raw memory, logs, sessions, and config are intentionally
+    excluded from this allowlist.
+    """
+    global _READ_SAFE_ROOTS
+    if _READ_SAFE_ROOTS is not None:
+        return _READ_SAFE_ROOTS
+
+    from .. import config as _cfg
+
+    package_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    roots = [
+        os.path.join(package_root, "templates", "skills"),
+        os.path.join(str(_cfg.PYTHONCLAW_HOME), "context", "skills"),
+        str(_cfg.files_dir()),
+    ]
+    _READ_SAFE_ROOTS = [os.path.realpath(root) for root in roots if os.path.isdir(root)]
+    return _READ_SAFE_ROOTS
+
+
+def _is_under(path: str, root: str) -> bool:
+    return path == root or path.startswith(root + os.sep)
+
+
+def _block_reason_for_read(path: str) -> str | None:
+    """Return a clear block reason, or None when the read is allowed."""
+    from .. import config as _cfg
+
+    resolved = os.path.realpath(os.path.abspath(path))
+    name = os.path.basename(resolved)
+    lower_name = name.lower()
+    lower_path = resolved.lower()
+    home = os.path.realpath(str(_cfg.PYTHONCLAW_HOME))
+    context = os.path.join(home, "context")
+    memory_dir = os.path.join(context, "memory")
+    logs_dir = os.path.join(context, "logs")
+    sessions_dir = os.path.join(context, "sessions")
+    compaction_dir = os.path.join(context, "compaction")
+
+    if lower_name == ".env" or lower_name.endswith(".env") or ".env." in lower_name:
+        return ".env files are not exposed to LLM tools."
+    if resolved == os.path.realpath(str(_cfg.PYTHONCLAW_HOME / "pythonclaw.json")):
+        return "Jarvis configuration may contain API keys or tokens."
+    if any(term in lower_name for term in ("apikey", "api_key", "token", "secret", "password")):
+        return "Files named like secrets, tokens, or API keys are not exposed."
+    if _is_under(resolved, memory_dir):
+        if _DAILY_MEMORY_LOG_RE.match(name):
+            return "Daily memory logs are raw change logs and are not exposed to LLM tools."
+        return "Raw legacy memory files are not exposed; use safe personalization context."
+    if _is_under(resolved, logs_dir) or name == "history_detail.jsonl":
+        return "Raw interaction logs and tool-call logs are not exposed to LLM tools."
+    if _is_under(resolved, sessions_dir):
+        return "Raw session transcripts are not exposed to LLM tools."
+    if _is_under(resolved, compaction_dir):
+        return "Compaction audit logs are not exposed to LLM tools."
+    if lower_path.endswith("history_detail.jsonl"):
+        return "history_detail.jsonl is not exposed to LLM tools."
+    if not any(_is_under(resolved, root) for root in _read_safe_roots()):
+        return "Path is outside the LLM-readable allowlist."
+    return None
+
+
+def _contains_secret_content(path: str) -> bool:
+    """Scan allowed text files for obvious secret material before exposure."""
+    try:
+        size = os.path.getsize(path)
+        if size > 2 * 1024 * 1024:
+            return False
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            return bool(_SECRET_CONTENT_RE.search(f.read()))
+    except OSError:
+        return False
+
+
+def _shell_command_enabled() -> bool:
+    """Return whether the unsafe legacy shell tool is explicitly enabled."""
+    from .. import config as _cfg
+    return _cfg.get_bool(
+        "tools",
+        "allow_shell_command",
+        env="PYTHONCLAW_ALLOW_SHELL_COMMAND",
+        default=False,
+    )
+
+
 def _sanitize_filename(name: str) -> str:
     """Strip path separators and '..' segments from a filename."""
     name = name.replace("..", "").replace("/", "").replace("\\", "")
@@ -140,14 +243,20 @@ def _files_dir() -> str:
 
 
 def run_command(command: str) -> str:
-    """Execute a shell command and return combined stdout/stderr.
+    """Execute a shell command only when explicitly enabled for debugging.
 
-    The command inherits the project's virtual environment so that
-    ``python``, ``pip``, and any installed CLI tools resolve correctly.
-    The working directory is set to ``~/.pythonclaw/context/files/`` so
-    that any files created or downloaded by the command land there.
+    Phase 8 privacy treats unrestricted shell as outside the LLM security
+    boundary. It can read config, logs, memory, and secrets through many paths
+    (python -c, cp, tar, dd, base64, nested sh, etc.), so production defaults
+    to disabled. Prefer skill-specific Python helpers over shell.
     """
     try:
+        if not _shell_command_enabled():
+            return (
+                "Blocked: run_command is disabled by default for Phase 8 "
+                "privacy. Use approved skill helpers or set "
+                "tools.allow_shell_command=true only in a trusted debug environment."
+            )
         result = subprocess.run(
             command, shell=True, capture_output=True, text=True,
             timeout=60, env=_venv_env(), cwd=_files_dir(),
@@ -158,12 +267,18 @@ def run_command(command: str) -> str:
 
 
 def read_file(path: str) -> str:
-    """Read and return the contents of a file."""
+    """Read and return a file from the Phase 8 safe allowlist."""
     try:
         if not os.path.exists(path):
             return f"Error: '{path}' not found."
+        block_reason = _block_reason_for_read(path)
+        if block_reason:
+            return f"Blocked: {block_reason}"
         with open(path, "r", encoding="utf-8") as f:
-            return f.read()
+            content = f.read()
+        if _SECRET_CONTENT_RE.search(content):
+            return "Blocked: file content appears to contain API keys, tokens, or secrets."
+        return content
     except Exception as exc:
         return f"Read error: {exc}"
 
@@ -187,15 +302,25 @@ def write_file(path: str, content: str) -> str:
         return f"Write error: {exc}"
 
 
-def list_files(path: str = ".") -> str:
-    """List files in a directory, one per line."""
+def list_files(path: str | None = None) -> str:
+    """List files only inside the Phase 8 readable allowlist."""
     try:
-        return "\n".join(sorted(os.listdir(path)))
+        path = path or _files_dir()
+        resolved = os.path.realpath(os.path.abspath(path))
+        if not any(_is_under(resolved, root) for root in _read_safe_roots()):
+            return "Blocked: path is outside the LLM-readable allowlist."
+        entries = []
+        for name in sorted(os.listdir(resolved)):
+            full = os.path.join(resolved, name)
+            if _block_reason_for_read(full):
+                continue
+            entries.append(name)
+        return "\n".join(entries)
     except Exception as exc:
         return f"List error: {exc}"
 
 
-_MAX_SEND_FILE_BYTES = 100 * 1024 * 1024  # 100 MB
+_MAX_SEND_FILE_BYTES = 100 * 1024 * 1024  # transport hard cap
 
 # Channel-provided callback: send_file_fn(path, caption) → None
 _file_sender: callable | None = None
@@ -212,15 +337,27 @@ def send_file(path: str, caption: str = "") -> str:
     resolved = os.path.realpath(os.path.abspath(path))
     if not os.path.isfile(resolved):
         return f"Error: file not found: {path}"
-
+    block_reason = _block_reason_for_read(resolved)
+    if block_reason:
+        return f"Blocked: {block_reason}"
     size = os.path.getsize(resolved)
+    if size > _MAX_SAFE_SEND_FILE_BYTES:
+        size_mb = size / (1024 * 1024)
+        return (
+            f"Blocked: file is too large for safe secret scanning "
+            f"({size_mb:.1f} MB)."
+        )
+    if _contains_secret_content(resolved):
+        return "Blocked: file content appears to contain API keys, tokens, or secrets."
+
     if size > _MAX_SEND_FILE_BYTES:
         size_mb = size / (1024 * 1024)
         return f"Error: file too large ({size_mb:.1f} MB). Maximum allowed is 100 MB."
 
     if _file_sender is None:
+        name = os.path.basename(resolved)
         return (
-            f"File ready at: {resolved} ({size / 1024:.1f} KB). "
+            f"File ready: {name} ({size / 1024:.1f} KB). "
             "No active channel to send through — user can download it directly."
         )
 
@@ -266,13 +403,20 @@ def _fn(name: str, description: str, properties: dict, required: list[str]) -> d
 PRIMITIVE_TOOLS: list[dict] = [
     _fn(
         "run_command",
-        "Execute a shell command. Use to run scripts, install packages, or perform system operations.",
+        (
+            "Legacy shell command tool. Disabled by default for Phase 8 privacy; "
+            "use approved skill helpers instead."
+        ),
         {"command": {"type": "string", "description": "The shell command to execute."}},
         ["command"],
     ),
     _fn(
         "read_file",
-        "Read the contents of a file. Use to inspect code, logs, or data.",
+        (
+            "Read a safe file from the allowlist. Intended for skill resources "
+            "and shared generated files; config, secrets, raw memory, sessions, "
+            "and logs are blocked."
+        ),
         {"path": {"type": "string", "description": "Path to the file."}},
         ["path"],
     ),
@@ -288,7 +432,7 @@ PRIMITIVE_TOOLS: list[dict] = [
     _fn(
         "list_files",
         "List files in a directory. Use to discover available scripts or files.",
-        {"path": {"type": "string", "description": "Directory path (defaults to '.').", "default": "."}},
+        {"path": {"type": "string", "description": "Directory path inside the readable allowlist. Defaults to the shared files directory."}},
         [],
     ),
     _fn(
@@ -346,9 +490,9 @@ MEMORY_TOOLS: list[dict] = [
     _fn(
         "recall",
         (
-            "Search long-term memory using semantic + keyword retrieval. "
-            "Pass a descriptive query to get the most relevant memories. "
-            "Use query='*' to retrieve ALL memories."
+            "Search safe personalization memory using semantic + keyword retrieval. "
+            "Pass a descriptive query to get relevant whitelisted fields. "
+            "Use query='*' to retrieve the safe personalization context."
         ),
         {"query": {"type": "string", "description": "Topic or question to search memory for. Use '*' for all memories."}},
         ["query"],
@@ -356,15 +500,15 @@ MEMORY_TOOLS: list[dict] = [
     _fn(
         "memory_get",
         (
-            "Read a specific memory file by path. "
-            "Use 'MEMORY.md' for long-term memory or 'YYYY-MM-DD.md' for daily logs."
+            "Return the safe Phase 8 personalization context. "
+            "Raw memory files and daily logs are not exposed."
         ),
-        {"path": {"type": "string", "description": "Filename relative to memory dir (e.g. 'MEMORY.md', '2026-03-03.md')."}},
-        ["path"],
+        {"path": {"type": "string", "description": "Optional; use 'safe_personalization_context'."}},
+        [],
     ),
     _fn(
         "memory_list_files",
-        "List all memory files (MEMORY.md + daily logs).",
+        "List safe memory tool targets. Raw memory files and daily logs are hidden.",
         {},
         [],
     ),

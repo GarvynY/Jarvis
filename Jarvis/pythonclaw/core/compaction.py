@@ -45,6 +45,24 @@ logger = logging.getLogger(__name__)
 CHARS_PER_TOKEN = 4
 DEFAULT_AUTO_THRESHOLD_TOKENS = 6000   # trigger auto-compaction at ~6k tokens
 DEFAULT_RECENT_KEEP = 6                # keep last N chat messages verbatim
+
+
+def _legacy_memory_write_enabled() -> bool:
+    """Return whether compaction may write extracted facts to legacy memory.
+
+    Phase 8 personalization stores preferences in structured fields. The
+    legacy LLM extraction path writes unstructured facts into MEMORY.md and
+    daily logs, so production defaults to disabled.
+    """
+    from .. import config as _cfg
+    return _cfg.get_bool(
+        "personalization",
+        "legacy_memory_write_enabled",
+        env="PYTHONCLAW_LEGACY_MEMORY_WRITE_ENABLED",
+        default=False,
+    )
+
+
 def _compaction_log_file() -> str:
     from .. import config as _cfg
     return os.path.join(str(_cfg.PYTHONCLAW_HOME), "context", "compaction", "history.jsonl")
@@ -108,6 +126,12 @@ def memory_flush(
     Returns the number of facts saved.
     """
     if not messages_to_flush:
+        return 0
+    if not _legacy_memory_write_enabled():
+        logger.debug(
+            "[Compaction] Legacy memory flush skipped; Phase 8 structured "
+            "personalization is the supported write path."
+        )
         return 0
 
     history_text = messages_to_text(messages_to_flush)
@@ -189,8 +213,9 @@ def compact(
         len(to_summarise), len(to_keep),
     )
 
-    # 1. Memory flush — save important facts before discarding old messages
-    if memory is not None:
+    # 1. Optional legacy memory flush. Disabled by default for Phase 8 privacy;
+    # structured personalization must not depend on free-form LLM memory.
+    if memory is not None and _legacy_memory_write_enabled():
         memory_flush(to_summarise, provider, memory)
 
     # 2. Summarise

@@ -162,7 +162,7 @@ def _run_foreground(args) -> None:
 
     from .web.app import create_app
 
-    host = config.get_str("web", "host", default="0.0.0.0")
+    host = config.get_str("web", "host", default="127.0.0.1")
     port = config.get_int("web", "port", default=7788)
 
     app = create_app(provider, build_provider_fn=_build_provider)
@@ -452,7 +452,7 @@ def _handle_legacy_mode(args) -> None:
             print("Error: pip install pythonclaw[web]")
             return
         from .web.app import create_app
-        host = config.get_str("web", "host", default="0.0.0.0")
+        host = config.get_str("web", "host", default="127.0.0.1")
         port = config.get_int("web", "port", default=7788)
         logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
         app = create_app(provider, build_provider_fn=_build_provider)

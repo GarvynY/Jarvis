@@ -13,6 +13,9 @@ Commands
   /reset          — discard and recreate the current session
   /status         — show session info (provider, skills, memory, tokens, compactions)
   /compact [hint] — compact conversation history
+  /my_profile     — show structured personalization data
+  /privacy        — show Phase 8 privacy design
+  /delete_profile — delete structured personalization data
   <text>          — forwarded to Agent.chat(), reply sent back
   <photo>         — image sent to LLM with optional caption
 
@@ -39,7 +42,7 @@ import queue as _queue
 import re
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from telegram import BotCommand, ReactionTypeEmoji, Update
 from telegram.ext import (
@@ -82,13 +85,36 @@ _WELCOME_GUIDE = (
     "  /start     — 显示此信息\n"
     "  /reset     — 重置对话（开始新会话）\n"
     "  /status    — 查看会话状态\n"
-    "  /compact   — 压缩对话历史\n\n"
+    "  /compact   — 压缩对话历史\n"
+    "  /my_profile — 查看我的个性化资料\n"
+    "  /delete_profile — 删除我的个性化数据\n"
+    "  /privacy   — 查看隐私说明\n\n"
     "💡 也可以直接输入任何问题，我会尽力回答！"
 )
 
 _RETURNING_WELCOME = (
     "👋 欢迎回来！有什么需要帮忙的？\n\n"
     "快捷指令：最新新闻 | 最新汇率 | 汇率波动"
+)
+
+_PRIVACY_TEXT = (
+    "Jarvis 第8阶段隐私说明\n\n"
+    "Jarvis 会把个性化相关数据分成几类处理：\n\n"
+    "1. 明确偏好\n"
+    "例如语言、目标汇率、提醒阈值、摘要风格。这些是你主动设置或确认的内容，可用于提供个性化体验。\n\n"
+    "2. 推断出的内容偏好\n"
+    "例如你可能更关注哪些汇率或新闻主题。这类内容应与明确偏好分开保存，并支持你查看、修改或删除。\n\n"
+    "3. 短期原始行为记录\n"
+    "例如用于评估功能是否有用的临时事件记录。这类数据只用于短期评估和聚合，"
+    "不会作为长期记忆，也不会作为个性化上下文直接提供给大语言模型。\n\n"
+    "4. 敏感信息\n"
+    "Jarvis 不会主动要求你提供银行卡、账户余额、身份证/护照、确切地址或详细个人财务压力等敏感信息。"
+    "检测到这类内容时，Jarvis 会尽量拒绝写入个性化资料。\n\n"
+    "大语言模型的个性化上下文只应接收经过白名单筛选的字段，而不是完整用户档案、原始日志或 MEMORY.md。\n\n"
+    "资料相关命令：\n"
+    "- /my_profile 查看当前个性化资料\n"
+    "- /update_profile 修改偏好（后续支持）\n"
+    "- /delete_profile 删除个性化数据"
 )
 
 
@@ -161,6 +187,112 @@ def _load_cnyaud(module_name: str):
     return mod
 
 
+def _display_value(value: Any) -> str:
+    if value is None or value == "":
+        return "未设置"
+    return str(value)
+
+
+def _display_topics(value: Any) -> str:
+    if not value:
+        return "未设置"
+    if isinstance(value, list):
+        items = [str(item).strip() for item in value if str(item).strip()]
+        return "、".join(items) if items else "未设置"
+    return str(value)
+
+
+def _is_set(value: Any) -> bool:
+    return value not in (None, "", [])
+
+
+def _format_feedback_summary(summary: dict[str, Any]) -> list[str]:
+    if not summary:
+        return []
+    labels = {
+        "useful": "有用",
+        "not_useful": "无用",
+        "useless": "无用",
+        "not_interested": "不感兴趣",
+    }
+    lines = ["", "反馈摘要："]
+    for key in ("useful", "not_useful", "useless", "not_interested"):
+        count = summary.get(key)
+        if count:
+            lines.append(f"- {labels[key]}：{count}")
+    return lines if len(lines) > 2 else []
+
+
+def _format_user_profile(profile: dict[str, Any], *, created: bool = False) -> str:
+    """Render structured personalization data without raw behavior logs."""
+    explicit = profile.get("explicit_preferences") or {}
+    inferred = profile.get("inferred_preferences") or {}
+    feedback = profile.get("feedback_summary") or {}
+
+    lines = ["你的 Jarvis 个性化资料"]
+    if created:
+        lines.extend([
+            "",
+            "我刚为你创建了默认资料。目前暂无偏好记录。",
+            "",
+            "说明：这里不会显示原始行为日志或短期 raw events。",
+            "你可以使用 /delete_profile 删除个性化数据；修改偏好功能后续支持。",
+        ])
+        return "\n".join(lines)
+
+    explicit_lines = [
+        ("目标汇率", _display_value(explicit.get("target_rate")), explicit.get("target_rate")),
+        ("提醒阈值", _display_value(explicit.get("alert_threshold")), explicit.get("alert_threshold")),
+        ("用途", _display_value(explicit.get("purpose")), explicit.get("purpose")),
+        ("语言", _display_value(explicit.get("language")), explicit.get("language")),
+        (
+            "首选摘要样式",
+            _display_value(explicit.get("preferred_summary_style")),
+            explicit.get("preferred_summary_style"),
+        ),
+        ("首选主题", _display_topics(explicit.get("preferred_topics")), explicit.get("preferred_topics")),
+        ("首选提醒时间", _display_value(explicit.get("preferred_reminder_time")), explicit.get("preferred_reminder_time")),
+        ("可操作性阈值", _display_value(explicit.get("actionability_threshold")), explicit.get("actionability_threshold")),
+        ("隐私级别", _display_value(explicit.get("privacy_level")), explicit.get("privacy_level")),
+    ]
+    lines.extend(["", "明确偏好："])
+    added = False
+    for label, display, raw in explicit_lines:
+        if _is_set(raw):
+            lines.append(f"- {label}：{display}")
+            added = True
+    if not added:
+        lines.append("- 暂无明确偏好")
+
+    lines.extend(["", "推断出的偏好："])
+    inferred_added = False
+    if _is_set(inferred.get("high_interest_topics")):
+        lines.append(f"- 高兴趣话题：{_display_topics(inferred.get('high_interest_topics'))}")
+        inferred_added = True
+    if _is_set(inferred.get("low_interest_topics")):
+        lines.append(f"- 低兴趣话题：{_display_topics(inferred.get('low_interest_topics'))}")
+        inferred_added = True
+    confidence = inferred.get("confidence")
+    if confidence is not None:
+        lines.append(f"- 推断置信度：{confidence}")
+        inferred_added = True
+    if not inferred_added:
+        lines.append("- 暂无推断偏好")
+
+    lines.extend(_format_feedback_summary(feedback))
+    lines.extend([
+        "",
+        "说明：这里不会显示原始行为日志或短期 raw events。",
+        "你可以使用 /delete_profile 删除个性化数据；修改偏好功能后续支持。",
+    ])
+    return "\n".join(lines)
+
+
+def _delete_profile_requires_confirmation() -> bool:
+    """Hook for adding a multi-step delete confirmation flow later."""
+    return True
+
+
 class TelegramBot:
     """
     Telegram channel — pure I/O layer.
@@ -211,6 +343,9 @@ class TelegramBot:
 
     async def _check_access(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
         user = update.effective_user
+        if update.message is None:
+            logger.warning("[Telegram] Ignored update without message")
+            return False
         if user is None or not self._is_allowed(user.id):
             logger.warning("[Telegram] Rejected user_id=%s", user.id if user else "unknown")
             await update.message.reply_text("Sorry, you are not authorised to use this bot.")
@@ -304,6 +439,72 @@ class TelegramBot:
         from .. import config as _cfg
         count = _cfg.clear_files()
         await update.message.reply_text(f"Cleared {count} file(s) from the downloads folder.")
+
+    async def _cmd_my_profile(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self._check_access(update, context):
+            return
+        from ..core.personalization import get_or_create_user, get_user_profile
+
+        if update.effective_user is None or update.message is None:
+            return
+        telegram_user_id = update.effective_user.id
+        profile = get_user_profile(telegram_user_id)
+        created = not bool(profile)
+        if created:
+            get_or_create_user(telegram_user_id)
+            profile = get_user_profile(telegram_user_id)
+
+        await update.message.reply_text(_format_user_profile(profile, created=created))
+
+    async def _cmd_privacy(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self._check_access(update, context):
+            return
+        await update.message.reply_text(_PRIVACY_TEXT)
+
+    async def _cmd_delete_profile(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self._check_access(update, context):
+            return
+        if update.effective_user is None or update.message is None:
+            return
+
+        confirm = bool(context.args and context.args[0].lower() == "confirm")
+        if _delete_profile_requires_confirmation():
+            if not confirm:
+                await update.message.reply_text(
+                    "此操作会删除你的结构化个性化数据，包括明确偏好、推断偏好、反馈事件和短期 raw events。"
+                    "不会删除对话历史或系统运行日志。\n\n"
+                    "如确认删除，请发送：/delete_profile confirm"
+                )
+                return
+
+        from ..core.personalization import delete_user_profile, get_user_profile
+
+        telegram_user_id = update.effective_user.id
+        try:
+            existing = get_user_profile(telegram_user_id)
+            if not existing:
+                await update.message.reply_text("目前没有找到你的个性化资料，无需删除。")
+                return
+            deleted = delete_user_profile(telegram_user_id)
+        except Exception as exc:
+            logger.exception(
+                "[Telegram] Failed to delete personalization profile for user_id=%s",
+                telegram_user_id,
+            )
+            await update.message.reply_text("删除个性化数据失败，请稍后再试。")
+            return
+
+        if deleted:
+            logger.info(
+                "[Telegram] Deleted personalization profile for user_id=%s",
+                telegram_user_id,
+            )
+            await update.message.reply_text(
+                "你的结构化个性化数据已删除，包括偏好、反馈摘要和短期 raw events。"
+                "对话历史和系统运行日志不会因此删除。之后 Jarvis 将按默认设置为你服务。"
+            )
+        else:
+            await update.message.reply_text("目前没有找到你的个性化资料，无需删除。")
 
     # ── Shortcut command handlers (no LLM) ───────────────────────────────────
 
@@ -632,11 +833,14 @@ class TelegramBot:
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     _BOT_COMMANDS = [
-        BotCommand("start", "Show welcome message"),
-        BotCommand("reset", "Start a fresh session"),
-        BotCommand("status", "Show session info"),
-        BotCommand("compact", "Compact conversation history"),
-        BotCommand("clear_files", "Delete all downloaded files"),
+        BotCommand("start", "显示欢迎信息"),
+        BotCommand("reset", "重置当前会话"),
+        BotCommand("status", "查看会话状态"),
+        BotCommand("compact", "压缩对话历史"),
+        BotCommand("my_profile", "查看我的个性化资料"),
+        BotCommand("privacy", "查看隐私说明"),
+        BotCommand("delete_profile", "删除我的个性化数据"),
+        BotCommand("clear_files", "清空下载文件"),
     ]
 
     def build_application(self) -> Application:
@@ -645,6 +849,9 @@ class TelegramBot:
         app.add_handler(CommandHandler("reset", self._cmd_reset))
         app.add_handler(CommandHandler("status", self._cmd_status))
         app.add_handler(CommandHandler("compact", self._cmd_compact))
+        app.add_handler(CommandHandler("my_profile", self._cmd_my_profile))
+        app.add_handler(CommandHandler("privacy", self._cmd_privacy))
+        app.add_handler(CommandHandler("delete_profile", self._cmd_delete_profile))
         app.add_handler(CommandHandler("clear_files", self._cmd_clear_files))
         app.add_handler(MessageHandler(
             (filters.TEXT | filters.PHOTO | filters.VOICE | filters.AUDIO)

@@ -152,6 +152,10 @@ class MemoryStorage:
         return entry["value"] if entry else None
 
     def set(self, key: str, value: Any) -> None:
+        # Phase 8 privacy: this low-level store is still available for
+        # explicit legacy/debug writes, but automatic LLM-driven writes are
+        # guarded in agent.py and compaction.py. New personalization data
+        # should use structured storage, not free-form MEMORY.md entries.
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self.data[key] = {"value": str(value), "updated": now}
         self._save_memory_md()

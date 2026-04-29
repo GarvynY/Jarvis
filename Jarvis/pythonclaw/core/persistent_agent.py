@@ -85,14 +85,14 @@ class PersistentAgent(Agent):
         )
 
     def _inject_memory_refresh(self) -> None:
-        """Append a fresh memory snapshot as a system message.
+        """Append a fresh safe personalization snapshot as a system message.
 
-        Called after session restore so the LLM sees up-to-date long-term
-        memory near the latest conversation context, not just the stale
-        snapshot in the original system prompt.
+        Called after session restore so the LLM sees up-to-date Phase 8
+        whitelisted context near the latest conversation context. Raw memory
+        files and daily logs are intentionally excluded.
         """
         try:
-            boot_mem = self.memory.boot_context(max_chars=2000)
+            boot_mem = self.memory.get_safe_boot_context(max_chars=2000)
         except Exception:
             return
         if not boot_mem:
@@ -101,8 +101,8 @@ class PersistentAgent(Agent):
             "role": "system",
             "content": (
                 "[Memory Refresh — session restored]\n"
-                "The following is your latest long-term memory. "
-                "Use this context to personalize responses.\n\n"
+                "The following is your latest safe personalization context. "
+                "Use only these whitelisted fields to personalize responses.\n\n"
                 f"{boot_mem}"
             ),
         })

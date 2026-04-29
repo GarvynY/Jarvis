@@ -55,6 +55,25 @@ from .tools import (
 
 logger = logging.getLogger(__name__)
 
+_LEGACY_MEMORY_WRITE_TOOLS = {"remember", "forget", "update_index"}
+_DISABLED_BY_DEFAULT_TOOLS = {"run_command"}
+
+
+def _legacy_memory_write_enabled() -> bool:
+    """Return whether legacy LLM-driven memory writes are allowed.
+
+    Phase 8 personalization uses structured storage with an explicit safe
+    context whitelist. The old free-form LLM memory path is disabled by
+    default so user facts, decisions, and preferences are not automatically
+    written into MEMORY.md or daily memory logs.
+    """
+    return config.get_bool(
+        "personalization",
+        "legacy_memory_write_enabled",
+        env="PYTHONCLAW_LEGACY_MEMORY_WRITE_ENABLED",
+        default=False,
+    )
+
 
 def _load_text_dir_or_file(path: str | None, label: str = "File") -> str:
     """
@@ -201,6 +220,7 @@ class Agent:
         self.compaction_recent_keep = compaction_recent_keep
         self.compaction_count: int = 0
         self._cron_manager = cron_manager
+        self.legacy_memory_write_enabled = _legacy_memory_write_enabled()
 
         self.loaded_skill_names: set[str] = set()
         self.pending_injections: list[str] = []
@@ -315,13 +335,36 @@ class Agent:
         except Exception:
             pass
 
+        if self.legacy_memory_write_enabled:
+            memory_tools_line = (
+                "- **Memory**: `remember(key,val)`, `recall(query)`, "
+                "`memory_get(path)`, `memory_list_files()`, `forget(key)`, "
+                "`update_index(content)`"
+            )
+            memory_rules = (
+                "- Proactively `remember` user preferences, decisions, key facts.\n"
+                "- Use `recall` when user references past context.\n"
+                "- Memory auto-loaded at session start. INDEX.md = curated system info."
+            )
+        else:
+            memory_tools_line = (
+                "- **Memory (read-only legacy)**: `recall(query)`, "
+                "`memory_get(path)`, `memory_list_files()`"
+            )
+            memory_rules = (
+                "- Legacy LLM memory writes are disabled by configuration.\n"
+                "- Do not store user facts, decisions, or preferences in MEMORY.md; "
+                "Phase 8 personalization uses structured storage and a safe context whitelist.\n"
+                "- Use `recall` only when the user references past context."
+            )
+
         system_msg = f"""You are a Jarvis agent — an autonomous AI assistant.{bot_name}{soul_section}{persona_section}{tools_section}
 
 ### Tools
-- **Primitives**: `run_command`, `read_file`, `write_file`, `list_files`
+- **Primitives**: `read_file`, `write_file`, `list_files`; `run_command` is disabled by default for privacy
 - **Skills** — call `use_skill(name)` to activate. Catalog:
 {skill_catalog}
-- **Memory**: `remember(key,val)`, `recall(query)`, `memory_get(path)`, `memory_list_files()`, `forget(key)`, `update_index(content)`
+{memory_tools_line}
 - **Skill creation**: `create_skill` — create generic reusable skills when none fit{web_search_section}
 
 ### Task Execution Modes
@@ -340,10 +383,8 @@ You decide which mode fits. Don't announce the mode name.
 ### Rules
 - Batch independent tool calls in one response (parallel execution).
 - Minimize search rounds (1-3 max). Combine queries. Don't repeat.
-- Proactively `remember` user preferences, decisions, key facts.
-- Use `recall` when user references past context.
-- Memory auto-loaded at session start. INDEX.md = curated system info.
-- All downloaded/generated files go in the shared files directory (`~/.pythonclaw/context/files/`). The `run_command` tool uses this as its working directory.
+{memory_rules}
+- All downloaded/generated files go in the shared files directory (`~/.pythonclaw/context/files/`).
 - NEVER output tool calls as XML or text. Always use the function calling API.
 
 ### Response Guidelines
@@ -353,10 +394,10 @@ You decide which mode fits. Don't announce the mode name.
 - Do NOT mention what skills or tools you have available, unless explicitly asked.
 - Do NOT list other things you can do at the end of your response.
 """
-        # ── Auto-inject memory context ────────────────────────────────────
-        boot_mem = self.memory.boot_context(max_chars=3000)
+        # ── Auto-inject only Phase 8 safe personalization context ─────────
+        boot_mem = self.memory.get_safe_boot_context(max_chars=3000)
         if boot_mem:
-            system_msg += f"\n\n## Loaded Memory (auto-injected at session start)\n{boot_mem}\n"
+            system_msg += f"\n\n## Loaded Safe Context (auto-injected at session start)\n{boot_mem}\n"
 
         if getattr(self, "_needs_onboarding", False):
             system_msg += """
@@ -377,16 +418,27 @@ the rest of the onboarding (and set that as their language preference).
 After collecting ALL answers, use the `onboarding` skill to write the
 soul.md and persona.md files. Detect the user's language from their
 replies (default to English if they replied in English) and pass it as
-the `--language` argument. Then use `remember` to save:
+the `--language` argument.
+"""
+            if self.legacy_memory_write_enabled:
+                system_msg += """
+Then use `remember` to save:
 - `bot_name`: the custom name the user gave you
 - `user_name`: the user's name
 - user preferences to long-term memory
+"""
+            else:
+                system_msg += """
+Do not call legacy memory write tools during onboarding. Phase 8
+personalization data must be stored later in structured fields only.
+"""
+            system_msg += """
 
 Ask the questions ONE AT A TIME, waiting for each answer before asking the next.
 If the user's first message already contains task content (not just "hi"),
 still start onboarding but keep it brief — you can help with their task after.
 """
-        elif getattr(self, "memory", None):
+        elif self.legacy_memory_write_enabled and getattr(self, "memory", None):
             try:
                 all_mem = self.memory.list_all()
                 if "bot_name" not in all_mem:
@@ -454,7 +506,24 @@ Don't repeat this if `bot_name` already exists in memory.
 
     def _build_tools(self) -> list[dict]:
         """Assemble the full tool schema list for the current session."""
-        tools = PRIMITIVE_TOOLS + SKILL_TOOLS + META_SKILL_TOOLS + MEMORY_TOOLS
+        memory_tools = MEMORY_TOOLS
+        if not self.legacy_memory_write_enabled:
+            memory_tools = [
+                tool for tool in MEMORY_TOOLS
+                if tool.get("function", {}).get("name") not in _LEGACY_MEMORY_WRITE_TOOLS
+            ]
+        primitive_tools = PRIMITIVE_TOOLS
+        if not config.get_bool(
+            "tools",
+            "allow_shell_command",
+            env="PYTHONCLAW_ALLOW_SHELL_COMMAND",
+            default=False,
+        ):
+            primitive_tools = [
+                tool for tool in PRIMITIVE_TOOLS
+                if tool.get("function", {}).get("name") not in _DISABLED_BY_DEFAULT_TOOLS
+            ]
+        tools = primitive_tools + SKILL_TOOLS + META_SKILL_TOOLS + memory_tools
         if self._web_search_enabled:
             tools = tools + [WEB_SEARCH_TOOL]
         if self.rag:
@@ -483,12 +552,19 @@ Don't repeat this if `bot_name` already exists in memory.
                     result = "Resources:\n" + "\n".join(f"  - {r}" for r in resources)
                 else:
                     result = "No bundled resources found (or skill not found)."
+            elif func_name in _LEGACY_MEMORY_WRITE_TOOLS and not self.legacy_memory_write_enabled:
+                result = (
+                    "Blocked: legacy LLM memory writes are disabled. "
+                    "Phase 8 personalization uses structured storage instead."
+                )
             elif func_name == "remember":
                 result = self.memory.remember(args.get("content"), args.get("key"))
             elif func_name == "recall":
                 result = self.memory.recall(args.get("query", "*"))
             elif func_name == "memory_get":
-                result = self.memory.memory_get(args.get("path", "MEMORY.md"))
+                result = self.memory.memory_get(
+                    args.get("path", "safe_personalization_context")
+                )
                 if not result:
                     result = "(file not found or empty)"
             elif func_name == "memory_list_files":
@@ -641,7 +717,7 @@ Don't repeat this if `bot_name` already exists in memory.
         resource_hint = ""
         if resources:
             resource_hint = (
-                "\n\n**Bundled resources** (use `read_file` / `run_command` to access):\n"
+                "\n\n**Bundled resources** (use `read_file` to inspect; shell is disabled by default):\n"
                 + "\n".join(f"  - `{skill.metadata.path}/{r}`" for r in resources)
             )
 
@@ -769,7 +845,7 @@ Don't repeat this if `bot_name` already exists in memory.
             new_messages, summary = _do_compact(
                 messages=self.messages,
                 provider=self.provider,
-                memory=self.memory,
+                memory=self.memory if self.legacy_memory_write_enabled else None,
                 recent_keep=self.compaction_recent_keep,
                 instruction=instruction,
             )
@@ -790,9 +866,9 @@ Don't repeat this if `bot_name` already exists in memory.
     def _maybe_auto_compact(self) -> bool:
         """Auto-compact if the estimated token count exceeds the threshold.
 
-        Before compacting, a proactive memory flush runs when the token
-        count crosses a soft threshold (80% of the compaction threshold).
-        This ensures durable facts are saved even if compaction itself fails.
+        Before compacting, the old proactive memory flush can run when enabled
+        by config. It is disabled by default for Phase 8 privacy so the LLM
+        does not extract user facts into free-form MEMORY.md storage.
         """
         if not self.auto_compaction:
             return False
@@ -800,7 +876,11 @@ Don't repeat this if `bot_name` already exists in memory.
         tokens = estimate_tokens(self.messages)
         soft_threshold = int(self.compaction_threshold * 0.8)
 
-        if not self._memory_flushed_this_cycle and tokens >= soft_threshold:
+        if (
+            self.legacy_memory_write_enabled
+            and not self._memory_flushed_this_cycle
+            and tokens >= soft_threshold
+        ):
             self._bg_executor.submit(self._proactive_memory_flush)
             self._memory_flushed_this_cycle = True
 
@@ -813,7 +893,7 @@ Don't repeat this if `bot_name` already exists in memory.
             new_messages, _ = _do_compact(
                 messages=self.messages,
                 provider=self.provider,
-                memory=self.memory,
+                memory=self.memory if self.legacy_memory_write_enabled else None,
                 recent_keep=self.compaction_recent_keep,
             )
             self.messages = new_messages
@@ -826,12 +906,14 @@ Don't repeat this if `bot_name` already exists in memory.
             return False
 
     def _proactive_memory_flush(self) -> None:
-        """Silently flush key facts to memory before compaction threshold.
+        """Silently flush key facts to legacy memory before compaction.
 
-        Runs once per compaction cycle when tokens cross 80% of the
-        threshold. This way, important facts are persisted even if
-        compaction is delayed or fails.
+        Disabled by default for Phase 8 privacy. Structured personalization
+        replaces non-structured LLM extraction into MEMORY.md and daily logs.
         """
+        if not self.legacy_memory_write_enabled:
+            return
+
         from .compaction import memory_flush
 
         chat_msgs = [m for m in self.messages if m.get("role") != "system"]

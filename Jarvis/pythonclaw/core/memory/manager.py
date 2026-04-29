@@ -31,6 +31,7 @@ are returned (full-dump mode, used by compaction and legacy callers).
 from __future__ import annotations
 
 import logging
+import re
 
 from ..retrieval.retriever import HybridRetriever
 from .storage import MemoryStorage
@@ -38,6 +39,29 @@ from .storage import MemoryStorage
 logger = logging.getLogger(__name__)
 
 _DUMP_TRIGGERS = {"", "*", "all", "everything"}
+_DAILY_MEMORY_LOG_RE = re.compile(r"^\d{4}-\d{2}-\d{2}\.md$")
+
+_SAFE_BOOT_CONTEXT_FIELDS: dict[str, tuple[str, ...]] = {
+    "Language": ("language", "preferred_language", "user_language"),
+    "Tone": ("tone", "assistant_tone", "preferred_tone"),
+    "Target rate": ("target_rate", "cny_aud_target_rate", "aud_cny_target_rate"),
+    "Alert threshold": (
+        "alert_threshold",
+        "rate_alert_threshold",
+        "exchange_rate_alert_threshold",
+    ),
+    "Report time": ("report_time", "daily_report_time", "scheduled_report_time"),
+    "Risk preference": (
+        "risk_preference",
+        "risk_preference_label",
+        "risk_profile",
+    ),
+    "Summary style": (
+        "summary_style",
+        "preferred_summary_style",
+        "report_summary_style",
+    ),
+}
 
 
 class MemoryManager:
@@ -94,26 +118,34 @@ class MemoryManager:
 
     def recall(self, query: str, top_k: int = 10) -> str:
         """
-        Retrieve memories relevant to *query*.
+        Retrieve safe memories relevant to *query*.
 
         Searches both local and global memories when global_memory_dir is set.
 
-        - If query is empty / "*" / "all" → returns ALL memories (full dump).
+        - If query is empty / "*" / "all" → returns safe personalization context.
         - Otherwise → runs hybrid BM25 (+ optional dense) retrieval and
-          returns the top *top_k* most relevant entries.
+          returns only hits whose keys are on the Phase 8 safe whitelist.
         """
         all_memories = self._merged_memories()
         if not all_memories:
             return "No memories found."
 
         if query.strip().lower() in _DUMP_TRIGGERS:
-            lines = [f"- {k}: {v}" for k, v in all_memories.items()]
-            return "\n".join(lines)
+            return self.get_safe_boot_context() or "(no safe personalization context configured)"
+
+        safe_keys = {
+            key
+            for keys in _SAFE_BOOT_CONTEXT_FIELDS.values()
+            for key in keys
+        }
 
         corpus = [
             {"source": k, "content": f"{k}: {v}"}
             for k, v in all_memories.items()
+            if k in safe_keys or (k.startswith("[global] ") and k[9:] in safe_keys)
         ]
+        if not corpus:
+            return "(no safe personalization context configured)"
 
         retriever = HybridRetriever(
             provider=None,
@@ -125,9 +157,8 @@ class MemoryManager:
         hits = retriever.retrieve(query, top_k=top_k)
 
         if not hits:
-            logger.debug("[MemoryManager] No RAG hits for '%s', returning all.", query)
-            lines = [f"- {k}: {v}" for k, v in all_memories.items()]
-            return "(No close match found; showing all memories)\n" + "\n".join(lines)
+            logger.debug("[MemoryManager] No safe RAG hits for '%s'.", query)
+            return "(no matching safe personalization context)"
 
         lines = [f"- {h['source']}: {h['content'].split(': ', 1)[-1]}" for h in hits]
         return "\n".join(lines)
@@ -140,69 +171,82 @@ class MemoryManager:
         return f"Nothing found for: {key}"
 
     def memory_get(self, path: str) -> str:
-        """Read a specific file under the memory directory."""
-        return self.storage.read_memory_file(path)
+        """Return safe personalization context, not raw memory files.
+
+        Phase 8 privacy forbids exposing MEMORY.md, daily memory change logs,
+        raw events, or tool results to the LLM. Keep the method for tool
+        compatibility, but make it a safe-context endpoint.
+        """
+        requested = (path or "safe_personalization_context").strip()
+        if requested in {
+            "safe",
+            "safe_context",
+            "safe_personalization_context",
+            "personalization",
+        }:
+            return self.get_safe_boot_context() or "(no safe personalization context configured)"
+        if _DAILY_MEMORY_LOG_RE.match(requested):
+            return "Blocked: daily memory logs are raw change logs and are not exposed to LLM tools."
+        return (
+            "Blocked: raw legacy memory files are not exposed. "
+            "Use memory_get('safe_personalization_context') instead."
+        )
 
     def list_files(self) -> list[str]:
-        """List all .md files in the memory directory."""
-        return self.storage.list_memory_files()
+        """List safe memory tool targets only.
 
-    # ── Boot context (auto-injected at session start) ────────────────────────
+        Raw MEMORY.md and daily log filenames are intentionally hidden from
+        LLM tools; only the safe summary endpoint is advertised.
+        """
+        return ["safe_personalization_context"]
+
+    # ── Safe boot context (auto-injected at session start) ───────────────────
+
+    @staticmethod
+    def _lookup_safe_field(memories: dict[str, str], keys: tuple[str, ...]) -> str:
+        """Return the first configured safe field, preferring local values."""
+        for key in keys:
+            value = memories.get(key)
+            if value:
+                return str(value).strip()
+        for key in keys:
+            value = memories.get(f"[global] {key}")
+            if value:
+                return str(value).strip()
+        return ""
+
+    def get_safe_boot_context(self, max_chars: int = 3000) -> str:
+        """Return only the Phase 8 safe personalization context.
+
+        Raw daily logs, raw interaction history, tool results, INDEX.md, and
+        the full MEMORY.md are deliberately excluded. Those sources may contain
+        sensitive behavior traces or unstructured LLM-generated memories, and
+        Phase 8 personalization must expose only approved structured fields to
+        model prompts.
+        """
+        memories = self._merged_memories()
+        lines: list[str] = []
+        for label, keys in _SAFE_BOOT_CONTEXT_FIELDS.items():
+            value = self._lookup_safe_field(memories, keys)
+            if value:
+                lines.append(f"- **{label}**: {value}")
+
+        if not lines:
+            return ""
+
+        context = "### Safe Personalization Context\n" + "\n".join(lines)
+        if max_chars > 0 and len(context) > max_chars:
+            return context[:max_chars].rstrip()
+        return context
 
     def boot_context(self, max_chars: int = 3000) -> str:
-        """Build a concise memory snapshot to inject at session start.
+        """Backward-compatible wrapper for safe startup context.
 
-        Includes:
-        1. Curated long-term memory (MEMORY.md) — user profile entries first,
-           then other entries, truncated to fit within the budget.
-        2. Recent daily logs (today + yesterday) — trimmed to fit remaining budget.
-
-        This ensures the agent always starts with relevant context without
-        needing an explicit ``recall()`` call.
+        Older code calls ``boot_context()`` during agent startup. Keep that API
+        stable, but route it through the Phase 8 whitelist so raw logs and full
+        free-form memory never enter the LLM prompt.
         """
-        parts: list[str] = []
-
-        index_content = self.storage.read_index()
-        if index_content:
-            parts.append("### INDEX (System Info)\n" + index_content)
-
-        all_mem = self._merged_memories()
-        used = sum(len(p) for p in parts)
-        mem_budget = int((max_chars - used) * 0.7)
-
-        if all_mem:
-            profile_keys = {"bot_name", "user_name", "user_profile",
-                           "assistant_personality", "assistant_focus_area",
-                           "assistant_tone", "assistant_domain",
-                           "onboarding_completed"}
-            profile = {k: v for k, v in all_mem.items() if k in profile_keys}
-            other = {k: v for k, v in all_mem.items() if k not in profile_keys}
-
-            lines: list[str] = []
-            for k, v in profile.items():
-                lines.append(f"- **{k}**: {v}")
-            total_len = sum(len(ln) for ln in lines)
-
-            for k, v in other.items():
-                line = f"- **{k}**: {v}"
-                if total_len + len(line) > mem_budget:
-                    remaining = len(other) - (len(lines) - len(profile))
-                    if remaining > 0:
-                        lines.append(f"- …({remaining} more entries — use `recall()` to search)")
-                    break
-                lines.append(line)
-                total_len += len(line)
-
-            parts.append("### Long-Term Memory\n" + "\n".join(lines))
-
-        daily_budget = max(500, max_chars - sum(len(p) for p in parts))
-        daily = self.storage.read_recent_daily_logs(days=2)
-        if daily:
-            if len(daily) > daily_budget:
-                daily = daily[:daily_budget] + "\n\n…(truncated)"
-            parts.append("### Recent Activity (Daily Logs)\n" + daily)
-
-        return "\n\n".join(parts) if parts else ""
+        return self.get_safe_boot_context(max_chars=max_chars)
 
     # ── INDEX.md — curated system/config info ───────────────────────────────
 

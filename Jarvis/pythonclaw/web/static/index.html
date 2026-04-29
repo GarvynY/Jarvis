@@ -149,6 +149,9 @@
       <header class="h-[48px] bg-surface-950 border-b border-surface-700/30 flex items-center px-8 shrink-0">
         <h1 id="page-title" class="text-sm font-medium text-gray-400 tracking-tight">Dashboard</h1>
         <div class="ml-auto flex items-center gap-3">
+          <input id="admin-token-input" type="password" placeholder="Admin token"
+            class="input-field !w-[180px] !py-1 !text-[.75rem]" autocomplete="off">
+          <button onclick="saveAdminToken()" class="btn-ghost !py-1 text-[.75rem]">Use</button>
           <span id="header-provider" class="text-[.6875rem] bg-brand-900/30 text-brand-300 px-2.5 py-1 rounded-full font-medium"></span>
         </div>
       </header>
@@ -686,6 +689,33 @@ let ws = null;
 let currentTab = 'dashboard';
 let chatWaiting = false;
 
+function adminToken() {
+  return localStorage.getItem('jarvis_admin_token') || '';
+}
+
+function adminHeaders(extra = {}) {
+  const token = adminToken();
+  return token ? { ...extra, Authorization: 'Bearer ' + token } : extra;
+}
+
+function apiFetch(url, options = {}) {
+  return fetch(url, { ...options, headers: adminHeaders(options.headers || {}) });
+}
+
+function saveAdminToken() {
+  const input = document.getElementById('admin-token-input');
+  const token = input.value.trim();
+  if (token) localStorage.setItem('jarvis_admin_token', token);
+  else localStorage.removeItem('jarvis_admin_token');
+  refreshDashboard();
+  if (currentTab === 'config') loadConfig();
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+  const input = document.getElementById('admin-token-input');
+  if (input) input.value = adminToken();
+});
+
 // ── Tab Switching ────────────────────────────────────────────────────────────
 function switchTab(tab) {
   currentTab = tab;
@@ -717,17 +747,17 @@ function switchTab(tab) {
 // ── Dashboard ────────────────────────────────────────────────────────────────
 async function refreshDashboard() {
   try {
-    const res = await fetch('/api/status');
+    const res = await apiFetch('/api/status');
     const d = await res.json();
     document.getElementById('stat-provider').textContent = d.providerName || '--';
     document.getElementById('stat-provider-class').textContent = d.provider || '--';
-    document.getElementById('stat-skills-loaded').textContent = d.skillsLoaded;
-    document.getElementById('stat-skills-total').textContent = d.skillsTotal;
-    document.getElementById('stat-memories').textContent = d.memoryCount;
+    document.getElementById('stat-skills-loaded').textContent = d.skillsLoaded || 0;
+    document.getElementById('stat-skills-total').textContent = d.skillsTotal || 0;
+    document.getElementById('stat-memories').textContent = d.memoryCount || 0;
     document.getElementById('stat-uptime').textContent = formatUptime(d.uptimeSeconds);
-    document.getElementById('stat-history').textContent = d.historyLength + ' msgs in history';
+    document.getElementById('stat-history').textContent = (d.historyLength || 0) + ' msgs in history';
     document.getElementById('header-provider').textContent = d.providerName || '';
-    document.getElementById('feat-compactions').textContent = d.compactionCount;
+    document.getElementById('feat-compactions').textContent = d.compactionCount || 0;
 
     const wsEl = document.getElementById('feat-websearch');
     wsEl.textContent = d.webSearchEnabled ? 'Enabled' : 'Disabled';
@@ -760,8 +790,9 @@ async function refreshDashboard() {
   } catch (e) {}
 
   try {
-    const res2 = await fetch('/api/identity');
-    const id = await res2.json();
+      const res2 = await apiFetch('/api/identity');
+      const id = await res2.json();
+      if (res2.status === 403) throw new Error(id.error || 'Admin token required');
 
     const soulEl = document.getElementById('soul-content');
     const soulBadge = document.getElementById('soul-badge');
@@ -841,11 +872,16 @@ async function refreshDashboard() {
   } catch (e) { console.error('Identity fetch:', e); }
 
   try {
-    const res3 = await fetch('/api/memories');
+    const res3 = await apiFetch('/api/memories');
     const mem = await res3.json();
     const container = document.getElementById('memory-content');
     const badge = document.getElementById('memory-badge');
-    const entries = mem.memories || {};
+    if (res3.status === 403) {
+      badge.textContent = 'Locked';
+      container.innerHTML = '<span class="text-[.75rem] text-gray-600 italic">Memory API locked. Enter admin token for local debugging.</span>';
+      return;
+    }
+    const entries = mem.fields || {};
     const keys = Object.keys(entries);
     badge.textContent = keys.length + ' entries';
 
@@ -887,15 +923,15 @@ async function openIdentityEditor(type) {
 
   try {
     if (type === 'tools') {
-      const res = await fetch('/api/identity/tools');
+      const res = await apiFetch('/api/identity/tools');
       const data = await res.json();
       editor.value = data.content || defaultToolsTemplate();
     } else if (type === 'index') {
-      const res = await fetch('/api/memory/index');
+      const res = await apiFetch('/api/memory/index');
       const data = await res.json();
       editor.value = data.content || defaultIndexTemplate();
     } else {
-      const res = await fetch('/api/identity');
+      const res = await apiFetch('/api/identity');
       _identityRawData = await res.json();
       const content = type === 'soul' ? _identityRawData.soul : _identityRawData.persona;
       editor.value = content || (type === 'soul' ? defaultSoulTemplate() : defaultPersonaTemplate());
@@ -931,7 +967,7 @@ async function saveIdentity() {
 
   try {
     const endpoint = _identityType === 'index' ? '/api/memory/index' : '/api/identity/' + _identityType;
-    const res = await fetch(endpoint, {
+    const res = await apiFetch(endpoint, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ content }),
@@ -1245,8 +1281,14 @@ let _lastSecretsSet = {};
 
 async function loadConfig() {
   try {
-    const res = await fetch('/api/config');
+    const res = await apiFetch('/api/config');
     const data = await res.json();
+    if (res.status === 403) {
+      document.getElementById('config-banner').className = 'mb-6 rounded-lg px-5 py-3 text-sm bg-amber-500/10 border border-amber-500/20 text-amber-300';
+      document.getElementById('config-banner').innerHTML = '<strong>Admin token required.</strong> Enter it in the header before editing configuration.';
+      document.getElementById('config-banner').classList.remove('hidden');
+      return;
+    }
     _rawConfig = data.config || {};
     _lastSecretsSet = data.secretsSet || {};
 
@@ -1337,7 +1379,7 @@ async function loadConfig() {
     document.getElementById('cfg-max-skills').value = agentCfg.maxParallelSkills || 5;
 
     const web = _rawConfig.web || {};
-    document.getElementById('cfg-web-host').value = web.host || '0.0.0.0';
+    document.getElementById('cfg-web-host').value = web.host || '127.0.0.1';
     document.getElementById('cfg-web-port').value = web.port || 7788;
 
     document.getElementById('cfg-json-raw').value = JSON.stringify(_rawConfig, null, 2);
@@ -1458,10 +1500,10 @@ async function saveConfig() {
     cfg.agent.maxParallelSkills = parseInt(document.getElementById('cfg-max-skills').value) || 5;
 
     if (!cfg.web) cfg.web = {};
-    cfg.web.host = document.getElementById('cfg-web-host').value.trim() || '0.0.0.0';
+    cfg.web.host = document.getElementById('cfg-web-host').value.trim() || '127.0.0.1';
     cfg.web.port = parseInt(document.getElementById('cfg-web-port').value) || 7788;
 
-    const res = await fetch('/api/config', {
+    const res = await apiFetch('/api/config', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ config: cfg }),

@@ -40,8 +40,13 @@
     "apiKey": ""
   },
   "web": {
-    "host": "0.0.0.0",
-    "port": 7788
+    "host": "127.0.0.1",
+    "port": 7788,
+    // Disabled by default: never expose raw user memory over the network.
+    // For trusted local debugging, set enableMemoryApi=true.
+    "enableMemoryApi": false,
+    // Raw memory export and admin APIs additionally require JARVIS_WEB_ADMIN_TOKEN.
+    "enableRawMemoryApi": false
   },
   "channels": {
     "telegram": {
@@ -74,7 +79,15 @@
   "memory": {
     "dir": null
   },
+  "personalization": {
+    "legacy_memory_write_enabled": false
+  },
   "skills": {},
+  "tools": {
+    // Trusted local debugging only. Never enable in production because shell
+    // can read config, memory, logs, and secrets through many paths.
+    "allow_shell_command": false
+  },
   "agent": {
     "autoCompactThreshold": 0,
     "verbose": false

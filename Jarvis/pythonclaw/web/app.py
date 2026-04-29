@@ -13,6 +13,7 @@ import copy
 import json
 import logging
 import os
+import secrets
 import time
 from pathlib import Path
 from typing import Any
@@ -42,6 +43,79 @@ _chat_lock: asyncio.Lock | None = None
 _fastapi_app: FastAPI | None = None
 
 WEB_SESSION_ID = "web:dashboard"
+
+
+def _web_memory_api_enabled() -> bool:
+    """Return whether the memory REST API is enabled.
+
+    Phase 8 user data must not be exposed by unauthenticated network APIs.
+    The endpoint is disabled by default; local debugging must opt in.
+    """
+    return config.get_bool("web", "enableMemoryApi", default=False)
+
+
+def _web_raw_memory_api_enabled() -> bool:
+    """Return whether raw legacy memory export is explicitly enabled."""
+    return config.get_bool("web", "enableRawMemoryApi", default=False)
+
+
+def _admin_token() -> str:
+    """Read the dashboard admin token from the environment only.
+
+    Do not source this from pythonclaw.json: anyone with config API access
+    could otherwise rotate or clear the token through the dashboard itself.
+    """
+    return os.environ.get("JARVIS_WEB_ADMIN_TOKEN", "")
+
+
+def _has_admin_token(request: Request) -> bool:
+    """Validate the optional admin token for sensitive web APIs."""
+    expected = _admin_token()
+    if not expected:
+        return False
+    supplied = request.headers.get("x-jarvis-admin-token", "")
+    auth = request.headers.get("authorization", "")
+    if auth.lower().startswith("bearer "):
+        supplied = auth[7:].strip()
+    return secrets.compare_digest(supplied, expected)
+
+
+def _admin_required_response() -> JSONResponse:
+    return JSONResponse(
+        {
+            "ok": False,
+            "error": (
+                "Admin token required. Set JARVIS_WEB_ADMIN_TOKEN for "
+                "trusted local debugging."
+            ),
+        },
+        status_code=403,
+    )
+
+
+def _require_admin(request: Request):
+    """Guard sensitive dashboard APIs.
+
+    Config, identity, and raw memory endpoints can change model behavior or
+    reveal Phase 8 user data. They must never be exposed without an admin token,
+    even when the dashboard is accidentally bound to a public interface.
+    """
+    if not _has_admin_token(request):
+        return _admin_required_response()
+    return None
+
+
+def _safe_context_to_fields(context: str) -> dict[str, str]:
+    """Parse MemoryManager safe boot context into JSON fields."""
+    fields: dict[str, str] = {}
+    for line in context.splitlines():
+        line = line.strip()
+        if not line.startswith("- **") or "**:" not in line:
+            continue
+        label, value = line[4:].split("**:", 1)
+        key = label.strip("* ").lower().replace(" ", "_")
+        fields[key] = value.strip()
+    return fields
 
 
 def _get_chat_lock() -> asyncio.Lock:
@@ -171,7 +245,10 @@ def _secret_keys_present(obj: Any, _parent_key: str = "") -> dict[str, str]:
 _MASKED_PLACEHOLDER = "••••••••"
 
 
-async def _api_config_get():
+async def _api_config_get(request: Request):
+    blocked = _require_admin(request)
+    if blocked:
+        return blocked
     raw = config.as_dict()
     masked = _mask_secrets(copy.deepcopy(raw))
     cfg_path = config.config_path()
@@ -210,6 +287,9 @@ async def _api_config_save(request: Request):
     are preserved from the existing config (not overwritten).
     """
     global _provider
+    blocked = _require_admin(request)
+    if blocked:
+        return blocked
 
     try:
         body = await request.json()
@@ -301,52 +381,108 @@ async def _api_skills():
     return {"total": len(skills_meta), "categories": categories, "categoryMeta": cat_meta}
 
 
-async def _api_status():
+def _build_status(request: Request | None = None):
     uptime = int(time.time() - _start_time)
     provider_name = config.get_str("llm", "provider", env="LLM_PROVIDER", default="deepseek")
+    is_admin = _has_admin_token(request) if request is not None else False
 
     agent = _get_agent()
     if agent is None:
-        return {
+        public_status = {
             "provider": "Not configured",
             "providerName": provider_name,
             "providerReady": False,
-            "skillsLoaded": 0,
-            "skillsTotal": 0,
-            "memoryCount": 0,
-            "historyLength": 0,
-            "compactionCount": 0,
             "uptimeSeconds": uptime,
-            "webSearchEnabled": False,
         }
+        if is_admin:
+            public_status.update({
+                "skillsLoaded": 0,
+                "skillsTotal": 0,
+                "memoryCount": 0,
+                "historyLength": 0,
+                "compactionCount": 0,
+                "webSearchEnabled": False,
+            })
+        return public_status
 
-    session_file = _store._path(WEB_SESSION_ID) if _store else None
-    return {
+    status = {
         "provider": type(agent.provider).__name__,
         "providerName": provider_name,
         "providerReady": True,
-        "skillsLoaded": len(agent.loaded_skill_names),
-        "skillsTotal": len(agent._registry.discover()),
-        "memoryCount": len(agent.memory.list_all()),
-        "historyLength": len(agent.messages),
-        "compactionCount": agent.compaction_count,
         "uptimeSeconds": uptime,
-        "webSearchEnabled": agent._web_search_enabled,
-        "sessionFile": session_file,
-        "sessionPersistent": True,
+    }
+    if is_admin:
+        status.update({
+            "skillsLoaded": len(agent.loaded_skill_names),
+            "skillsTotal": len(agent._registry.discover()),
+            "memoryCount": len(agent.memory.list_all()),
+            "historyLength": len(agent.messages),
+            "compactionCount": agent.compaction_count,
+            "webSearchEnabled": agent._web_search_enabled,
+            "sessionPersistent": True,
+        })
+    return status
+
+
+async def _api_status(request: Request):
+    return _build_status(request)
+
+
+async def _api_memories(request: Request):
+    """Return safe personalization fields; never raw memory by default.
+
+    Phase 8 privacy rule: raw MEMORY.md values, daily logs, and inferred
+    legacy memories must not be exposed over the Web API without explicit
+    local-debug opt-in and an admin token.
+    """
+    if not _web_memory_api_enabled():
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": (
+                    "Memory API is disabled by default. Enable "
+                    "web.enableMemoryApi only for trusted local debugging."
+                ),
+            },
+            status_code=403,
+        )
+
+    agent = _get_agent()
+    if agent is None:
+        return {"ok": True, "safe": True, "total": 0, "fields": {}}
+
+    safe_context = agent.memory.get_safe_boot_context()
+    fields = _safe_context_to_fields(safe_context)
+
+    if request.query_params.get("raw") == "1":
+        if not (_web_raw_memory_api_enabled() and _has_admin_token(request)):
+            return JSONResponse(
+                {
+                    "ok": False,
+                    "error": (
+                        "Raw memory export is blocked. It requires "
+                        "web.enableRawMemoryApi=true and a valid admin token."
+                    ),
+                },
+                status_code=403,
+            )
+        memories = agent.memory.list_all()
+        return {"ok": True, "safe": False, "total": len(memories), "memories": memories}
+
+    return {
+        "ok": True,
+        "safe": True,
+        "total": len(fields),
+        "fields": fields,
+        "context": safe_context,
     }
 
 
-async def _api_memories():
-    agent = _get_agent()
-    if agent is None:
-        return {"total": 0, "memories": []}
-    memories = agent.memory.list_all()
-    return {"total": len(memories), "memories": memories}
-
-
-async def _api_identity():
+async def _api_identity(request: Request):
     """Return soul, persona content, and the full tool list."""
+    blocked = _require_admin(request)
+    if blocked:
+        return blocked
     from ..core.tools import (
         CRON_TOOLS,
         KNOWLEDGE_TOOL,
@@ -373,7 +509,7 @@ async def _api_identity():
     tools_notes = _read_md(str(home / "context" / "tools"))
     index_file = home / "context" / "memory" / "INDEX.md"
     index_content = None
-    if index_file.is_file():
+    if index_file.is_file() and _has_admin_token(request):
         try:
             index_content = index_file.read_text(encoding="utf-8").strip()
         except OSError:
@@ -405,6 +541,7 @@ async def _api_identity():
         "persona": persona,
         "toolsNotes": tools_notes,
         "indexContent": index_content,
+        "indexContentRequiresAdmin": index_file.is_file() and index_content is None,
         "soulConfigured": soul is not None,
         "personaConfigured": persona is not None,
         "toolsNotesConfigured": tools_notes is not None,
@@ -415,6 +552,9 @@ async def _api_identity():
 
 async def _api_save_soul(request: Request):
     """Save soul content to context/soul/SOUL.md and reload agent identity."""
+    blocked = _require_admin(request)
+    if blocked:
+        return blocked
     try:
         body = await request.json()
         content = body.get("content", "").strip()
@@ -435,6 +575,9 @@ async def _api_save_soul(request: Request):
 
 async def _api_save_persona(request: Request):
     """Save persona content to context/persona/persona.md and reload agent identity."""
+    blocked = _require_admin(request)
+    if blocked:
+        return blocked
     try:
         body = await request.json()
         content = body.get("content", "").strip()
@@ -453,8 +596,11 @@ async def _api_save_persona(request: Request):
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
 
 
-async def _api_get_tools_notes():
+async def _api_get_tools_notes(request: Request):
     """Return the current TOOLS.md content."""
+    blocked = _require_admin(request)
+    if blocked:
+        return blocked
     tools_dir = config.PYTHONCLAW_HOME / "context" / "tools"
     content = None
     if tools_dir.is_dir():
@@ -469,6 +615,9 @@ async def _api_get_tools_notes():
 
 async def _api_save_tools_notes(request: Request):
     """Save TOOLS.md content and reload agent identity."""
+    blocked = _require_admin(request)
+    if blocked:
+        return blocked
     try:
         body = await request.json()
         content = body.get("content", "").strip()
@@ -485,8 +634,11 @@ async def _api_save_tools_notes(request: Request):
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
 
 
-async def _api_get_index():
-    """Return the INDEX.md curated system info content."""
+async def _api_get_index(request: Request):
+    """Return INDEX.md only to authenticated local/debug admins."""
+    blocked = _require_admin(request)
+    if blocked:
+        return blocked
     index_path = config.PYTHONCLAW_HOME / "context" / "memory" / "INDEX.md"
     content = ""
     if index_path.is_file():
@@ -499,6 +651,9 @@ async def _api_get_index():
 
 async def _api_save_index(request: Request):
     """Save INDEX.md content and refresh agent memory."""
+    blocked = _require_admin(request)
+    if blocked:
+        return blocked
     try:
         body = await request.json()
         content = body.get("content", "").strip()
@@ -833,7 +988,7 @@ async def _ws_chat(websocket: WebSocket):
                 continue
 
             if message == "/status":
-                status = await _api_status()
+                status = _build_status()
                 await websocket.send_json({"type": "response", "content": json.dumps(status, indent=2)})
                 continue
 
