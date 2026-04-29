@@ -12,6 +12,7 @@ build/
 
 # Claude Code
 CLAUDE.md
+.claude/
 
 # OS
 .DS_Store
@@ -19,3 +20,4 @@ Thumbs.db
 jarvis_deploy.tar.gz
 deploy.tar.gz
 .env.deploy
+pythonclaw.json
