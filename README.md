@@ -9,6 +9,7 @@
 - **汇率告警**：每 30 分钟检测波动，超过阈值（默认 ±0.3%）推送告警
 - **联合告警**：突发新闻 + 汇率从 48 小时高点下跌 ≥ 0.8% 同时触发时，推送带 AI 分析的深度告警
 - **Telegram 对话**：可直接向 Bot 提问汇率走势、换汇建议、新闻分析等
+- **隐私感知个性化**：结构化保存用户偏好，支持 `/my_profile`、`/privacy`、`/delete_profile`
 
 ## 技术架构
 
@@ -22,6 +23,7 @@
 | 深度新闻搜索 | Tavily（仅每日早报使用，约 60 credits/月） |
 | 推送渠道 | Telegram Bot |
 | 定时调度 | APScheduler（内置于 PythonClaw）+ 独立监控守护进程 |
+| 个性化数据 | SQLite（`~/.pythonclaw/context/personalization/user_profiles.sqlite3`） |
 | 部署 | RackNerd VPS，Ubuntu 24.04，systemd 管理 |
 
 ## 监控架构
@@ -59,6 +61,9 @@ AUDRateAgent/
 │   │   ├── core/llm/
 │   │   │   ├── openai_compatible.py     # DeepSeek/OpenAI provider
 │   │   │   └── anthropic_client.py      # Anthropic provider（含兼容性修复）
+│   │   ├── core/personalization/
+│   │   │   └── user_profile_store.py    # Phase 8 结构化用户资料 SQLite 存储
+│   │   ├── channels/telegram_bot.py      # Telegram 命令与消息处理
 │   │   └── templates/skills/data/
 │   │       └── cnyaud_monitor/          # 核心自定义技能
 │   │           ├── SKILL.md             # 技能定义（Agent 自动发现）
@@ -134,6 +139,41 @@ systemctl start jarvis-agent jarvis-monitor
 | 新闻监控 | 每 20 分钟 | 有新文章时（DeepSeek） | 相关性过滤 + 简析 |
 | 汇率告警 | 每 30 分钟 | 否 | 波动超阈值才推送 |
 | 联合告警 | 实时触发 | 是（DeepSeek） | 新闻 + 汇率双触发 |
+
+## Telegram 命令
+
+| 命令 | 说明 |
+|------|------|
+| `/start` | 显示欢迎信息 |
+| `/status` | 查看当前 Agent 会话状态 |
+| `/my_profile` | 查看当前结构化个性化资料，不展示 raw logs |
+| `/privacy` | 查看 Jarvis 第 8 阶段隐私设计说明 |
+| `/delete_profile` | 显示删除影响范围与确认方式 |
+| `/delete_profile confirm` | 删除当前 Telegram 用户的结构化个性化数据 |
+
+`/delete_profile confirm` 只删除结构化个性化数据：明确偏好、推断偏好、反馈事件和短期 raw events。它不会删除系统运行日志、Telegram 对话历史或 legacy memory 文件。
+
+## 隐私与个性化
+
+Phase 8 的个性化设计遵循以下原则：
+
+- 不依赖非结构化 LLM memory 存储用户偏好。
+- 个性化数据存储在 SQLite 的结构化表中。
+- LLM 个性化上下文只接收白名单字段，不接收完整 `MEMORY.md`、daily logs、raw events 或 `history_detail.jsonl`。
+- 原始行为事件只作为短期反馈信号，带 TTL 上限并可清理。
+- 用户可通过 `/my_profile` 查看资料，通过 `/delete_profile confirm` 删除结构化个性化数据。
+
+当前结构化数据表：
+
+| 表 | 用途 |
+|----|------|
+| `users` | Telegram 用户 profile 根记录 |
+| `explicit_preferences` | 用户明确设置或确认的偏好 |
+| `inferred_preferences` | 轻量推断出的内容偏好 |
+| `feedback_events` | 有用/无用/不感兴趣等反馈 |
+| `raw_events` | 短期原始事件，不进入 LLM 个性化上下文 |
+
+Jarvis 不会主动要求或用于个性化存储银行卡、账户余额、身份证/护照、确切地址或详细个人财务压力等敏感信息；检测到这类内容时会尽量拒绝写入个性化资料。
 
 ## 数据来源声明
 
