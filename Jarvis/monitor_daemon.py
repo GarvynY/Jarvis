@@ -257,16 +257,25 @@ def check_rate(state: dict, token: str, chat_id: int) -> dict | None:
         base_time = raw_time[:16].replace("T", " ") + " UTC" if raw_time else "未知"
         # Use cny_per_aud perspective: positive = AUD appreciated (buys more CNY)
         chg_cny = (current - baseline) / baseline * 100 if baseline else 0
-        icon, direction = ("📈", "AUD 升值") if chg_cny > 0 else ("📉", "AUD 贬值")
-        msg = (
-            f"{icon} <b>{direction}  {abs(chg_cny):.2f}%</b>\n\n"
-            f"当前  1 AUD = <b>{current:.4f}</b> CNY\n"
-            f"基准  1 AUD = {baseline:.4f} CNY\n"
-            f"偏差  {chg_cny:+.2f}%   触发阈值 ±{SIMPLE_THRESHOLD_PCT}%\n\n"
-            f"基准建立: {base_time}"
-        )
-        _telegram_send(token, chat_id, msg)
-        log.info("Simple rate alert sent.")
+
+        # Dedup: skip if identical to last sent alert (same rate + same rounded change)
+        fingerprint = (round(current, 4), round(chg_cny, 2))
+        if state.get("last_simple_alert_fp") == list(fingerprint):
+            log.info("Simple rate alert suppressed (duplicate of last send: %.4f / %+.2f%%)",
+                     current, chg_cny)
+        else:
+            icon, direction = ("📈", "AUD 升值") if chg_cny > 0 else ("📉", "AUD 贬值")
+            msg = (
+                f"{icon} <b>{direction}  {abs(chg_cny):.2f}%</b>\n\n"
+                f"当前  1 AUD = <b>{current:.4f}</b> CNY\n"
+                f"基准  1 AUD = {baseline:.4f} CNY\n"
+                f"偏差  {chg_cny:+.2f}%   触发阈值 ±{SIMPLE_THRESHOLD_PCT}%\n\n"
+                f"基准建立: {base_time}"
+            )
+            _telegram_send(token, chat_id, msg)
+            state["last_simple_alert_fp"] = list(fingerprint)
+            _save_state(state)
+            log.info("Simple rate alert sent.")
 
     return {
         "data": data, "current_cny": current, "high_48h": high, "drop_pct": drop,
