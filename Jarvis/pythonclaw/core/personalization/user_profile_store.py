@@ -24,7 +24,7 @@ from ... import config
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 EXPLICIT_PREFERENCE_KEYS = {
     "language",
@@ -36,6 +36,7 @@ EXPLICIT_PREFERENCE_KEYS = {
     "privacy_level",
     "preferred_reminder_time",
     "actionability_threshold",
+    "alert_preference",
 }
 
 INFERRED_PREFERENCE_KEYS = {
@@ -78,6 +79,7 @@ MAX_TOPICS_PER_FIELD = 20
 
 PREFERRED_SUMMARY_STYLES = {"brief", "standard", "detailed", "action_first"}
 PRIVACY_LEVELS = {"minimal", "standard", "strict"}
+ALERT_PREFERENCES = {"target_rate", "volatility", "major_news", "morning_report"}
 
 SENSITIVE_VALUE_PATTERNS = [
     re.compile(r"\bapi[_ -]?key\b", re.IGNORECASE),
@@ -207,6 +209,13 @@ def _validate_preference_value(key: str, value: Any) -> Any:
         if value not in PRIVACY_LEVELS:
             raise ValueError(f"Unsupported privacy_level: {value}")
         return value
+    if key == "alert_preference":
+        if value is None:
+            return None
+        value = str(value).strip()
+        if value not in ALERT_PREFERENCES:
+            raise ValueError(f"Unsupported alert_preference: {value}")
+        return value
     if key == "purpose":
         if value is None:
             return None
@@ -283,6 +292,18 @@ def _column_names(conn: sqlite3.Connection, table: str) -> set[str]:
 
 def _migrate_schema(conn: sqlite3.Connection) -> None:
     """Apply small in-place migrations for the structured profile store."""
+    user_columns = _column_names(conn, "users")
+    if user_columns and "onboarding_completed" not in user_columns:
+        conn.execute(
+            "ALTER TABLE users ADD COLUMN onboarding_completed INTEGER NOT NULL DEFAULT 0"
+        )
+    if user_columns and "onboarding_completed_at" not in user_columns:
+        conn.execute("ALTER TABLE users ADD COLUMN onboarding_completed_at TEXT")
+
+    explicit_columns = _column_names(conn, "explicit_preferences")
+    if explicit_columns and "alert_preference" not in explicit_columns:
+        conn.execute("ALTER TABLE explicit_preferences ADD COLUMN alert_preference TEXT")
+
     inferred_columns = _column_names(conn, "inferred_preferences")
     if inferred_columns and "confidence" not in inferred_columns:
         conn.execute("ALTER TABLE inferred_preferences ADD COLUMN confidence REAL")
@@ -307,7 +328,9 @@ def init_db(db_path: str | Path | None = None) -> Path:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 telegram_user_id TEXT NOT NULL UNIQUE,
                 created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
+                updated_at TEXT NOT NULL,
+                onboarding_completed INTEGER NOT NULL DEFAULT 0,
+                onboarding_completed_at TEXT
             );
 
             CREATE TABLE IF NOT EXISTS explicit_preferences (
@@ -321,6 +344,7 @@ def init_db(db_path: str | Path | None = None) -> Path:
                 privacy_level TEXT,
                 preferred_reminder_time TEXT,
                 actionability_threshold REAL,
+                alert_preference TEXT,
                 updated_at TEXT NOT NULL,
                 FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
             );
@@ -434,6 +458,7 @@ def _explicit_row_to_dict(row: sqlite3.Row | None) -> dict[str, Any]:
         "privacy_level": row["privacy_level"],
         "preferred_reminder_time": row["preferred_reminder_time"],
         "actionability_threshold": row["actionability_threshold"],
+        "alert_preference": row["alert_preference"],
         "updated_at": row["updated_at"],
     }
 
@@ -516,9 +541,10 @@ def update_explicit_preferences(
             INSERT INTO explicit_preferences (
                 user_id, language, target_rate, alert_threshold, purpose,
                 preferred_summary_style, preferred_topics_json, privacy_level,
-                preferred_reminder_time, actionability_threshold, updated_at
+                preferred_reminder_time, actionability_threshold, alert_preference,
+                updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(user_id) DO UPDATE SET
                 language = excluded.language,
                 target_rate = excluded.target_rate,
@@ -529,6 +555,7 @@ def update_explicit_preferences(
                 privacy_level = excluded.privacy_level,
                 preferred_reminder_time = excluded.preferred_reminder_time,
                 actionability_threshold = excluded.actionability_threshold,
+                alert_preference = excluded.alert_preference,
                 updated_at = excluded.updated_at
             """,
             (
@@ -542,8 +569,33 @@ def update_explicit_preferences(
                 data.get("privacy_level"),
                 data.get("preferred_reminder_time"),
                 data.get("actionability_threshold"),
+                data.get("alert_preference"),
                 _now(),
             ),
+        )
+    return get_user_profile(telegram_user_id, db_path)
+
+
+def mark_onboarding_completed(
+    telegram_user_id: int | str,
+    *,
+    completed: bool = True,
+    db_path: str | Path | None = None,
+) -> dict[str, Any]:
+    """Mark whether the lightweight Telegram onboarding flow is complete."""
+    init_db(db_path)
+    now = _now()
+    with _connect(db_path) as conn:
+        user = _ensure_user(conn, telegram_user_id)
+        conn.execute(
+            """
+            UPDATE users
+            SET onboarding_completed = ?,
+                onboarding_completed_at = ?,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (1 if completed else 0, now if completed else None, now, user["id"]),
         )
     return get_user_profile(telegram_user_id, db_path)
 

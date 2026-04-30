@@ -9,7 +9,7 @@
 - **汇率告警**：每 30 分钟检测波动，超过阈值（默认 ±0.3%）推送告警
 - **联合告警**：突发新闻 + 汇率从 48 小时高点下跌 ≥ 0.8% 同时触发时，推送带 AI 分析的深度告警
 - **Telegram 对话**：可直接向 Bot 提问汇率走势、换汇建议、新闻分析等
-- **隐私感知个性化**：结构化保存用户偏好，支持 `/my_profile`、`/privacy`、`/delete_profile`
+- **隐私感知个性化**：结构化保存用户偏好，支持 `/my_profile`、`/update_profile`、`/privacy`、`/delete_profile`
 
 ## 技术架构
 
@@ -148,10 +148,16 @@ systemctl start jarvis-agent jarvis-monitor
 | `/status` | 查看当前 Agent 会话状态 |
 | `/my_profile` | 查看当前结构化个性化资料，不展示 raw logs |
 | `/privacy` | 查看 Jarvis 第 8 阶段隐私设计说明 |
+| `/update_profile` | 进入问答式流程，逐项更新明确偏好 |
+| `/update_profile 目标汇率=4.85 提醒阈值=0.3 用途=学费 风格=简短 主题=RBA,oil,CNY` | 高级用法：一次性更新明确偏好 |
 | `/delete_profile` | 显示删除影响范围与确认方式 |
-| `/delete_profile confirm` | 删除当前 Telegram 用户的结构化个性化数据 |
+| `确定` | 在 `/delete_profile` 后确认删除当前 Telegram 用户的结构化个性化数据 |
 
-`/delete_profile confirm` 只删除结构化个性化数据：明确偏好、推断偏好、反馈事件和短期 raw events。它不会删除系统运行日志、Telegram 对话历史或 legacy memory 文件。
+问答式 `/update_profile` 会依次询问目标汇率、提醒阈值、用途、摘要风格、关注主题、语言和隐私级别。每一步都可以回复 `跳过`，也可以回复 `取消` 退出本次修改。
+
+新用户首次私聊 Jarvis 时会进入轻量入门流程，只询问用途、提醒偏好和摘要风格。用户可回复 `跳过引导` 使用默认资料，跳过后不会反复询问。
+
+`/delete_profile` 后回复 `确定` 只删除结构化个性化数据：明确偏好、推断偏好、反馈事件和短期 raw events。它不会删除系统运行日志、Telegram 对话历史或 legacy memory 文件。
 
 ## 隐私与个性化
 
@@ -161,14 +167,14 @@ Phase 8 的个性化设计遵循以下原则：
 - 个性化数据存储在 SQLite 的结构化表中。
 - LLM 个性化上下文只接收白名单字段，不接收完整 `MEMORY.md`、daily logs、raw events 或 `history_detail.jsonl`。
 - 原始行为事件只作为短期反馈信号，带 TTL 上限并可清理。
-- 用户可通过 `/my_profile` 查看资料，通过 `/delete_profile confirm` 删除结构化个性化数据。
+- 用户可通过 `/my_profile` 查看资料，通过 `/update_profile` 更新明确偏好，通过 `/delete_profile` 后回复 `确定` 删除结构化个性化数据。
 
 当前结构化数据表：
 
 | 表 | 用途 |
 |----|------|
-| `users` | Telegram 用户 profile 根记录 |
-| `explicit_preferences` | 用户明确设置或确认的偏好 |
+| `users` | Telegram 用户 profile 根记录，含 onboarding 完成状态 |
+| `explicit_preferences` | 用户明确设置或确认的偏好，含用途、提醒偏好、摘要风格等 |
 | `inferred_preferences` | 轻量推断出的内容偏好 |
 | `feedback_events` | 有用/无用/不感兴趣等反馈 |
 | `raw_events` | 短期原始事件，不进入 LLM 个性化上下文 |

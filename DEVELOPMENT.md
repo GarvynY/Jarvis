@@ -331,10 +331,20 @@ purge_expired_raw_events()
 |------|------|
 | `/privacy` | 中文解释 Phase 8 数据分类、敏感信息处理和 LLM 个性化上下文边界 |
 | `/my_profile` | 查看当前用户结构化 profile；不存在则创建默认 profile |
+| `/update_profile` | 进入问答式流程，逐项更新明确偏好，不更新推断偏好 |
+| `/update_profile 目标汇率=4.85 提醒阈值=0.3 用途=学费 风格=简短 主题=RBA,oil,CNY` | 高级用法：一次性更新明确偏好 |
 | `/delete_profile` | 显示删除影响范围和确认方式 |
-| `/delete_profile confirm` | 删除当前 Telegram 用户的结构化个性化数据 |
+| `确定` | 在 `/delete_profile` 后确认删除当前 Telegram 用户的结构化个性化数据 |
 
-`/delete_profile confirm` 删除范围：
+新用户首次私聊 Jarvis，或 `users.onboarding_completed = 0` 时，会进入轻量 onboarding：
+
+1. 用途：学费 / 生活费 / 投资 / 其他
+2. 提醒偏好：目标汇率 / 波动率 / 重大新闻 / 晨报
+3. 摘要风格：简短 / 普通 / 详细
+
+回答保存到 `explicit_preferences`，完成状态保存在 `users.onboarding_completed` 和 `users.onboarding_completed_at`。用户可回复 `跳过引导` 使用默认 profile，跳过后不会反复询问。
+
+`/delete_profile` 后回复 `确定` 的删除范围：
 
 - explicit preferences
 - inferred preferences
@@ -362,12 +372,27 @@ tail -80 ~/.pythonclaw/monitor_daemon.log
 Telegram：
 
 ```text
+/start
+学费
+重大新闻
+简短
 /privacy
 /my_profile
+/update_profile
+4.85
+0.3
+学费
+简短
+RBA，oil，CNY
+zh-CN
+标准
+/update_profile 目标汇率=4.85 提醒阈值=0.3 用途=学费 风格=简短 主题=RBA,oil,CNY
 /delete_profile
-/delete_profile confirm
+确定
 /my_profile
 ```
+
+问答式更新中可回复 `跳过` 跳过当前字段，或回复 `取消` 退出本次修改。
 
 SQLite 检查：
 
@@ -403,7 +428,7 @@ PY
 删除闭环通过标准：
 
 - `/my_profile` 不展示 raw logs 或 JSON dump。
-- `/delete_profile` 不会立即删除，必须 `/delete_profile confirm`。
+- `/delete_profile` 不会立即删除，必须再回复 `确定`。
 - 删除后相关 profile 表记录被清空或当前用户相关行消失。
 - 删除后 `/my_profile` 显示默认/暂无偏好状态。
 - `/reset` 后再询问旧目标汇率，Jarvis 不应继续记得已删除偏好。

@@ -38,6 +38,7 @@ import importlib.util
 import io
 import json
 import logging
+import math
 import queue as _queue
 import re
 import time
@@ -87,6 +88,7 @@ _WELCOME_GUIDE = (
     "  /status    — 查看会话状态\n"
     "  /compact   — 压缩对话历史\n"
     "  /my_profile — 查看我的个性化资料\n"
+    "  /update_profile — 更新我的偏好\n"
     "  /delete_profile — 删除我的个性化数据\n"
     "  /privacy   — 查看隐私说明\n\n"
     "💡 也可以直接输入任何问题，我会尽力回答！"
@@ -113,8 +115,16 @@ _PRIVACY_TEXT = (
     "大语言模型的个性化上下文只应接收经过白名单筛选的字段，而不是完整用户档案、原始日志或 MEMORY.md。\n\n"
     "资料相关命令：\n"
     "- /my_profile 查看当前个性化资料\n"
-    "- /update_profile 修改偏好（后续支持）\n"
+    "- /update_profile 修改明确偏好\n"
     "- /delete_profile 删除个性化数据"
+)
+
+_UPDATE_PROFILE_USAGE = (
+    "格式示例：\n"
+    "/update_profile 目标汇率=4.85 提醒阈值=0.3 用途=学费 风格=简短 主题=RBA,oil,CNY 提醒偏好=重大新闻\n\n"
+    "等号两边可以有空格；提醒阈值=0.3 表示 0.3%。\n"
+    "可用字段：目标汇率、提醒阈值、用途、语言、风格、主题、提醒偏好、隐私级别。\n"
+    "用途建议：学费、生活、投资、一般。风格可选：简短、普通、详细。"
 )
 
 
@@ -202,6 +212,45 @@ def _display_topics(value: Any) -> str:
     return str(value)
 
 
+def _display_percent(value: Any) -> str:
+    if value is None or value == "":
+        return "未设置"
+    return f"{value}%"
+
+
+_PROFILE_VALUE_LABELS = {
+    "purpose": {
+        "tuition": "学费",
+        "living": "生活",
+        "investment": "投资",
+        "general": "其他",
+    },
+    "preferred_summary_style": {
+        "brief": "简短",
+        "standard": "普通",
+        "detailed": "详细",
+        "action_first": "行动优先",
+    },
+    "privacy_level": {
+        "minimal": "最少",
+        "standard": "标准",
+        "strict": "严格",
+    },
+    "alert_preference": {
+        "target_rate": "目标汇率",
+        "volatility": "波动率",
+        "major_news": "重大新闻",
+        "morning_report": "晨报",
+    },
+}
+
+
+def _display_profile_value(field: str, value: Any) -> str:
+    if value is None or value == "":
+        return "未设置"
+    return _PROFILE_VALUE_LABELS.get(field, {}).get(str(value), str(value))
+
+
 def _is_set(value: Any) -> bool:
     return value not in (None, "", [])
 
@@ -215,7 +264,7 @@ def _format_feedback_summary(summary: dict[str, Any]) -> list[str]:
         "useless": "无用",
         "not_interested": "不感兴趣",
     }
-    lines = ["", "反馈摘要："]
+    lines = ["", "反馈记录："]
     for key in ("useful", "not_useful", "useless", "not_interested"):
         count = summary.get(key)
         if count:
@@ -236,24 +285,25 @@ def _format_user_profile(profile: dict[str, Any], *, created: bool = False) -> s
             "我刚为你创建了默认资料。目前暂无偏好记录。",
             "",
             "说明：这里不会显示原始行为日志或短期 raw events。",
-            "你可以使用 /delete_profile 删除个性化数据；修改偏好功能后续支持。",
+            "你可以使用 /update_profile 修改明确偏好，或使用 /delete_profile 删除个性化数据。",
         ])
         return "\n".join(lines)
 
     explicit_lines = [
         ("目标汇率", _display_value(explicit.get("target_rate")), explicit.get("target_rate")),
-        ("提醒阈值", _display_value(explicit.get("alert_threshold")), explicit.get("alert_threshold")),
-        ("用途", _display_value(explicit.get("purpose")), explicit.get("purpose")),
+        ("提醒阈值", _display_percent(explicit.get("alert_threshold")), explicit.get("alert_threshold")),
+        ("用途", _display_profile_value("purpose", explicit.get("purpose")), explicit.get("purpose")),
+        ("提醒偏好", _display_profile_value("alert_preference", explicit.get("alert_preference")), explicit.get("alert_preference")),
         ("语言", _display_value(explicit.get("language")), explicit.get("language")),
         (
             "首选摘要样式",
-            _display_value(explicit.get("preferred_summary_style")),
+            _display_profile_value("preferred_summary_style", explicit.get("preferred_summary_style")),
             explicit.get("preferred_summary_style"),
         ),
         ("首选主题", _display_topics(explicit.get("preferred_topics")), explicit.get("preferred_topics")),
         ("首选提醒时间", _display_value(explicit.get("preferred_reminder_time")), explicit.get("preferred_reminder_time")),
         ("可操作性阈值", _display_value(explicit.get("actionability_threshold")), explicit.get("actionability_threshold")),
-        ("隐私级别", _display_value(explicit.get("privacy_level")), explicit.get("privacy_level")),
+        ("隐私级别", _display_profile_value("privacy_level", explicit.get("privacy_level")), explicit.get("privacy_level")),
     ]
     lines.extend(["", "明确偏好："])
     added = False
@@ -283,7 +333,7 @@ def _format_user_profile(profile: dict[str, Any], *, created: bool = False) -> s
     lines.extend([
         "",
         "说明：这里不会显示原始行为日志或短期 raw events。",
-        "你可以使用 /delete_profile 删除个性化数据；修改偏好功能后续支持。",
+        "你可以使用 /update_profile 修改明确偏好，或使用 /delete_profile 删除个性化数据。",
     ])
     return "\n".join(lines)
 
@@ -291,6 +341,268 @@ def _format_user_profile(profile: dict[str, Any], *, created: bool = False) -> s
 def _delete_profile_requires_confirmation() -> bool:
     """Hook for adding a multi-step delete confirmation flow later."""
     return True
+
+
+_PROFILE_FIELD_ALIASES = {
+    "target_rate": "target_rate",
+    "目标汇率": "target_rate",
+    "汇率目标": "target_rate",
+    "alert_threshold": "alert_threshold",
+    "提醒阈值": "alert_threshold",
+    "告警阈值": "alert_threshold",
+    "purpose": "purpose",
+    "用途": "purpose",
+    "language": "language",
+    "语言": "language",
+    "style": "preferred_summary_style",
+    "preferred_summary_style": "preferred_summary_style",
+    "风格": "preferred_summary_style",
+    "摘要风格": "preferred_summary_style",
+    "topics": "preferred_topics",
+    "preferred_topics": "preferred_topics",
+    "主题": "preferred_topics",
+    "关注主题": "preferred_topics",
+    "privacy_level": "privacy_level",
+    "隐私级别": "privacy_level",
+    "隐私": "privacy_level",
+    "alert_preference": "alert_preference",
+    "提醒偏好": "alert_preference",
+    "提醒": "alert_preference",
+}
+
+_PURPOSE_ALIASES = {
+    "tuition": "tuition",
+    "学费": "tuition",
+    "living": "living",
+    "生活": "living",
+    "生活费": "living",
+    "investment": "investment",
+    "投资": "investment",
+    "general": "general",
+    "一般": "general",
+    "通用": "general",
+    "其他": "general",
+}
+
+_STYLE_ALIASES = {
+    "short": "brief",
+    "简短": "brief",
+    "短": "brief",
+    "brief": "brief",
+    "normal": "standard",
+    "普通": "standard",
+    "正常": "standard",
+    "standard": "standard",
+    "detailed": "detailed",
+    "详细": "detailed",
+}
+
+_PRIVACY_ALIASES = {
+    "minimal": "minimal",
+    "最少": "minimal",
+    "最小": "minimal",
+    "standard": "standard",
+    "标准": "standard",
+    "strict": "strict",
+    "严格": "strict",
+}
+
+_ALERT_PREFERENCE_ALIASES = {
+    "target_rate": "target_rate",
+    "目标汇率": "target_rate",
+    "volatility": "volatility",
+    "波动率": "volatility",
+    "汇率波动": "volatility",
+    "major_news": "major_news",
+    "重大新闻": "major_news",
+    "新闻": "major_news",
+    "morning_report": "morning_report",
+    "晨报": "morning_report",
+    "早报": "morning_report",
+}
+
+_UPDATE_PROFILE_LABELS = {
+    "target_rate": "目标汇率",
+    "alert_threshold": "提醒阈值",
+    "purpose": "用途",
+    "language": "语言",
+    "preferred_summary_style": "摘要风格",
+    "preferred_topics": "关注主题",
+    "privacy_level": "隐私级别",
+    "alert_preference": "提醒偏好",
+}
+
+_UPDATE_PROFILE_VALUE_LABELS = {
+    "purpose": {
+        "tuition": "学费",
+        "living": "生活",
+        "investment": "投资",
+        "general": "一般",
+    },
+    "preferred_summary_style": {
+        "brief": "简短",
+        "standard": "普通",
+        "detailed": "详细",
+    },
+    "privacy_level": {
+        "minimal": "最少",
+        "standard": "标准",
+        "strict": "严格",
+    },
+    "alert_preference": {
+        "target_rate": "目标汇率",
+        "volatility": "波动率",
+        "major_news": "重大新闻",
+        "morning_report": "晨报",
+    },
+}
+
+_UPDATE_PROFILE_PAIR_RE = re.compile(
+    r"([^\s=]+)\s*=\s*(?:\"([^\"]*)\"|'([^']*)'|([^\s]+))"
+)
+
+_UPDATE_PROFILE_ERROR_MESSAGES = {
+    "empty": "请在 /update_profile 后添加要更新的字段。",
+    "bad_format": "格式不正确，请使用 key=value，例如：目标汇率=4.85。",
+    "target_rate": "目标汇率必须是合理数字，例如 4.85。",
+    "alert_threshold": "提醒阈值必须是 0 到 10 之间的百分比数字，例如 0.3 表示 0.3%。",
+    "purpose": "用途建议使用：学费、生活、投资、一般。",
+    "style": "风格可选：简短、普通、详细。",
+    "topics": "主题不能为空，可用逗号、中文逗号或顿号分隔，例如：RBA，oil，CNY。",
+    "privacy_level": "隐私级别可选：最少、标准、严格。",
+    "alert_preference": "提醒偏好可选：目标汇率、波动率、重大新闻、晨报。",
+}
+
+_UPDATE_PROFILE_WIZARD_KEY = "update_profile_wizard"
+_DELETE_PROFILE_PENDING_KEY = "delete_profile_pending"
+_UPDATE_PROFILE_WIZARD_STEPS = [
+    ("target_rate", "请输入目标汇率，例如：4.85"),
+    ("alert_threshold", "请输入提醒阈值百分比，例如：0.3 表示 0.3%"),
+    ("purpose", "请输入用途：学费、生活、投资、一般"),
+    ("preferred_summary_style", "请输入摘要风格：简短、普通、详细"),
+    ("preferred_topics", "请输入关注主题，可用逗号或顿号分隔，例如：RBA，oil，CNY"),
+    ("language", "请输入语言，例如：zh-CN 或 中文"),
+    ("privacy_level", "请输入隐私级别：最少、标准、严格"),
+]
+
+_ONBOARDING_KEY = "profile_onboarding"
+_ONBOARDING_STEPS = [
+    ("purpose", "你的主要用途是什么？\n请选择：学费 / 生活费 / 投资 / 其他"),
+    ("alert_preference", "你更希望 Jarvis 优先提醒什么？\n请选择：目标汇率 / 波动率 / 重大新闻 / 晨报"),
+    ("preferred_summary_style", "你喜欢哪种摘要风格？\n请选择：简短 / 普通 / 详细"),
+]
+_ONBOARDING_INTRO = (
+    "为了让 Jarvis 的提醒更贴近你的使用方式，我会先问 3 个简单问题。\n"
+    "不会询问余额、银行信息、证件号或地址。\n\n"
+    "你也可以回复“跳过引导”，直接使用默认资料；跳过后不会反复询问。"
+)
+
+
+def _parse_update_profile_value(field: str, value: str) -> Any:
+    value = value.strip()
+    if not value:
+        raise ValueError("bad_format")
+
+    if field == "target_rate":
+        parsed = float(value)
+        if not math.isfinite(parsed) or parsed < 3.0 or parsed > 8.0:
+            raise ValueError("target_rate")
+        return parsed
+    if field == "alert_threshold":
+        parsed = float(value.rstrip("%"))
+        if not math.isfinite(parsed) or parsed <= 0 or parsed > 10:
+            raise ValueError("alert_threshold")
+        return parsed
+    if field == "purpose":
+        parsed = _PURPOSE_ALIASES.get(value.lower(), _PURPOSE_ALIASES.get(value))
+        if parsed is None:
+            raise ValueError("purpose")
+        return parsed
+    if field == "preferred_summary_style":
+        parsed = _STYLE_ALIASES.get(value.lower(), _STYLE_ALIASES.get(value))
+        if parsed is None:
+            raise ValueError("style")
+        return parsed
+    if field == "alert_preference":
+        parsed = _ALERT_PREFERENCE_ALIASES.get(
+            value.lower(),
+            _ALERT_PREFERENCE_ALIASES.get(value),
+        )
+        if parsed is None:
+            raise ValueError("alert_preference")
+        return parsed
+    if field == "preferred_topics":
+        normalized = value.replace("，", ",").replace("、", ",")
+        parsed = [item.strip() for item in normalized.split(",") if item.strip()]
+        if not parsed:
+            raise ValueError("topics")
+        return parsed
+    if field == "privacy_level":
+        parsed = _PRIVACY_ALIASES.get(value.lower(), _PRIVACY_ALIASES.get(value))
+        if parsed is None:
+            raise ValueError("privacy_level")
+        return parsed
+    if field == "language":
+        return value
+    raise ValueError("bad_format")
+
+
+def _parse_update_profile_args(args: list[str]) -> dict[str, Any]:
+    raw = " ".join(args).strip()
+    if not raw:
+        raise ValueError("empty")
+
+    updates: dict[str, Any] = {}
+    position = 0
+    for match in _UPDATE_PROFILE_PAIR_RE.finditer(raw):
+        if raw[position:match.start()].strip():
+            raise ValueError("bad_format")
+        position = match.end()
+        key = match.group(1).strip()
+        value = next(group for group in match.groups()[1:] if group is not None).strip()
+        field = _PROFILE_FIELD_ALIASES.get(key) or _PROFILE_FIELD_ALIASES.get(key.lower())
+        if not field:
+            raise ValueError("bad_format")
+        updates[field] = _parse_update_profile_value(field, value)
+
+    if raw[position:].strip() or not updates:
+        raise ValueError("bad_format")
+    return updates
+
+
+def _format_update_profile_error(code: str) -> str:
+    message = _UPDATE_PROFILE_ERROR_MESSAGES.get(code, _UPDATE_PROFILE_ERROR_MESSAGES["bad_format"])
+    return f"{message}\n\n{_UPDATE_PROFILE_USAGE}"
+
+
+def _update_profile_prompt(step_index: int) -> str:
+    _, prompt = _UPDATE_PROFILE_WIZARD_STEPS[step_index]
+    return (
+        f"{prompt}\n\n"
+        "输入“跳过”可跳过这一项，输入“取消”可退出修改。"
+    )
+
+
+def _onboarding_prompt(step_index: int) -> str:
+    _, prompt = _ONBOARDING_STEPS[step_index]
+    return (
+        f"{prompt}\n\n"
+        "回复“跳过”可跳过这一题，回复“跳过引导”可结束引导。"
+    )
+
+
+def _format_update_profile_confirmation(updates: dict[str, Any]) -> str:
+    lines = ["已更新你的明确偏好："]
+    for key, value in updates.items():
+        label = _UPDATE_PROFILE_LABELS.get(key, key)
+        if isinstance(value, list):
+            display = "、".join(str(item) for item in value)
+        else:
+            display = _UPDATE_PROFILE_VALUE_LABELS.get(key, {}).get(str(value), str(value))
+        lines.append(f"- {label}：{display}")
+    lines.append("")
+    lines.append("这些字段会进入结构化个性化资料；不会更新推断偏好或 raw events。")
+    return "\n".join(lines)
 
 
 class TelegramBot:
@@ -393,6 +705,7 @@ class TelegramBot:
                 await update.message.reply_text(recent)
         else:
             await update.message.reply_text(_RETURNING_WELCOME)
+        await self._maybe_start_onboarding(update, context)
 
     async def _cmd_reset(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._check_access(update, context):
@@ -461,21 +774,244 @@ class TelegramBot:
             return
         await update.message.reply_text(_PRIVACY_TEXT)
 
-    async def _cmd_delete_profile(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    async def _maybe_start_onboarding(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> bool:
+        """Start lightweight Phase 8 onboarding for private chats only."""
+        if update.effective_user is None or update.message is None:
+            return False
+        if self._is_group(update):
+            return False
+
+        from ..core.personalization import get_or_create_user, get_user_profile
+
+        try:
+            telegram_user_id = update.effective_user.id
+            profile = get_user_profile(telegram_user_id)
+            if not profile:
+                get_or_create_user(telegram_user_id)
+                profile = get_user_profile(telegram_user_id)
+        except Exception:
+            logger.exception(
+                "[Telegram] Failed to load onboarding state for user_id=%s",
+                update.effective_user.id,
+            )
+            return False
+
+        user = profile.get("user") or {}
+        if bool(user.get("onboarding_completed")):
+            return False
+
+        context.user_data.pop(_UPDATE_PROFILE_WIZARD_KEY, None)
+        context.user_data[_ONBOARDING_KEY] = {
+            "step": 0,
+            "updates": {},
+        }
+        await update.message.reply_text(f"{_ONBOARDING_INTRO}\n\n{_onboarding_prompt(0)}")
+        return True
+
+    async def _cmd_update_profile(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._check_access(update, context):
             return
         if update.effective_user is None or update.message is None:
             return
 
-        confirm = bool(context.args and context.args[0].lower() == "confirm")
-        if _delete_profile_requires_confirmation():
-            if not confirm:
+        context.user_data.pop(_ONBOARDING_KEY, None)
+        context.user_data.pop(_DELETE_PROFILE_PENDING_KEY, None)
+        if not context.args:
+            context.user_data[_UPDATE_PROFILE_WIZARD_KEY] = {
+                "step": 0,
+                "updates": {},
+            }
+            await update.message.reply_text(
+                "我会逐步帮你更新明确偏好。你可以随时输入“跳过”或“取消”。\n\n"
+                f"{_update_profile_prompt(0)}"
+            )
+            return
+
+        try:
+            updates = _parse_update_profile_args(context.args)
+        except ValueError as exc:
+            await update.message.reply_text(_format_update_profile_error(str(exc)))
+            return
+
+        from ..core.personalization import update_explicit_preferences
+
+        try:
+            update_explicit_preferences(update.effective_user.id, updates)
+        except ValueError:
+            await update.message.reply_text(
+                "输入包含不支持或不适合保存到个性化资料的内容。\n\n"
+                f"{_UPDATE_PROFILE_USAGE}"
+            )
+            return
+        except Exception:
+            logger.exception(
+                "[Telegram] Failed to update personalization profile for user_id=%s",
+                update.effective_user.id,
+            )
+            await update.message.reply_text("更新个性化偏好失败，请稍后再试。")
+            return
+
+        await update.message.reply_text(_format_update_profile_confirmation(updates))
+
+    async def _handle_update_profile_wizard(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        user_text: str,
+    ) -> bool:
+        wizard = context.user_data.get(_UPDATE_PROFILE_WIZARD_KEY)
+        if not wizard:
+            return False
+        if update.effective_user is None or update.message is None:
+            return True
+
+        text = user_text.strip()
+        if text in {"取消", "/cancel"}:
+            context.user_data.pop(_UPDATE_PROFILE_WIZARD_KEY, None)
+            await update.message.reply_text("已取消修改个性化偏好。")
+            return True
+        if not text:
+            step = int(wizard.get("step", 0))
+            await update.message.reply_text(
+                "请发送文字内容，或输入“跳过”“取消”。\n\n"
+                f"{_update_profile_prompt(step)}"
+            )
+            return True
+
+        step = int(wizard.get("step", 0))
+        updates = dict(wizard.get("updates") or {})
+        field, _ = _UPDATE_PROFILE_WIZARD_STEPS[step]
+
+        if text != "跳过":
+            try:
+                updates[field] = _parse_update_profile_value(field, text)
+            except ValueError as exc:
                 await update.message.reply_text(
-                    "此操作会删除你的结构化个性化数据，包括明确偏好、推断偏好、反馈事件和短期 raw events。"
-                    "不会删除对话历史或系统运行日志。\n\n"
-                    "如确认删除，请发送：/delete_profile confirm"
+                    f"{_UPDATE_PROFILE_ERROR_MESSAGES.get(str(exc), '输入不正确，请重新输入。')}\n\n"
+                    f"{_update_profile_prompt(step)}"
                 )
+                return True
+
+        step += 1
+        if step < len(_UPDATE_PROFILE_WIZARD_STEPS):
+            context.user_data[_UPDATE_PROFILE_WIZARD_KEY] = {
+                "step": step,
+                "updates": updates,
+            }
+            await update.message.reply_text(_update_profile_prompt(step))
+            return True
+
+        context.user_data.pop(_UPDATE_PROFILE_WIZARD_KEY, None)
+        if not updates:
+            await update.message.reply_text("没有更新任何偏好。")
+            return True
+
+        from ..core.personalization import update_explicit_preferences
+
+        try:
+            update_explicit_preferences(update.effective_user.id, updates)
+        except ValueError:
+            await update.message.reply_text("输入包含不适合保存到个性化资料的内容，已取消本次更新。")
+            return True
+        except Exception:
+            logger.exception(
+                "[Telegram] Failed to update personalization profile for user_id=%s",
+                update.effective_user.id,
+            )
+            await update.message.reply_text("更新个性化偏好失败，请稍后再试。")
+            return True
+
+        await update.message.reply_text(_format_update_profile_confirmation(updates))
+        return True
+
+    async def _handle_onboarding(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        user_text: str,
+    ) -> bool:
+        state = context.user_data.get(_ONBOARDING_KEY)
+        if not state:
+            return False
+        if update.effective_user is None or update.message is None:
+            return True
+
+        from ..core.personalization import (
+            get_user_profile,
+            mark_onboarding_completed,
+            update_explicit_preferences,
+        )
+
+        async def finish(updates: dict[str, Any]) -> None:
+            telegram_user_id = update.effective_user.id
+            try:
+                if updates:
+                    update_explicit_preferences(telegram_user_id, updates)
+                mark_onboarding_completed(telegram_user_id)
+                profile = get_user_profile(telegram_user_id)
+            except ValueError:
+                context.user_data.pop(_ONBOARDING_KEY, None)
+                await update.message.reply_text("输入包含不适合保存到个性化资料的内容，已结束引导。")
                 return
+            except Exception:
+                logger.exception(
+                    "[Telegram] Failed to complete onboarding for user_id=%s",
+                    telegram_user_id,
+                )
+                await update.message.reply_text("保存入门设置失败，请稍后再试。")
+                return
+
+            context.user_data.pop(_ONBOARDING_KEY, None)
+            await update.message.reply_text(
+                "入门设置已完成。下面是你当前的个性化资料：\n\n"
+                f"{_format_user_profile(profile)}"
+            )
+
+        text = user_text.strip()
+        if text in {"跳过引导", "跳过全部", "取消引导"}:
+            await finish({})
+            return True
+        if not text:
+            step = int(state.get("step", 0))
+            await update.message.reply_text(
+                "请发送文字内容，或回复“跳过”“跳过引导”。\n\n"
+                f"{_onboarding_prompt(step)}"
+            )
+            return True
+
+        step = int(state.get("step", 0))
+        updates = dict(state.get("updates") or {})
+        field, _ = _ONBOARDING_STEPS[step]
+
+        if text != "跳过":
+            try:
+                updates[field] = _parse_update_profile_value(field, text)
+            except ValueError as exc:
+                await update.message.reply_text(
+                    f"{_UPDATE_PROFILE_ERROR_MESSAGES.get(str(exc), '输入不正确，请重新输入。')}\n\n"
+                    f"{_onboarding_prompt(step)}"
+                )
+                return True
+
+        step += 1
+        if step < len(_ONBOARDING_STEPS):
+            context.user_data[_ONBOARDING_KEY] = {
+                "step": step,
+                "updates": updates,
+            }
+            await update.message.reply_text(_onboarding_prompt(step))
+            return True
+
+        await finish(updates)
+        return True
+
+    async def _delete_profile_for_current_user(self, update: Update) -> None:
+        if update.effective_user is None or update.message is None:
+            return
 
         from ..core.personalization import delete_user_profile, get_user_profile
 
@@ -486,7 +1022,7 @@ class TelegramBot:
                 await update.message.reply_text("目前没有找到你的个性化资料，无需删除。")
                 return
             deleted = delete_user_profile(telegram_user_id)
-        except Exception as exc:
+        except Exception:
             logger.exception(
                 "[Telegram] Failed to delete personalization profile for user_id=%s",
                 telegram_user_id,
@@ -500,11 +1036,70 @@ class TelegramBot:
                 telegram_user_id,
             )
             await update.message.reply_text(
-                "你的结构化个性化数据已删除，包括偏好、反馈摘要和短期 raw events。"
+                "你的结构化个性化数据已删除，包括偏好、反馈记录和短期 raw events。"
                 "对话历史和系统运行日志不会因此删除。之后 Jarvis 将按默认设置为你服务。"
             )
         else:
             await update.message.reply_text("目前没有找到你的个性化资料，无需删除。")
+
+    async def _handle_delete_profile_confirmation(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        user_text: str,
+    ) -> bool:
+        if not context.user_data.get(_DELETE_PROFILE_PENDING_KEY):
+            return False
+        if update.effective_user is None or update.message is None:
+            return True
+
+        text = user_text.strip()
+        if text in {"确定", "确认"}:
+            context.user_data.pop(_DELETE_PROFILE_PENDING_KEY, None)
+            await self._delete_profile_for_current_user(update)
+            return True
+        if text in {"取消", "/cancel"}:
+            context.user_data.pop(_DELETE_PROFILE_PENDING_KEY, None)
+            await update.message.reply_text("已取消删除个性化数据。")
+            return True
+        return False
+
+    async def _cmd_delete_profile(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self._check_access(update, context):
+            return
+        if update.effective_user is None or update.message is None:
+            return
+
+        context.user_data.pop(_ONBOARDING_KEY, None)
+        context.user_data.pop(_UPDATE_PROFILE_WIZARD_KEY, None)
+        confirm = bool(context.args and context.args[0].lower() in {"确认", "confirm"})
+        if _delete_profile_requires_confirmation():
+            if not confirm:
+                from ..core.personalization import get_user_profile
+
+                try:
+                    existing = get_user_profile(update.effective_user.id)
+                except Exception:
+                    logger.exception(
+                        "[Telegram] Failed to load profile before delete confirmation for user_id=%s",
+                        update.effective_user.id,
+                    )
+                    await update.message.reply_text("读取个性化资料失败，请稍后再试。")
+                    return
+                if not existing:
+                    await update.message.reply_text("目前没有找到你的个性化资料，无需删除。")
+                    return
+                context.user_data[_DELETE_PROFILE_PENDING_KEY] = True
+                await update.message.reply_text(
+                    "此操作会删除你的结构化个性化数据，包括明确偏好、推断偏好、反馈事件和短期 raw events。"
+                    "不会删除对话历史或系统运行日志。\n\n"
+                    "如确认删除，请直接回复：确定\n"
+                    "如放弃删除，请回复：取消"
+                )
+                return
+
+        context.user_data.pop(_DELETE_PROFILE_PENDING_KEY, None)
+        await self._delete_profile_for_current_user(update)
 
     # ── Shortcut command handlers (no LLM) ───────────────────────────────────
 
@@ -578,16 +1173,12 @@ class TelegramBot:
         if not user_text and not has_photo:
             return
 
-        # ── First-time welcome (fires once per user, no LLM) ──────────────────
-        _cid = update.effective_chat.id
-        if _is_new_user(_cid):
-            _mark_greeted(_cid)
-            await update.message.reply_text(_WELCOME_GUIDE)
-            _recent = _get_recent_news_text()
-            if _recent:
-                await update.message.reply_text(_recent)
+        if await self._handle_update_profile_wizard(update, context, user_text):
+            return
+        if await self._handle_delete_profile_confirmation(update, context, user_text):
+            return
 
-        # ── Shortcut commands (bypass LLM entirely) ───────────────────────────
+        # ── Shortcut commands (bypass onboarding and LLM entirely) ───────────
         _cmd = user_text.strip()
         if _cmd == "最新新闻":
             await self._shortcut_latest_news(update)
@@ -597,6 +1188,21 @@ class TelegramBot:
             return
         if _cmd == "汇率波动":
             await self._shortcut_rate_chart(update)
+            return
+
+        if await self._handle_onboarding(update, context, user_text):
+            return
+
+        # ── First-time welcome (fires once per user, no LLM) ──────────────────
+        _cid = update.effective_chat.id
+        if _is_new_user(_cid):
+            _mark_greeted(_cid)
+            await update.message.reply_text(_WELCOME_GUIDE)
+            _recent = _get_recent_news_text()
+            if _recent:
+                await update.message.reply_text(_recent)
+
+        if await self._maybe_start_onboarding(update, context):
             return
 
         sid = self._session_id(update.effective_chat.id)
@@ -838,6 +1444,7 @@ class TelegramBot:
         BotCommand("status", "查看会话状态"),
         BotCommand("compact", "压缩对话历史"),
         BotCommand("my_profile", "查看我的个性化资料"),
+        BotCommand("update_profile", "更新我的明确偏好"),
         BotCommand("privacy", "查看隐私说明"),
         BotCommand("delete_profile", "删除我的个性化数据"),
         BotCommand("clear_files", "清空下载文件"),
@@ -850,6 +1457,7 @@ class TelegramBot:
         app.add_handler(CommandHandler("status", self._cmd_status))
         app.add_handler(CommandHandler("compact", self._cmd_compact))
         app.add_handler(CommandHandler("my_profile", self._cmd_my_profile))
+        app.add_handler(CommandHandler("update_profile", self._cmd_update_profile))
         app.add_handler(CommandHandler("privacy", self._cmd_privacy))
         app.add_handler(CommandHandler("delete_profile", self._cmd_delete_profile))
         app.add_handler(CommandHandler("clear_files", self._cmd_clear_files))
