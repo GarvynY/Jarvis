@@ -14,6 +14,7 @@ Commands
   /status         — show session info (provider, skills, memory, tokens, compactions)
   /compact [hint] — compact conversation history
   /my_profile     — show structured personalization data
+  /feedback       — record lightweight alert feedback
   /privacy        — show Phase 8 privacy design
   /delete_profile — delete structured personalization data
   <text>          — forwarded to Agent.chat(), reply sent back
@@ -83,20 +84,27 @@ _WELCOME_GUIDE = (
     "  最新汇率   — 查看当前 CNY/AUD 汇率\n"
     "  汇率波动   — 查看近2日汇率走势图\n\n"
     "⚙️ 斜杠命令：\n"
-    "  /start     — 显示此信息\n"
-    "  /reset     — 重置对话（开始新会话）\n"
-    "  /status    — 查看会话状态\n"
-    "  /compact   — 压缩对话历史\n"
-    "  /my_profile — 查看我的个性化资料\n"
-    "  /update_profile — 更新我的偏好\n"
-    "  /delete_profile — 删除我的个性化数据\n"
-    "  /privacy   — 查看隐私说明\n\n"
+    "  /start — 显示此说明\n"
+    "  /reset — 重置当前对话\n"
+    "  /status — 查看会话状态\n"
+    "  /compact — 压缩对话历史\n"
+    "  /my_profile — 查看个性化资料；中文：/我的资料\n"
+    "  /update_profile — 修改偏好；中文：/修改资料\n"
+    "  /feedback useful — 记录反馈；中文：/反馈 有用\n"
+    "  /delete_profile — 删除个性化数据；中文：/删除资料\n"
+    "  /privacy — 查看隐私说明；中文：/隐私\n\n"
+    "📝 常用中文示例：\n"
+    "  /我的资料\n"
+    "  /修改资料\n"
+    "  /反馈 有用\n"
+    "  /反馈 不感兴趣 主题=通用市场新闻\n"
+    "  /删除资料\n"
+    "  /隐私\n\n"
     "💡 也可以直接输入任何问题，我会尽力回答！"
 )
 
 _RETURNING_WELCOME = (
-    "👋 欢迎回来！有什么需要帮忙的？\n\n"
-    "快捷指令：最新新闻 | 最新汇率 | 汇率波动"
+    _WELCOME_GUIDE
 )
 
 _PRIVACY_TEXT = (
@@ -116,6 +124,7 @@ _PRIVACY_TEXT = (
     "资料相关命令：\n"
     "- /my_profile 查看当前个性化资料\n"
     "- /update_profile 修改明确偏好\n"
+    "- /feedback 记录提醒反馈\n"
     "- /delete_profile 删除个性化数据"
 )
 
@@ -125,6 +134,14 @@ _UPDATE_PROFILE_USAGE = (
     "等号两边可以有空格；提醒阈值=0.3 表示 0.3%。\n"
     "可用字段：目标汇率、提醒阈值、用途、语言、风格、主题、提醒偏好、隐私级别。\n"
     "用途建议：学费、生活、投资、一般。风格可选：简短、普通、详细。"
+)
+
+_FEEDBACK_USAGE = (
+    "反馈格式示例：\n"
+    "/feedback useful\n"
+    "/feedback not_useful\n"
+    "/feedback not_interested topic=通用市场新闻\n\n"
+    "中文也可以：/反馈 有用、/反馈 无用、/反馈 不感兴趣 主题=通用市场新闻"
 )
 
 
@@ -460,6 +477,7 @@ _UPDATE_PROFILE_VALUE_LABELS = {
 _UPDATE_PROFILE_PAIR_RE = re.compile(
     r"([^\s=]+)\s*=\s*(?:\"([^\"]*)\"|'([^']*)'|([^\s]+))"
 )
+_FEEDBACK_TOPIC_RE = re.compile(r"(?:^|\s)(?:topic|主题)\s*=\s*(?:\"([^\"]*)\"|'([^']*)'|(.+))$")
 
 _UPDATE_PROFILE_ERROR_MESSAGES = {
     "empty": "请在 /update_profile 后添加要更新的字段。",
@@ -496,6 +514,21 @@ _ONBOARDING_INTRO = (
     "不会询问余额、银行信息、证件号或地址。\n\n"
     "你也可以回复“跳过引导”，直接使用默认资料；跳过后不会反复询问。"
 )
+
+_FEEDBACK_TYPE_ALIASES = {
+    "useful": "useful",
+    "有用": "useful",
+    "not_useful": "not_useful",
+    "无用": "not_useful",
+    "useless": "not_useful",
+    "not_interested": "not_interested",
+    "不感兴趣": "not_interested",
+}
+_FEEDBACK_TYPE_LABELS = {
+    "useful": "有用",
+    "not_useful": "无用",
+    "not_interested": "不感兴趣",
+}
 
 
 def _parse_update_profile_value(field: str, value: str) -> Any:
@@ -605,6 +638,30 @@ def _format_update_profile_confirmation(updates: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _parse_feedback_args(args: list[str]) -> tuple[str, str | None]:
+    raw = " ".join(args).strip()
+    if not raw:
+        raise ValueError("empty")
+
+    topic: str | None = None
+    topic_match = _FEEDBACK_TOPIC_RE.search(raw)
+    if topic_match:
+        topic = next(group for group in topic_match.groups() if group is not None).strip()
+        raw = raw[:topic_match.start()].strip()
+
+    feedback_type = _FEEDBACK_TYPE_ALIASES.get(raw) or _FEEDBACK_TYPE_ALIASES.get(raw.lower())
+    if feedback_type is None:
+        raise ValueError("type")
+    return feedback_type, topic
+
+
+def _format_feedback_confirmation(event_type: str, topic: str | None) -> str:
+    label = _FEEDBACK_TYPE_LABELS.get(event_type, event_type)
+    if topic:
+        return f"已记录反馈：{label}（主题：{topic}）。谢谢。"
+    return f"已记录反馈：{label}。谢谢。"
+
+
 class TelegramBot:
     """
     Telegram channel — pure I/O layer.
@@ -712,7 +769,7 @@ class TelegramBot:
             return
         sid = self._session_id(update.effective_chat.id)
         self._sm.reset(sid)
-        await update.message.reply_text("Session reset. Starting fresh! Send me a message.")
+        await update.message.reply_text("当前对话已重置。你可以重新发送问题，Jarvis 会从新的会话开始处理。")
 
     async def _cmd_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._check_access(update, context):
@@ -774,6 +831,55 @@ class TelegramBot:
             return
         await update.message.reply_text(_PRIVACY_TEXT)
 
+    async def _record_feedback(
+        self,
+        update: Update,
+        args: list[str],
+    ) -> None:
+        if update.effective_user is None or update.message is None:
+            return
+
+        try:
+            event_type, topic = _parse_feedback_args(args)
+        except ValueError:
+            await update.message.reply_text(_FEEDBACK_USAGE)
+            return
+
+        from ..core.personalization import log_feedback_event
+
+        try:
+            event_id = log_feedback_event(
+                update.effective_user.id,
+                event_type,
+                topic=topic,
+                message_id=str(update.message.message_id),
+                metadata={"source": "telegram_command"},
+            )
+        except ValueError:
+            await update.message.reply_text("反馈内容不适合保存，请简化后再试。")
+            return
+        except Exception:
+            logger.exception(
+                "[Telegram] Failed to log feedback for user_id=%s",
+                update.effective_user.id,
+            )
+            await update.message.reply_text("记录反馈失败，请稍后再试。")
+            return
+
+        logger.info(
+            "[Telegram] Logged feedback event_id=%s user_id=%s event_type=%s topic=%s",
+            event_id,
+            update.effective_user.id,
+            event_type,
+            topic or "",
+        )
+        await update.message.reply_text(_format_feedback_confirmation(event_type, topic))
+
+    async def _cmd_feedback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self._check_access(update, context):
+            return
+        await self._record_feedback(update, list(context.args or []))
+
     async def _maybe_start_onboarding(
         self,
         update: Update,
@@ -815,12 +921,20 @@ class TelegramBot:
     async def _cmd_update_profile(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._check_access(update, context):
             return
+        await self._handle_update_profile_command(update, context, list(context.args or []))
+
+    async def _handle_update_profile_command(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        args: list[str],
+    ) -> None:
         if update.effective_user is None or update.message is None:
             return
 
         context.user_data.pop(_ONBOARDING_KEY, None)
         context.user_data.pop(_DELETE_PROFILE_PENDING_KEY, None)
-        if not context.args:
+        if not args:
             context.user_data[_UPDATE_PROFILE_WIZARD_KEY] = {
                 "step": 0,
                 "updates": {},
@@ -832,7 +946,7 @@ class TelegramBot:
             return
 
         try:
-            updates = _parse_update_profile_args(context.args)
+            updates = _parse_update_profile_args(args)
         except ValueError as exc:
             await update.message.reply_text(_format_update_profile_error(str(exc)))
             return
@@ -1064,15 +1178,59 @@ class TelegramBot:
             return True
         return False
 
+    async def _handle_text_command_alias(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        user_text: str,
+    ) -> bool:
+        """Handle Chinese slash-like commands that Telegram cannot register."""
+        text = user_text.strip()
+        if not text.startswith("/"):
+            return False
+        command, _, rest = text.partition(" ")
+        args = rest.split() if rest else []
+
+        if command in {"/我的资料", "/资料"}:
+            await self._cmd_my_profile(update, context)
+            return True
+        if command in {"/隐私", "/隐私说明"}:
+            await self._cmd_privacy(update, context)
+            return True
+        if command in {"/修改资料", "/更新资料", "/更新偏好"}:
+            if not await self._check_access(update, context):
+                return True
+            await self._handle_update_profile_command(update, context, args)
+            return True
+        if command in {"/删除资料", "/删除个性化"}:
+            if not await self._check_access(update, context):
+                return True
+            await self._handle_delete_profile_command(update, context, args)
+            return True
+        if command in {"/反馈"}:
+            if not await self._check_access(update, context):
+                return True
+            await self._record_feedback(update, args)
+            return True
+        return False
+
     async def _cmd_delete_profile(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._check_access(update, context):
             return
+        await self._handle_delete_profile_command(update, context, list(context.args or []))
+
+    async def _handle_delete_profile_command(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        args: list[str],
+    ) -> None:
         if update.effective_user is None or update.message is None:
             return
 
         context.user_data.pop(_ONBOARDING_KEY, None)
         context.user_data.pop(_UPDATE_PROFILE_WIZARD_KEY, None)
-        confirm = bool(context.args and context.args[0].lower() in {"确认", "confirm"})
+        confirm = bool(args and args[0].lower() in {"确认", "confirm"})
         if _delete_profile_requires_confirmation():
             if not confirm:
                 from ..core.personalization import get_user_profile
@@ -1173,6 +1331,8 @@ class TelegramBot:
         if not user_text and not has_photo:
             return
 
+        if await self._handle_text_command_alias(update, context, user_text):
+            return
         if await self._handle_update_profile_wizard(update, context, user_text):
             return
         if await self._handle_delete_profile_confirmation(update, context, user_text):
@@ -1445,6 +1605,7 @@ class TelegramBot:
         BotCommand("compact", "压缩对话历史"),
         BotCommand("my_profile", "查看我的个性化资料"),
         BotCommand("update_profile", "更新我的明确偏好"),
+        BotCommand("feedback", "记录提醒反馈"),
         BotCommand("privacy", "查看隐私说明"),
         BotCommand("delete_profile", "删除我的个性化数据"),
         BotCommand("clear_files", "清空下载文件"),
@@ -1458,6 +1619,7 @@ class TelegramBot:
         app.add_handler(CommandHandler("compact", self._cmd_compact))
         app.add_handler(CommandHandler("my_profile", self._cmd_my_profile))
         app.add_handler(CommandHandler("update_profile", self._cmd_update_profile))
+        app.add_handler(CommandHandler("feedback", self._cmd_feedback))
         app.add_handler(CommandHandler("privacy", self._cmd_privacy))
         app.add_handler(CommandHandler("delete_profile", self._cmd_delete_profile))
         app.add_handler(CommandHandler("clear_files", self._cmd_clear_files))

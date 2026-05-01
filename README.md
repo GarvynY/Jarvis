@@ -150,8 +150,11 @@ systemctl start jarvis-agent jarvis-monitor
 | `/privacy` | 查看 Jarvis 第 8 阶段隐私设计说明 |
 | `/update_profile` | 进入问答式流程，逐项更新明确偏好 |
 | `/update_profile 目标汇率=4.85 提醒阈值=0.3 用途=学费 风格=简短 主题=RBA,oil,CNY` | 高级用法：一次性更新明确偏好 |
+| `/feedback useful` | 记录提醒反馈，也支持 `/反馈 有用` |
 | `/delete_profile` | 显示删除影响范围与确认方式 |
 | `确定` | 在 `/delete_profile` 后确认删除当前 Telegram 用户的结构化个性化数据 |
+
+中文文本别名：`/我的资料`、`/隐私`、`/修改资料`、`/删除资料`、`/反馈`。Telegram 命令菜单仍使用英文命令名，中文别名由 Jarvis 在消息入口映射处理。
 
 问答式 `/update_profile` 会依次询问目标汇率、提醒阈值、用途、摘要风格、关注主题、语言和隐私级别。每一步都可以回复 `跳过`，也可以回复 `取消` 退出本次修改。
 

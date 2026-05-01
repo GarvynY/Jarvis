@@ -1,7 +1,8 @@
 ---
 name: cnyaud_monitor
 description: >
-  Monitor CNY/AUD (人民币/澳元) exchange rate with real-time data, 90-day history,
+  Monitor CNY/AUD (人民币/澳元) exchange rate with Chinese bank spot buy/sell
+  quotes for student exchange decisions, market fallback data, 90-day history,
   statistical trend analysis, and threshold breach alerts. Use when: user asks about
   CNY/AUD or RMB-to-Australian-dollar exchange rate, wants daily market analysis,
   needs rate monitoring with alerts, or requests currency trend/prediction.
@@ -13,8 +14,9 @@ metadata:
 
 # CNY/AUD Exchange Rate Monitor
 
-Real-time CNY/AUD (人民币/澳元) exchange rate monitoring, historical analysis, and
-threshold alert system powered by Yahoo Finance.
+Chinese-bank CNY/AUD (人民币/澳元) quote monitoring, historical analysis, and
+threshold alert system. For student tuition/living-cost exchange, the operational
+reference is bank `spot_sell_rate` because the customer pays CNY to buy AUD.
 
 ## When to Use
 
@@ -45,7 +47,9 @@ python {skill_path}/fetch_rate.py --period 1y --format json
 - `--format` — `text` (default) or `json`
 
 **Output includes:**
-- Current rate (1 CNY = ? AUD)
+- Bank spot buy/sell quotes for AUD
+- Student exchange reference: lowest available bank spot sell rate (1 AUD = ? CNY)
+- Market mid-rate fallback (1 AUD = ? CNY)
 - Period start/end rates and % change
 - High/low/mean/volatility (σ)
 - 7-day trend vs prior 7 days
@@ -78,13 +82,13 @@ python {skill_path}/monitor_alert.py --threshold 0.5 --format json
 
 When tasked with a daily CNY/AUD analysis:
 
-1. Run `fetch_rate.py --period 90d --format json` to get historical data
+1. Run `fetch_rate.py --period 90d --format json` to get bank quote context and historical data
 2. Use `web_search` with `topic="news"` to fetch:
    - US-Iran geopolitical developments (affects oil → AUD)
    - Australian economic data (RBA rates, CPI, trade balance)
    - Chinese monetary policy and CNY basket moves
    - Global risk sentiment (USD strength, commodity prices)
-3. Synthesize: explain current rate level, recent trend, key drivers
+3. Synthesize: explain current bank spot sell level, bank buy/sell spread, recent market trend, and key drivers
 4. Give short-term outlook (bullish/bearish/sideways for CNY vs AUD)
 5. Note key risks and events to watch
 
@@ -109,7 +113,9 @@ python {skill_path}/news_monitor.py --no-mark-seen --format json
 
 ## Notes
 
-- Real-time rate source: `open.er-api.com` (free, ~1 min delay, no key needed)
+- Bank quote source: Chinese bank FX boards, best effort. Bank boards quote CNY per 100 AUD; scripts normalize to CNY per 1 AUD.
+- Student CNY -> AUD decisions should use bank `spot_sell_rate`; AUD -> CNY decisions should use bank `spot_buy_rate`.
+- Market fallback source: `open.er-api.com` (free, ~1 min delay, no key needed)
 - Historical data: yfinance `CNYAUD=X` (daily closes, free)
 - News monitoring: Google News RSS (free, no API key, zero Tavily credits)
 - Reserve Tavily (`web_search`) for daily report depth analysis only (~60 credits/month)
@@ -118,7 +124,7 @@ python {skill_path}/news_monitor.py --no-mark-seen --format json
 
 | File | Description |
 |------|-------------|
-| `fetch_rate.py` | Real-time rate (open.er-api.com) + 90-day history (yfinance) |
-| `monitor_alert.py` | Threshold alert vs saved baseline — 0 Tavily credits |
+| `fetch_rate.py` | Bank spot buy/sell quotes + market fallback + 90-day history (yfinance) |
+| `monitor_alert.py` | Threshold alert vs saved baseline, using bank spot sell when available — 0 Tavily credits |
 | `news_monitor.py` | Google News RSS keyword monitor — 0 Tavily credits |
 | `jobs.example.yaml` | Sample cron job definitions |

@@ -80,6 +80,38 @@ MAX_TOPICS_PER_FIELD = 20
 PREFERRED_SUMMARY_STYLES = {"brief", "standard", "detailed", "action_first"}
 PRIVACY_LEVELS = {"minimal", "standard", "strict"}
 ALERT_PREFERENCES = {"target_rate", "volatility", "major_news", "morning_report"}
+PURPOSE_ALIASES = {
+    "tuition": "tuition",
+    "学费": "tuition",
+    "living": "living",
+    "生活": "living",
+    "生活费": "living",
+    "investment": "investment",
+    "投资": "investment",
+    "general": "general",
+    "一般": "general",
+    "通用": "general",
+    "其他": "general",
+}
+SAFE_PURPOSES = {"tuition", "living", "investment", "general"}
+SAFE_USER_CONTEXT_FIELDS = (
+    "target_rate",
+    "alert_threshold",
+    "purpose",
+    "risk_level",
+    "preferred_summary_style",
+    "preferred_topics",
+    "privacy_level",
+)
+DEFAULT_SAFE_USER_CONTEXT: dict[str, Any] = {
+    "target_rate": None,
+    "alert_threshold": None,
+    "purpose": None,
+    "risk_level": "unknown",
+    "preferred_summary_style": "standard",
+    "preferred_topics": [],
+    "privacy_level": "standard",
+}
 
 SENSITIVE_VALUE_PATTERNS = [
     re.compile(r"\bapi[_ -]?key\b", re.IGNORECASE),
@@ -220,6 +252,9 @@ def _validate_preference_value(key: str, value: Any) -> Any:
         if value is None:
             return None
         value = str(value).strip()
+        value = PURPOSE_ALIASES.get(value.lower(), PURPOSE_ALIASES.get(value))
+        if value not in SAFE_PURPOSES:
+            raise ValueError(f"Unsupported purpose: {value}")
         _reject_sensitive_string(value, path=key, max_bytes=MAX_PURPOSE_BYTES)
         return value
     if key in {"language", "preferred_reminder_time"}:
@@ -510,13 +545,85 @@ def get_user_profile(
                 (user["id"],),
             )
         }
+        high_value_topics = [
+            row["topic"]
+            for row in conn.execute(
+                """
+                SELECT topic, COUNT(*) AS count
+                FROM feedback_events
+                WHERE user_id = ? AND event_type = 'useful' AND topic IS NOT NULL AND topic != ''
+                GROUP BY topic
+                ORDER BY count DESC, MAX(created_at) DESC
+                LIMIT 10
+                """,
+                (user["id"],),
+            )
+        ]
+        false_positive_topics = [
+            row["topic"]
+            for row in conn.execute(
+                """
+                SELECT topic, COUNT(*) AS count
+                FROM feedback_events
+                WHERE user_id = ?
+                  AND event_type IN ('not_useful', 'useless', 'not_interested')
+                  AND topic IS NOT NULL AND topic != ''
+                GROUP BY topic
+                ORDER BY count DESC, MAX(created_at) DESC
+                LIMIT 10
+                """,
+                (user["id"],),
+            )
+        ]
+        feedback_summary = dict(feedback_counts)
+        feedback_summary.update(
+            {
+                "useful_alert_count": feedback_counts.get("useful", 0),
+                "ignored_alert_count": (
+                    feedback_counts.get("not_useful", 0)
+                    + feedback_counts.get("useless", 0)
+                    + feedback_counts.get("not_interested", 0)
+                ),
+                "false_positive_topics": false_positive_topics,
+                "high_value_topics": high_value_topics,
+            }
+        )
 
         return {
             "user": dict(user),
             "explicit_preferences": _explicit_row_to_dict(explicit),
             "inferred_preferences": _inferred_row_to_dict(inferred),
-            "feedback_summary": feedback_counts,
+            "feedback_summary": feedback_summary,
         }
+
+
+def build_safe_user_context(
+    telegram_user_id: int | str,
+    db_path: str | Path | None = None,
+) -> dict[str, Any]:
+    """Return the minimal personalization context allowed in LLM prompts.
+
+    Full profiles can contain inferred preferences, feedback aggregates, and
+    operational traces. Those are useful for application logic but are not
+    passed to LLM providers; prompts only receive this explicit allowlist so
+    raw events, detailed feedback history, behavior logs, and sensitive data
+    never leave the local profile store.
+    """
+    profile = get_user_profile(telegram_user_id, db_path)
+    if not profile:
+        return dict(DEFAULT_SAFE_USER_CONTEXT)
+
+    explicit = profile.get("explicit_preferences") or {}
+    safe_context = dict(DEFAULT_SAFE_USER_CONTEXT)
+    for field in SAFE_USER_CONTEXT_FIELDS:
+        if field == "risk_level":
+            continue
+        value = explicit.get(field)
+        if field == "purpose":
+            value = PURPOSE_ALIASES.get(str(value).lower(), PURPOSE_ALIASES.get(value))
+        if value not in (None, "", []):
+            safe_context[field] = value
+    return safe_context
 
 
 def update_explicit_preferences(

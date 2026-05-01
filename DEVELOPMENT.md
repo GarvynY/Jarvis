@@ -333,8 +333,11 @@ purge_expired_raw_events()
 | `/my_profile` | 查看当前用户结构化 profile；不存在则创建默认 profile |
 | `/update_profile` | 进入问答式流程，逐项更新明确偏好，不更新推断偏好 |
 | `/update_profile 目标汇率=4.85 提醒阈值=0.3 用途=学费 风格=简短 主题=RBA,oil,CNY` | 高级用法：一次性更新明确偏好 |
+| `/feedback useful` | 记录提醒反馈；中文别名为 `/反馈 有用` |
 | `/delete_profile` | 显示删除影响范围和确认方式 |
 | `确定` | 在 `/delete_profile` 后确认删除当前 Telegram 用户的结构化个性化数据 |
+
+中文文本别名包括 `/我的资料`、`/隐私`、`/修改资料`、`/删除资料`、`/反馈`。Telegram BotCommand 菜单仍注册英文命令名，中文别名由 `_handle_text_command_alias()` 在消息入口映射。
 
 新用户首次私聊 Jarvis，或 `users.onboarding_completed = 0` 时，会进入轻量 onboarding：
 
@@ -378,6 +381,8 @@ Telegram：
 简短
 /privacy
 /my_profile
+/反馈 有用
+/反馈 不感兴趣 主题=通用市场新闻
 /update_profile
 4.85
 0.3

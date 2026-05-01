@@ -124,8 +124,8 @@ class PersistentAgent(Agent):
             self._ensure_ts(msg)
         self._store.save(self._session_id, self.messages)
 
-    def chat(self, user_input: str) -> str:
-        response = super().chat(user_input)
+    def chat(self, user_input: str, **kwargs) -> str:
+        response = super().chat(user_input, **kwargs)
         self._save()
         return response
 

@@ -590,6 +590,7 @@ Don't repeat this if `bot_name` already exists in memory.
                     prompt=args.get("prompt"),
                     deliver_to="telegram" if args.get("deliver_to_chat_id") else None,
                     chat_id=args.get("deliver_to_chat_id"),
+                    telegram_user_id=args.get("telegram_user_id"),
                 )
             elif func_name == "cron_remove" and self._cron_manager:
                 result = self._cron_manager.remove_dynamic_job(args.get("job_id"))
@@ -821,6 +822,40 @@ Don't repeat this if `bot_name` already exists in memory.
         chat_msgs = self._sanitize_tool_pairs(chat_msgs)
         return system_msgs + chat_msgs
 
+    @staticmethod
+    def _with_transient_system_context(
+        messages: list[dict],
+        transient_system_context: str | None,
+    ) -> list[dict]:
+        """Inject one-call context without appending it to saved history."""
+        if not transient_system_context:
+            return messages
+        injected = {"role": "system", "content": transient_system_context}
+        if messages and messages[0].get("role") == "system":
+            return [messages[0], injected, *messages[1:]]
+        return [injected, *messages]
+
+    @staticmethod
+    def _redact_transient_system_context(
+        messages: list[dict],
+        transient_system_context: str | None,
+    ) -> list[dict]:
+        """Redact one-call context from debug context dumps."""
+        if not transient_system_context:
+            return messages
+        redacted: list[dict] = []
+        for msg in messages:
+            if (
+                msg.get("role") == "system"
+                and msg.get("content") == transient_system_context
+            ):
+                clean = dict(msg)
+                clean["content"] = "[transient system context redacted]"
+                redacted.append(clean)
+            else:
+                redacted.append(msg)
+        return redacted
+
     # ── Compaction ────────────────────────────────────────────────────────────
 
     def compact(self, instruction: str | None = None) -> str:
@@ -948,6 +983,7 @@ Don't repeat this if `bot_name` already exists in memory.
         *user_input* can be a plain string or a content-array for
         multimodal input (e.g. ``[{"type":"text","text":"..."}, {"type":"image_url",...}]``).
         """
+        transient_system_context = kwargs.pop("transient_system_context", None)
         user_input = self._normalize_input(user_input)
         self.messages.append({"role": "user", "content": user_input})
 
@@ -963,13 +999,20 @@ Don't repeat this if `bot_name` already exists in memory.
         while True:
             try:
                 self._maybe_auto_compact()
-                messages_to_send = self._get_pruned_messages()
+                messages_to_send = self._with_transient_system_context(
+                    self._get_pruned_messages(),
+                    transient_system_context,
+                )
 
                 if self.show_full_context:
+                    messages_for_log = self._redact_transient_system_context(
+                        messages_to_send,
+                        transient_system_context,
+                    )
                     logger.debug(
                         "Context window (%d messages):\n%s",
                         len(messages_to_send),
-                        json.dumps(messages_to_send, indent=2, ensure_ascii=False),
+                        json.dumps(messages_for_log, indent=2, ensure_ascii=False),
                     )
 
                 response = self.provider.chat(
@@ -1013,7 +1056,10 @@ Don't repeat this if `bot_name` already exists in memory.
                         logger.debug("Tool round limit (%d) reached, forcing text reply.", self.MAX_TOOL_ROUNDS)
                     try:
                         final = self.provider.chat(
-                            messages=self._get_pruned_messages(),
+                            messages=self._with_transient_system_context(
+                                self._get_pruned_messages(),
+                                transient_system_context,
+                            ),
                             tools=current_tools,
                             tool_choice="none",
                         )
@@ -1093,6 +1139,7 @@ Don't repeat this if `bot_name` already exists in memory.
         self,
         user_input: str | list,
         on_token: object = None,
+        **kwargs,
     ) -> str:
         """Streaming variant of ``chat()``.
 
@@ -1100,6 +1147,7 @@ Don't repeat this if `bot_name` already exists in memory.
         *on_token* is called with each text chunk as it arrives.
         Returns the full final text, same as ``chat()``.
         """
+        transient_system_context = kwargs.pop("transient_system_context", None)
         user_input = self._normalize_input(user_input)
         self.messages.append({"role": "user", "content": user_input})
         _log_detail({
@@ -1114,7 +1162,10 @@ Don't repeat this if `bot_name` already exists in memory.
         while True:
             try:
                 self._maybe_auto_compact()
-                messages_to_send = self._get_pruned_messages()
+                messages_to_send = self._with_transient_system_context(
+                    self._get_pruned_messages(),
+                    transient_system_context,
+                )
 
                 gen = self.provider.chat_stream(
                     messages=messages_to_send,
@@ -1166,7 +1217,10 @@ Don't repeat this if `bot_name` already exists in memory.
                         {"role": "system", "content": limit_msg}
                     )
                     final = self.provider.chat(
-                        messages=self._get_pruned_messages(),
+                        messages=self._with_transient_system_context(
+                            self._get_pruned_messages(),
+                            transient_system_context,
+                        ),
                         tools=current_tools,
                         tool_choice="none",
                     )

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-CNY/AUD real-time threshold alert monitor.
+CNY/AUD threshold alert monitor.
 
-Real-time rate source: open.er-api.com (free, no key, ~1 min delay)
-Fallback source      : yfinance CNYAUD=X
+Primary rate basis: bank spot sell rate for CNY -> AUD student exchange.
+Market fallback   : open.er-api.com / yfinance through fetch_rate.py
 
 State file: ~/.pythonclaw/context/cnyaud_state.json
 
@@ -17,14 +17,10 @@ import datetime
 import json
 import os
 import sys
-import urllib.request
 
 STATE_FILE = os.path.expanduser(
     os.path.join("~", ".pythonclaw", "context", "cnyaud_state.json")
 )
-ER_API_URL = "https://open.er-api.com/v6/latest/CNY"
-
-
 # ── State helpers ─────────────────────────────────────────────────────────────
 
 def _load_state() -> dict:
@@ -45,69 +41,58 @@ def _save_state(state: dict) -> None:
 
 # ── Rate fetch ────────────────────────────────────────────────────────────────
 
-def _get_current_rate() -> tuple[float, str] | tuple[None, str]:
+def _get_current_rate() -> tuple[float, str, dict] | tuple[None, str, dict]:
     """
-    Returns (aud_per_cny, source).
-    aud_per_cny: how many AUD for 1 CNY  (e.g. 0.2045)
-    Inverse to get CNY per AUD: 1 / aud_per_cny ≈ 4.89
+    Returns (cny_per_aud, source, full_data).
+    Prefer bank spot sell rate because the tuition/living-cost scenario is
+    CNY -> AUD, where the customer buys AUD from the bank.
     """
-    # 1) open.er-api.com
     try:
-        req = urllib.request.Request(ER_API_URL, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=8) as resp:
-            data = json.loads(resp.read().decode())
-        if data.get("result") == "success":
-            aud = data["rates"].get("AUD")
-            if aud and float(aud) > 0:
-                return float(aud), "open.er-api.com"
+        from fetch_rate import fetch_rate
+        data = fetch_rate("7d")
+        rate = data.get("current_1_AUD_in_CNY")
+        if rate and float(rate) > 0:
+            return float(rate), data.get("current_rate_basis", "unknown"), data
     except Exception:
         pass
 
-    # 2) yfinance fallback
-    try:
-        import yfinance as yf
-        info = yf.Ticker("CNYAUD=X").info
-        for key in ("regularMarketPrice", "currentPrice", "ask", "bid", "previousClose"):
-            val = info.get(key)
-            if val and float(val) > 0:
-                return float(val), "yfinance (fallback)"
-    except Exception:
-        pass
-
-    return None, "unavailable"
+    return None, "unavailable", {}
 
 
 # ── Main logic ────────────────────────────────────────────────────────────────
 
 def check_alert(threshold_pct: float, force_update: bool = False) -> dict:
-    aud_per_cny, source = _get_current_rate()
+    cny_per_aud, source, full_data = _get_current_rate()
     now_utc = datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z"
 
-    if aud_per_cny is None:
+    if cny_per_aud is None:
         return {"error": "无法获取当前汇率，请稍后重试。", "timestamp": now_utc}
-
-    cny_per_aud = 1.0 / aud_per_cny   # "1 AUD = X CNY" — the user-facing number
 
     state = _load_state()
     result: dict = {
         "pair": "CNY/AUD",
-        "realtime_source": source,
-        # Both directions, clearly labelled
+        "rate_basis": source,
         "current_1_AUD_in_CNY": round(cny_per_aud, 4),
-        "current_1_CNY_in_AUD": round(aud_per_cny, 6),
-        "display": f"1 AUD = {cny_per_aud:.4f} CNY  |  1 CNY = {aud_per_cny:.6f} AUD",
+        "display": f"1 AUD = {cny_per_aud:.4f} CNY ({source})",
         "timestamp": now_utc,
         "threshold_pct": threshold_pct,
         "alert": False,
         "baseline_updated": False,
     }
+    if full_data.get("student_exchange_reference"):
+        result["student_exchange_reference"] = full_data["student_exchange_reference"]
 
-    has_baseline = "baseline_aud_per_cny" in state
+    if "baseline_cny_per_aud" not in state and "baseline_aud_per_cny" in state:
+        try:
+            state["baseline_cny_per_aud"] = 1.0 / float(state["baseline_aud_per_cny"])
+        except (TypeError, ValueError, ZeroDivisionError):
+            pass
+
+    has_baseline = "baseline_cny_per_aud" in state
 
     if has_baseline:
-        baseline_aud = float(state["baseline_aud_per_cny"])
-        baseline_cny = 1.0 / baseline_aud
-        change_pct = (aud_per_cny - baseline_aud) / baseline_aud * 100
+        baseline_cny = float(state["baseline_cny_per_aud"])
+        change_pct = (cny_per_aud - baseline_cny) / baseline_cny * 100
 
         result["baseline_1_AUD_in_CNY"] = round(baseline_cny, 4)
         result["baseline_time"] = state.get("baseline_time", "未知")
@@ -115,13 +100,11 @@ def check_alert(threshold_pct: float, force_update: bool = False) -> dict:
 
         if abs(change_pct) >= threshold_pct:
             result["alert"] = True
-            # From user's perspective: CNY strengthens = AUD gets cheaper in CNY terms
-            # change_pct > 0 means AUD/CNY rose → CNY weakened
             if change_pct > 0:
-                direction = "CNY贬值 (AUD升值)"
+                direction = "买 AUD 变贵 (AUD 对人民币升值)"
                 emoji = "📉"
             else:
-                direction = "CNY升值 (AUD贬值)"
+                direction = "买 AUD 变便宜 (AUD 对人民币贬值)"
                 emoji = "📈"
 
             result["alert_message"] = (
@@ -139,8 +122,9 @@ def check_alert(threshold_pct: float, force_update: bool = False) -> dict:
         result["info"] = "首次运行，已将当前汇率保存为基准。"
 
     if force_update or not has_baseline:
-        state["baseline_aud_per_cny"] = aud_per_cny
+        state["baseline_cny_per_aud"] = cny_per_aud
         state["baseline_time"] = now_utc
+        state["baseline_basis"] = source
         _save_state(state)
         result["baseline_updated"] = True
         result["baseline_1_AUD_in_CNY"] = round(cny_per_aud, 4)
@@ -158,7 +142,7 @@ def _format_text(r: dict) -> str:
         "  CNY/AUD 实时阈值监控",
         "═══════════════════════════════════",
         f"当前汇率:   {r['display']}",
-        f"数据来源:   {r.get('realtime_source', 'N/A')}",
+        f"价格口径:   {r.get('rate_basis', 'N/A')}",
         f"查询时间:   {r['timestamp']} (UTC)",
         f"告警阈值:   ±{r['threshold_pct']}%",
     ]

@@ -1,6 +1,7 @@
 """Structured personalization storage for Phase 8."""
 
 from .user_profile_store import (
+    build_safe_user_context,
     delete_user_profile,
     get_or_create_user,
     get_user_profile,
@@ -14,6 +15,7 @@ from .user_profile_store import (
 )
 
 __all__ = [
+    "build_safe_user_context",
     "delete_user_profile",
     "get_or_create_user",
     "get_user_profile",

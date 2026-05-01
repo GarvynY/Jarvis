@@ -266,6 +266,56 @@ def run_command(command: str) -> str:
         return f"Execution error: {exc}"
 
 
+def cnyaud_monitor_data(
+    action: str,
+    period: str = "90d",
+    threshold: float = 0.3,
+    no_mark_seen: bool = False,
+) -> str:
+    """Run approved CNY/AUD monitor helpers without exposing a shell."""
+    scripts = {
+        "fetch_rate": "fetch_rate.py",
+        "news_monitor": "news_monitor.py",
+        "monitor_alert": "monitor_alert.py",
+    }
+    script_name = scripts.get(str(action or "").strip())
+    if not script_name:
+        return "Error: action must be one of fetch_rate, news_monitor, monitor_alert."
+
+    skill_dir = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "templates", "skills", "data", "cnyaud_monitor",
+    )
+    script = os.path.join(skill_dir, script_name)
+    if not os.path.isfile(script):
+        return f"Error: approved helper not found: {script_name}"
+
+    cmd = [sys.executable, script, "--format", "json"]
+    if action == "fetch_rate":
+        if period not in {"7d", "30d", "90d", "1y"}:
+            return "Error: period must be one of 7d, 30d, 90d, 1y."
+        cmd.extend(["--period", period])
+    elif action == "monitor_alert":
+        cmd.extend(["--threshold", str(float(threshold))])
+    elif action == "news_monitor" and no_mark_seen:
+        cmd.append("--no-mark-seen")
+
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env=_venv_env(),
+            cwd=_files_dir(),
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+        return f"Error (exit {result.returncode}):\n{result.stderr.strip()}"
+    except Exception as exc:
+        return f"Execution error: {exc}"
+
+
 def read_file(path: str) -> str:
     """Read and return a file from the Phase 8 safe allowlist."""
     try:
@@ -371,6 +421,7 @@ def send_file(path: str, caption: str = "") -> str:
 
 AVAILABLE_TOOLS: dict[str, callable] = {
     "run_command": run_command,
+    "cnyaud_monitor_data": cnyaud_monitor_data,
     "read_file": read_file,
     "write_file": write_file,
     "list_files": list_files,
@@ -401,6 +452,37 @@ def _fn(name: str, description: str, properties: dict, required: list[str]) -> d
 
 
 PRIMITIVE_TOOLS: list[dict] = [
+    _fn(
+        "cnyaud_monitor_data",
+        (
+            "Approved CNY/AUD monitor helper. Use this instead of shell commands "
+            "to fetch exchange-rate JSON, check RSS news, or run threshold checks."
+        ),
+        {
+            "action": {
+                "type": "string",
+                "enum": ["fetch_rate", "news_monitor", "monitor_alert"],
+                "description": "Which approved monitor helper to run.",
+            },
+            "period": {
+                "type": "string",
+                "enum": ["7d", "30d", "90d", "1y"],
+                "description": "History period for fetch_rate.",
+                "default": "90d",
+            },
+            "threshold": {
+                "type": "number",
+                "description": "Percentage threshold for monitor_alert.",
+                "default": 0.3,
+            },
+            "no_mark_seen": {
+                "type": "boolean",
+                "description": "For news_monitor, avoid marking RSS articles as seen.",
+                "default": False,
+            },
+        },
+        ["action"],
+    ),
     _fn(
         "run_command",
         (
@@ -840,6 +922,13 @@ CRON_TOOLS: list[dict] = [
             "deliver_to_chat_id": {
                 "type": "integer",
                 "description": "Optional Telegram chat_id to deliver the result to.",
+            },
+            "telegram_user_id": {
+                "type": "integer",
+                "description": (
+                    "Optional explicit Telegram user id for safe personalization. "
+                    "Do not use group or channel chat ids."
+                ),
             },
         },
         ["job_id", "cron", "prompt"],
