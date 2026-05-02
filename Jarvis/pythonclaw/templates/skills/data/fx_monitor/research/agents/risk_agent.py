@@ -1,127 +1,232 @@
 """
-risk_agent — stateless risk synthesis agent.
+Phase 9 Step 3d — RiskAgent
 
 Runs AFTER Phase-1 agents (fx_agent, news_agent, macro_agent).
-Reads all Phase-1 AgentOutputs and synthesises contradictions/risks
-into a single AgentOutput. Never fetches external data itself.
+Reads all Phase-1 AgentOutputs and synthesises contradictions and risks
+into a single AgentOutput.
 
-Accepts ResearchTask + list[AgentOutput], returns AgentOutput.
-No side effects. No direct inter-agent communication.
+No external data fetches. No LLM calls. No side effects.
+No executor needed — pure CPU-bound synthesis.
+
+Signature differs from Phase-1 agents:
+    await risk_agent.run(task, phase1_outputs)
+The coordinator calls this explicitly after runner.run_many() completes.
 """
 
 from __future__ import annotations
 
 import time
-from datetime import datetime, timezone
 from collections import Counter
+from datetime import datetime, timezone
 
-from ..schema import (
-    AgentOutput,
-    Finding,
-    ResearchTask,
-)
+try:
+    from ..schema import AgentOutput, Finding, ResearchTask, now_iso
+except ImportError:
+    from schema import AgentOutput, Finding, ResearchTask, now_iso  # type: ignore[no-redef]
 
-AGENT_NAME = "risk_agent"
+_STALE_SOURCE_HOURS = 48.0
 
 
-def run(task: ResearchTask, phase1_outputs: list[AgentOutput]) -> AgentOutput:
+def _parse_iso(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _age_hours(value: str | None, now: datetime) -> float | None:
+    dt = _parse_iso(value)
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return max(0.0, (now - dt.astimezone(timezone.utc)).total_seconds() / 3600.0)
+
+
+class RiskAgent:
     """
-    Synthesise risks and contradictions from Phase-1 outputs.
+    Risk synthesis agent.
 
-    Note: signature differs from Phase-1 agents — takes phase1_outputs as
-    the second argument. Runner handles this explicitly.
+    Protocol:
+        agent.agent_name                          → str
+        await agent.run(task, phase1_outputs)     → AgentOutput
+
+    Note: second argument phase1_outputs distinguishes this from Phase-1
+    agents. The coordinator handles this explicitly.
     """
-    t0 = time.monotonic()
-    retrieved_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
-    findings: list[Finding] = []
-    risks: list[str] = []
-    missing: list[str] = []
+    agent_name: str = "risk_agent"
 
-    # ── Collect all directions from Phase-1 findings ──────────────────────────
-    all_findings: list[Finding] = []
-    for output in phase1_outputs:
-        all_findings.extend(output.findings)
-        risks.extend(output.risks)
+    async def run(
+        self,
+        task: ResearchTask,
+        phase1_outputs: list[AgentOutput],
+    ) -> AgentOutput:
+        """Synthesise risks and contradictions from Phase-1 outputs."""
+        t0 = time.monotonic()
+        retrieved_at = now_iso()
+        now_dt = datetime.now(timezone.utc)
+        findings: list[Finding] = []
+        risks: list[str] = []
+        missing: list[str] = []
 
-    direction_counts = Counter(
-        f.direction for f in all_findings if f.direction and f.direction != "neutral"
-    )
-    bullish = direction_counts.get("bullish_aud", 0)
-    bearish = direction_counts.get("bearish_aud", 0)
+        # ── Collect all directions from Phase-1 findings ──────────────────────
+        all_findings: list[Finding] = []
+        for output in phase1_outputs:
+            all_findings.extend(output.findings)
+            risks.extend(output.risks)
+            for item in output.missing_data:
+                missing.append(f"{output.agent_name}: {item}")
 
-    # ── Contradiction detection ───────────────────────────────────────────────
-    if bullish > 0 and bearish > 0:
-        findings.append(Finding(
-            key="signal_contradiction",
-            summary=(
-                f"多空信号矛盾：{bullish} 个指标偏多 AUD，{bearish} 个偏空 AUD。"
-                "当前方向不明确，不宜仅凭单一信号判断。"
-            ),
-            direction="neutral",
-        ))
+            if output.findings and not output.sources:
+                findings.append(Finding(
+                    key=f"missing_sources_{output.agent_name}",
+                    summary=f"{output.agent_name} 返回了发现项但没有提供来源引用。",
+                    direction="neutral",
+                ))
+                missing.append(f"missing_sources:{output.agent_name}")
 
-    # ── Agent failure risks ───────────────────────────────────────────────────
-    failed_agents = [o.agent_name for o in phase1_outputs if o.status == "error"]
-    partial_agents = [o.agent_name for o in phase1_outputs if o.status == "partial"]
-    if failed_agents:
-        missing.extend(failed_agents)
-        findings.append(Finding(
-            key="data_gap_failed_agents",
-            summary=f"以下数据源不可用，研究可能不完整：{', '.join(failed_agents)}",
-            direction="neutral",
-        ))
-    if partial_agents:
-        findings.append(Finding(
-            key="data_gap_partial_agents",
-            summary=f"以下数据源部分缺失：{', '.join(partial_agents)}",
-            direction="neutral",
-        ))
+            ages: list[tuple[str, float]] = []
+            output_age = _age_hours(output.as_of, now_dt)
+            if output_age is not None:
+                ages.append(("as_of", output_age))
+            for src in output.sources:
+                timestamp = src.published_at or src.retrieved_at
+                if not timestamp:
+                    findings.append(Finding(
+                        key=f"missing_source_timestamp_{output.agent_name}",
+                        summary=(
+                            f"{output.agent_name} 的来源缺少 published_at/retrieved_at："
+                            f"{src.title or src.source or 'source'}"
+                        ),
+                        direction="neutral",
+                    ))
+                    missing.append(f"missing_source_timestamp:{output.agent_name}")
+                    continue
+                src_age = _age_hours(timestamp, now_dt)
+                if src_age is not None:
+                    ages.append((src.title or src.source or "source", src_age))
+            stale = [(label, age) for label, age in ages if age > _STALE_SOURCE_HOURS]
+            if stale:
+                label, age = max(stale, key=lambda item: item[1])
+                findings.append(Finding(
+                    key=f"stale_data_{output.agent_name}",
+                    summary=(
+                        f"{output.agent_name} 存在可能过期的数据：{label} "
+                        f"约 {age:.0f} 小时前。"
+                    ),
+                    direction="neutral",
+                ))
+                risks.append(f"{output.agent_name} 数据可能过期，需复核最新来源")
+                missing.append(f"stale_data:{output.agent_name}")
 
-    # ── Low-confidence warning ────────────────────────────────────────────────
-    avg_confidence = (
-        sum(o.confidence for o in phase1_outputs) / len(phase1_outputs)
-        if phase1_outputs else 0.0
-    )
-    if avg_confidence < 0.4:
-        risks.append(f"数据整体置信度较低（平均 {avg_confidence:.0%}），结论参考价值有限")
+        direction_counts = Counter(
+            f.direction
+            for f in all_findings
+            if f.direction and f.direction != "neutral"
+        )
+        bullish = direction_counts.get("bullish_aud", 0)
+        bearish = direction_counts.get("bearish_aud", 0)
 
-    # ── Dominant trend summary ────────────────────────────────────────────────
-    if bullish > bearish and bullish > 0:
-        findings.append(Finding(
-            key="dominant_signal",
-            summary=f"多数指标（{bullish}/{bullish+bearish}）偏向 AUD 走强，但不构成操作建议",
-            direction="bullish_aud",
-        ))
-    elif bearish > bullish and bearish > 0:
-        findings.append(Finding(
-            key="dominant_signal",
-            summary=f"多数指标（{bearish}/{bullish+bearish}）偏向 AUD 走弱，但不构成操作建议",
-            direction="bearish_aud",
-        ))
-    elif not all_findings:
-        findings.append(Finding(
-            key="no_data",
-            summary="所有上游代理均未返回有效数据，风险分析无法完成",
-            direction="neutral",
-        ))
-    else:
-        findings.append(Finding(
-            key="dominant_signal",
-            summary="当前信号方向不明确，多空力量相对均衡",
-            direction="neutral",
-        ))
+        # ── Contradiction detection ───────────────────────────────────────────
+        if bullish > 0 and bearish > 0:
+            findings.append(Finding(
+                key="signal_contradiction",
+                summary=(
+                    f"多空信号矛盾：{bullish} 个指标偏多 AUD，{bearish} 个偏空 AUD。"
+                    "当前方向不明确，不宜仅凭单一信号判断。"
+                ),
+                direction="neutral",
+            ))
 
-    status = "ok" if phase1_outputs else "error"
-    return AgentOutput(
-        agent_name=AGENT_NAME,
-        status=status,
-        summary=findings[0].summary if findings else "风险分析无输出",
-        findings=findings,
-        sources=[],  # risk_agent synthesises — no new external sources
-        as_of=retrieved_at,
-        confidence=min(avg_confidence, 0.7),
-        risks=list(dict.fromkeys(risks)),  # deduplicate, preserve order
-        missing_data=missing,
-        latency_ms=int((time.monotonic() - t0) * 1000),
-    )
+        # ── Agent failure / data-gap findings ────────────────────────────────
+        failed  = [o.agent_name for o in phase1_outputs if o.status == "error"]
+        partial = [o.agent_name for o in phase1_outputs if o.status == "partial"]
+
+        if failed:
+            missing.extend(failed)
+            findings.append(Finding(
+                key="data_gap_failed_agents",
+                summary=f"以下数据源不可用，研究可能不完整：{', '.join(failed)}",
+                direction="neutral",
+            ))
+        if partial:
+            missing.extend(partial)
+            findings.append(Finding(
+                key="data_gap_partial_agents",
+                summary=f"以下数据源部分缺失：{', '.join(partial)}",
+                direction="neutral",
+            ))
+
+        # ── Low-confidence warning ────────────────────────────────────────────
+        avg_confidence = (
+            sum(o.confidence for o in phase1_outputs) / len(phase1_outputs)
+            if phase1_outputs else 0.0
+        )
+        if avg_confidence < 0.4:
+            risks.append(
+                f"数据整体置信度较低（平均 {avg_confidence:.0%}），结论参考价值有限"
+            )
+
+        low_conf_agents = [
+            f"{o.agent_name}:{o.confidence:.0%}"
+            for o in phase1_outputs
+            if o.confidence < 0.4
+        ]
+        if low_conf_agents:
+            findings.append(Finding(
+                key="low_confidence_outputs",
+                summary=f"以下代理置信度偏低：{', '.join(low_conf_agents)}",
+                direction="neutral",
+            ))
+
+        # ── Dominant trend summary ────────────────────────────────────────────
+        if bullish > bearish and bullish > 0:
+            findings.append(Finding(
+                key="dominant_signal",
+                summary=(
+                    f"多数指标（{bullish}/{bullish + bearish}）偏向 AUD 走强，"
+                    "但不构成操作建议"
+                ),
+                direction="bullish_aud",
+            ))
+        elif bearish > bullish and bearish > 0:
+            findings.append(Finding(
+                key="dominant_signal",
+                summary=(
+                    f"多数指标（{bearish}/{bullish + bearish}）偏向 AUD 走弱，"
+                    "但不构成操作建议"
+                ),
+                direction="bearish_aud",
+            ))
+        elif not all_findings:
+            findings.append(Finding(
+                key="no_data",
+                summary="所有上游代理均未返回有效数据，风险分析无法完成",
+                direction="neutral",
+            ))
+        else:
+            findings.append(Finding(
+                key="dominant_signal",
+                summary="当前信号方向不明确，多空力量相对均衡",
+                direction="neutral",
+            ))
+
+        status = "ok" if phase1_outputs else "error"
+
+        return AgentOutput(
+            agent_name=self.agent_name,
+            status=status,
+            summary=findings[0].summary if findings else "风险分析无输出",
+            findings=findings,
+            sources=[],   # risk_agent synthesises — no new external sources
+            as_of=retrieved_at,
+            confidence=min(avg_confidence, 0.70),
+            risks=list(dict.fromkeys(risks)),   # deduplicate, preserve order
+            missing_data=list(dict.fromkeys(missing)),
+            latency_ms=int((time.monotonic() - t0) * 1000),
+            token_usage={},
+            regulatory_flags=[],
+        )
