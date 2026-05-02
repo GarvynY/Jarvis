@@ -93,6 +93,7 @@ _WELCOME_GUIDE = (
     "  /my_profile — 查看个性化资料；中文：/我的资料\n"
     "  /update_profile — 修改偏好；中文：/修改资料\n"
     "  /feedback useful — 记录反馈；中文：/反馈 有用\n"
+    "  /clear_inferred — 清空推断偏好；中文：/清空推断\n"
     "  /delete_profile — 删除个性化数据；中文：/删除资料\n"
     "  /privacy — 查看隐私说明；中文：/隐私\n\n"
     "📝 常用中文示例：\n"
@@ -443,25 +444,20 @@ def _format_user_profile(profile: dict[str, Any], *, created: bool = False) -> s
         lines.append("- 暂无明确偏好")
 
     lines.extend(["", "推断出的偏好："])
-    inferred_added = False
-    if _is_set(inferred.get("high_interest_topics")):
-        lines.append(f"- 高兴趣话题：{_display_topics(inferred.get('high_interest_topics'))}")
-        inferred_added = True
-    if _is_set(inferred.get("low_interest_topics")):
-        lines.append(f"- 低兴趣话题：{_display_topics(inferred.get('low_interest_topics'))}")
-        inferred_added = True
-    confidence = inferred.get("confidence")
-    if confidence is not None:
-        lines.append(f"- 推断置信度：{confidence}")
-        inferred_added = True
-    if not inferred_added:
-        lines.append("- 暂无推断偏好")
+    from ..core.personalization.user_profile_store import format_inferred_preferences_display
+    inferred_display = format_inferred_preferences_display(inferred)
+    if inferred_display:
+        lines.append(inferred_display)
+    else:
+        lines.append("- 暂无推断偏好（收到足够反馈后 Jarvis 会自动推断）")
 
     lines.extend(_format_feedback_summary(feedback))
     lines.extend([
         "",
         "说明：这里不会显示原始行为日志或短期 raw events。",
-        "你可以使用 /update_profile 修改明确偏好，或使用 /delete_profile 删除个性化数据。",
+        "你可以使用 /update_profile 修改明确偏好；"
+        "使用 /clear_inferred 仅清空推断偏好（保留明确设置）；"
+        "使用 /delete_profile 删除全部个性化数据。",
     ])
     return "\n".join(lines)
 
@@ -984,8 +980,17 @@ class TelegramBot:
                 message_id=str(update.message.message_id),
                 metadata={"source": "telegram_command"},
             )
-        except ValueError:
-            await update.message.reply_text("反馈内容不适合保存，请简化后再试。")
+        except ValueError as exc:
+            if str(exc).startswith("topic_not_allowed:"):
+                from ..core.personalization import ALLOWED_FEEDBACK_TOPICS
+                valid = "、".join(sorted(ALLOWED_FEEDBACK_TOPICS))
+                await update.message.reply_text(
+                    "主题不在允许列表中，请使用以下主题之一：\n"
+                    f"{valid}\n\n"
+                    "示例：/feedback not_interested topic=通用市场新闻"
+                )
+            else:
+                await update.message.reply_text("反馈内容不适合保存，请简化后再试。")
             return
         except Exception:
             logger.exception(
@@ -1003,6 +1008,18 @@ class TelegramBot:
             topic or "",
         )
         await update.message.reply_text(_format_feedback_confirmation(event_type, topic))
+
+        # Run the rule-based aggregator after each feedback event.
+        # This is a lightweight SQL-only operation — no LLM is involved.
+        try:
+            from ..core.personalization import update_inferred_preferences_from_feedback
+            update_inferred_preferences_from_feedback(update.effective_user.id)
+        except Exception:
+            logger.warning(
+                "[Telegram] Inferred preference aggregation failed for user_id=%s",
+                update.effective_user.id,
+                exc_info=True,
+            )
 
     async def _cmd_feedback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._check_access(update, context):
@@ -1346,12 +1363,46 @@ class TelegramBot:
                 return True
             await self._record_feedback(update, args)
             return True
+        if command in {"/清空推断", "/清除推断"}:
+            if not await self._check_access(update, context):
+                return True
+            await self._cmd_clear_inferred(update, context)
+            return True
         return False
 
     async def _cmd_delete_profile(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._check_access(update, context):
             return
         await self._handle_delete_profile_command(update, context, list(context.args or []))
+
+    async def _cmd_clear_inferred(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Clear only inferred_preferences, keeping explicit prefs and feedback history."""
+        if not await self._check_access(update, context):
+            return
+        if update.effective_user is None or update.message is None:
+            return
+
+        from ..core.personalization import clear_inferred_preferences
+
+        telegram_user_id = update.effective_user.id
+        try:
+            deleted = clear_inferred_preferences(telegram_user_id)
+        except Exception:
+            logger.exception(
+                "[Telegram] Failed to clear inferred preferences for user_id=%s",
+                telegram_user_id,
+            )
+            await update.message.reply_text("清空推断偏好失败，请稍后再试。")
+            return
+
+        if deleted:
+            await update.message.reply_text(
+                "已清空 Jarvis 的推断偏好。\n\n"
+                "你的明确偏好和反馈记录已保留。\n"
+                "继续使用 /feedback 后，Jarvis 会从零重新推断。"
+            )
+        else:
+            await update.message.reply_text("目前没有推断偏好记录，无需清空。")
 
     async def _handle_delete_profile_command(
         self,
@@ -1784,6 +1835,7 @@ class TelegramBot:
         BotCommand("feedback", "记录提醒反馈"),
         BotCommand("privacy", "查看隐私说明"),
         BotCommand("delete_profile", "删除我的个性化数据"),
+        BotCommand("clear_inferred", "清空 Jarvis 的推断偏好（保留明确设置）"),
         BotCommand("bank_rates", "查看十大银行 AUD 牌价"),
         BotCommand("clear_files", "清空下载文件"),
     ]
@@ -1799,6 +1851,7 @@ class TelegramBot:
         app.add_handler(CommandHandler("feedback", self._cmd_feedback))
         app.add_handler(CommandHandler("privacy", self._cmd_privacy))
         app.add_handler(CommandHandler("delete_profile", self._cmd_delete_profile))
+        app.add_handler(CommandHandler("clear_inferred", self._cmd_clear_inferred))
         app.add_handler(CommandHandler("bank_rates", self._cmd_bank_rates))
         app.add_handler(CommandHandler("clear_files", self._cmd_clear_files))
         app.add_handler(MessageHandler(

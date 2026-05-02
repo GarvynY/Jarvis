@@ -26,6 +26,36 @@ logger = logging.getLogger(__name__)
 
 SCHEMA_VERSION = 4
 
+# ── Inference aggregation thresholds ─────────────────────────────────────────
+# Minimum number of 'useful' feedback events on a topic before it may be
+# promoted to high_interest_topics (net-value rule also requires useful > neg).
+MIN_USEFUL_COUNT: int = 2
+# Minimum number of negative feedback events before a topic may be added to
+# low_interest_topics (net-value rule also requires negative > useful).
+MIN_NEGATIVE_COUNT: int = 2
+# Total feedback events required to reach confidence = 1.0.
+CONFIDENCE_FULL_AT: int = 10
+# Maximum number of topics stored per inferred list.
+MAX_INFERRED_TOPICS: int = 8
+
+# ── Safe topic taxonomy ───────────────────────────────────────────────────────
+# Only topics in this set are accepted by log_feedback_event().  This prevents
+# sensitive inferences (e.g. "家庭压力", "签证焦虑") from accumulating in the
+# personalization store.  Extend this list as new alert categories are added.
+ALLOWED_FEEDBACK_TOPICS: frozenset[str] = frozenset({
+    # ── Exchange rate instruments ──
+    "CNY", "AUD", "USD", "人民币", "澳元", "美元", "汇率",
+    # ── Macro / economic drivers ──
+    "RBA", "RBA政策", "oil", "油价", "inflation", "通胀",
+    "interest_rate", "利率", "trade", "贸易",
+    # ── Geopolitical / regional ──
+    "China", "Australia", "中澳关系", "中东局势",
+    # ── Alert / product categories ──
+    "bank_rates", "银行牌价", "market_news", "市场新闻",
+    "通用市场新闻", "major_news", "重大新闻",
+    "volatility", "波动", "daily_report", "晨报",
+})
+
 EXPLICIT_PREFERENCE_KEYS = {
     "language",
     "target_rate",
@@ -865,6 +895,8 @@ def log_feedback_event(
     if event_type not in FEEDBACK_EVENT_TYPES:
         raise ValueError(f"Unsupported feedback event_type: {event_type}")
     topic = _validate_event_text(topic, path="topic")
+    if topic is not None and topic not in ALLOWED_FEEDBACK_TOPICS:
+        raise ValueError(f"topic_not_allowed:{topic}")
     message_id = _validate_event_text(message_id, path="message_id")
     _reject_sensitive_payload(metadata or {}, path="metadata")
     init_db(db_path)
@@ -935,3 +967,166 @@ def log_raw_event(
             ),
         )
         return int(cur.lastrowid)
+
+
+def update_inferred_preferences_from_feedback(
+    telegram_user_id: int | str,
+    db_path: str | Path | None = None,
+) -> dict[str, Any]:
+    """Aggregate feedback_events into inferred preferences using a net-value rule.
+
+    This is a pure rule-based aggregator — no LLM is involved and raw events
+    are never exposed.  Only the ``feedback_events`` table is read.  Inferred
+    preferences are stored separately from explicit preferences.
+
+    Net-value aggregation rules
+    ---------------------------
+    For each topic with at least one feedback event:
+
+    high_interest_topics
+        ``useful >= MIN_USEFUL_COUNT  AND  useful > negative``
+    low_interest_topics
+        ``negative >= MIN_NEGATIVE_COUNT  AND  negative > useful``
+    Tie / insufficient data
+        Topics where useful == negative (both above threshold) or neither
+        reaches its threshold are not classified — avoiding overconfident
+        inferences from conflicting signals.
+
+    confidence
+        ``min(1.0, total_feedback_events / CONFIDENCE_FULL_AT)`` — reflects
+        how much feedback data backs the inferred preferences overall.
+        This is a *volume* confidence, not per-topic accuracy.
+
+    Returns the full updated user profile dict (same shape as
+    ``get_user_profile``).  Returns ``{}`` if the user does not exist yet.
+    """
+    init_db(db_path)
+    with _connect(db_path) as conn:
+        user = _user_row(conn, telegram_user_id)
+        if user is None:
+            return {}
+
+        user_id = user["id"]
+
+        # Collect per-topic useful counts
+        useful_counts: dict[str, int] = {}
+        for row in conn.execute(
+            """
+            SELECT topic, COUNT(*) AS cnt
+            FROM feedback_events
+            WHERE user_id = ?
+              AND event_type = 'useful'
+              AND topic IS NOT NULL AND topic != ''
+            GROUP BY topic
+            """,
+            (user_id,),
+        ):
+            useful_counts[row["topic"]] = int(row["cnt"])
+
+        # Collect per-topic negative counts
+        negative_counts: dict[str, int] = {}
+        for row in conn.execute(
+            """
+            SELECT topic, COUNT(*) AS cnt
+            FROM feedback_events
+            WHERE user_id = ?
+              AND event_type IN ('not_useful', 'useless', 'not_interested')
+              AND topic IS NOT NULL AND topic != ''
+            GROUP BY topic
+            """,
+            (user_id,),
+        ):
+            negative_counts[row["topic"]] = int(row["cnt"])
+
+        # Total feedback events for confidence calculation
+        total_row = conn.execute(
+            "SELECT COUNT(*) AS cnt FROM feedback_events WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+        total_count = int(total_row["cnt"]) if total_row else 0
+
+    # Apply net-value rule: classify each known topic exactly once
+    all_topics = set(useful_counts) | set(negative_counts)
+    high_scored: list[tuple[str, int]] = []
+    low_scored: list[tuple[str, int]] = []
+
+    for topic in all_topics:
+        u = useful_counts.get(topic, 0)
+        n = negative_counts.get(topic, 0)
+        if u >= MIN_USEFUL_COUNT and u > n:
+            high_scored.append((topic, u))
+        elif n >= MIN_NEGATIVE_COUNT and n > u:
+            low_scored.append((topic, n))
+        # u == n (tie) or below threshold → no classification
+
+    # Sort by count descending, cap at MAX_INFERRED_TOPICS
+    high_scored.sort(key=lambda x: -x[1])
+    low_scored.sort(key=lambda x: -x[1])
+    high_interest = [t for t, _ in high_scored[:MAX_INFERRED_TOPICS]]
+    low_interest = [t for t, _ in low_scored[:MAX_INFERRED_TOPICS]]
+    confidence = round(min(1.0, total_count / CONFIDENCE_FULL_AT), 2)
+
+    updates: dict[str, Any] = {
+        "high_interest_topics": high_interest,
+        "low_interest_topics": low_interest,
+        "confidence": confidence,
+    }
+    return update_inferred_preferences(telegram_user_id, updates, db_path)
+
+
+def clear_inferred_preferences(
+    telegram_user_id: int | str,
+    db_path: str | Path | None = None,
+) -> bool:
+    """Delete only the inferred_preferences row for a user.
+
+    Explicit preferences and feedback records are kept intact.  This lets a
+    user correct a wrong inference without losing their explicit settings or
+    the feedback history that drives future re-aggregation.
+
+    Returns ``True`` if a row was deleted, ``False`` if no inferred preferences
+    existed for the user.
+    """
+    init_db(db_path)
+    with _connect(db_path) as conn:
+        user = _user_row(conn, telegram_user_id)
+        if user is None:
+            return False
+        cur = conn.execute(
+            "DELETE FROM inferred_preferences WHERE user_id = ?",
+            (user["id"],),
+        )
+        return cur.rowcount > 0
+
+
+def format_inferred_preferences_display(inferred: dict[str, Any]) -> str:
+    """Return a human-readable Chinese summary of inferred preferences.
+
+    Example output::
+
+        Jarvis 对你的偏好理解：
+        - 你可能更关注：RBA政策、中澳关系
+        - 你对以下话题关注度较低：通用市场新闻
+        - 推断置信度：40%（基于你的反馈次数）
+        - 以上为 Jarvis 根据你的反馈自动推断，并非你主动设置的明确偏好。
+
+    Returns an empty string when there are no inferred preferences yet so the
+    caller can skip the section entirely.
+    """
+    high: list[str] = inferred.get("high_interest_topics") or []
+    low: list[str] = inferred.get("low_interest_topics") or []
+    confidence: float | None = inferred.get("confidence")
+
+    if not high and not low:
+        return ""
+
+    lines = ["Jarvis 对你的偏好理解："]
+    if high:
+        lines.append(f"- 你可能更关注：{'、'.join(str(t) for t in high)}")
+    if low:
+        lines.append(f"- 你对以下话题关注度较低：{'、'.join(str(t) for t in low)}")
+    if confidence is not None:
+        pct = int(confidence * 100)
+        lines.append(f"- 推断置信度：{pct}%（基于你的反馈次数）")
+    lines.append("- 以上为 Jarvis 根据你的反馈自动推断，并非你主动设置的明确偏好。")
+    return "\n".join(lines)
