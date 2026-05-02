@@ -112,6 +112,83 @@ def _run_script(script_name: str, *extra_args: str) -> dict | None:
     return None
 
 
+_DEFAULT_BANKS = ["中国银行", "工商银行", "建设银行"]
+
+
+def _preferred_banks_for_chat_id(chat_id: int | str | list) -> list[str]:
+    """Return explicit preferred_banks for a single user, or defaults for multi/unknown."""
+    if isinstance(chat_id, list):
+        if len(chat_id) != 1:
+            return list(_DEFAULT_BANKS)
+        user_id = chat_id[0]
+    else:
+        user_id = chat_id
+    try:
+        from pythonclaw.core.personalization import get_user_profile
+        profile = get_user_profile(user_id)
+        banks = (profile.get("explicit_preferences") or {}).get("preferred_banks") or []
+        return banks if banks else list(_DEFAULT_BANKS)
+    except Exception:
+        return list(_DEFAULT_BANKS)
+
+
+def _format_bank_rate_footer(rate_info: dict, preferred_banks: list[str]) -> str:
+    """Build the rate footer showing per-bank spot sell rates.
+
+    If the user has set a single preferred bank, format is one-liner:
+        💱 当前汇率（中国银行现汇卖出价）：4.9135 | 48h高点 4.9200（较高点 -0.22%）
+
+    Otherwise show each bank on its own line:
+        💱 当前汇率（现汇卖出价，买 AUD 参考）：
+          中国银行  4.9135
+          工商银行  4.9110
+          建设银行  4.9098
+        48h高点 4.9200（较高点 -0.22%）
+    """
+    data = rate_info.get("data") or {}
+    quotes: list[dict] = (data.get("bank_exchange_rates") or {}).get("quotes") or []
+    high = rate_info.get("high_48h")
+    drop = rate_info.get("drop_pct", 0)
+    # inline suffix for single-bank; standalone line for multi-bank
+    high_inline = f" | 48h高点 {high:.4f}（较高点 {drop:+.2f}%）" if high else ""
+    high_line   = f"48h高点 {high:.4f}（较高点 {drop:+.2f}%）" if high else ""
+
+    # Build lookup: bank_name → spot_sell_rate
+    rate_by_bank: dict[str, float] = {}
+    for q in quotes:
+        bank = q.get("bank")
+        sell = q.get("spot_sell_rate")
+        if bank and sell:
+            rate_by_bank[bank] = sell
+
+    if not rate_by_bank:
+        # Fallback: no bank data, show market rate
+        cny = rate_info.get("current_cny", 0)
+        return f"\n\n💱 <b>当前汇率</b>：1 AUD = {cny:.4f} CNY（市场参考价）{high_inline}"
+
+    # Collect rates for the user's preferred banks (skip banks with no data)
+    bank_lines: list[tuple[str, float]] = []
+    for bank in preferred_banks:
+        if bank in rate_by_bank:
+            bank_lines.append((bank, rate_by_bank[bank]))
+
+    if not bank_lines:
+        # None of the preferred banks returned data — show all available
+        bank_lines = sorted(rate_by_bank.items(), key=lambda x: x[1])[:3]
+
+    if len(bank_lines) == 1:
+        bank, sell = bank_lines[0]
+        return (
+            f"\n\n💱 <b>当前汇率</b>（{bank}现汇卖出价）："
+            f"1 AUD = <b>{sell:.4f}</b> CNY{high_inline}"
+        )
+
+    # Multiple banks — one per line, 48h info on its own line
+    rows = "\n".join(f"  {bank}  {sell:.4f}" for bank, sell in bank_lines)
+    tail = f"\n{high_line}" if high_line else ""
+    return f"\n\n💱 <b>当前汇率</b>（现汇卖出价，买 AUD 参考）：\n{rows}{tail}"
+
+
 def _safe_context_for_chat_id(chat_id: int | str | list) -> dict:
     """
     Build only the LLM-safe personalization allowlist.
@@ -320,7 +397,10 @@ def check_rate(state: dict, token: str, chat_id: int) -> dict | None:
             log.info("Simple rate alert sent.")
 
     return {
-        "data": data, "current_cny": current, "high_48h": high, "drop_pct": drop,
+        "data": data,           # full monitor_alert.py output (includes bank_exchange_rates)
+        "current_cny": current,
+        "high_48h": high,
+        "drop_pct": drop,
         "fetched_at": time.monotonic(),
     }
 
@@ -362,7 +442,7 @@ def check_news(api_key: str, token: str, chat_id: int,
         for a, summary in relevant
     )
 
-    # Append current rate — refresh if cache is older than 10 min, zero tokens
+    # Append current bank rate footer — refresh if cache older than 10 min
     rate_footer = ""
     RATE_STALE_SEC = 10 * 60
     fresh = rate_info
@@ -371,21 +451,15 @@ def check_news(api_key: str, token: str, chat_id: int,
         fresh_data = _run_script("monitor_alert.py", "--threshold", "999")
         if fresh_data:
             fresh = {
+                "data": fresh_data,
                 "current_cny": fresh_data.get("current_1_AUD_in_CNY", 0),
                 "high_48h": rate_info.get("high_48h") if rate_info else None,
                 "drop_pct": rate_info.get("drop_pct", 0) if rate_info else 0,
                 "fetched_at": time.monotonic(),
             }
     if fresh:
-        cny = fresh.get("current_cny", 0)
-        high = fresh.get("high_48h")
-        drop = fresh.get("drop_pct", 0)
-        high_str = f" | 48h高点 {high:.4f}" if high else ""
-        rate_footer = (
-            f"\n\n💱 <b>当前汇率</b>：1 AUD = {cny:.4f} CNY"
-            f"{high_str}"
-            f"（较高点 {drop:+.2f}%）"
-        )
+        preferred_banks = _preferred_banks_for_chat_id(chat_id)
+        rate_footer = _format_bank_rate_footer(fresh, preferred_banks)
 
     msg = f"📰 <b>CNY/AUD 相关新闻</b>\n\n{lines}{rate_footer}"
     _telegram_send(token, chat_id, msg)

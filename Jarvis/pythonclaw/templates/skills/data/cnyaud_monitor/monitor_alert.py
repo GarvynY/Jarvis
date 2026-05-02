@@ -81,6 +81,8 @@ def check_alert(threshold_pct: float, force_update: bool = False) -> dict:
     }
     if full_data.get("student_exchange_reference"):
         result["student_exchange_reference"] = full_data["student_exchange_reference"]
+    if full_data.get("bank_exchange_rates"):
+        result["bank_exchange_rates"] = full_data["bank_exchange_rates"]
 
     if "baseline_cny_per_aud" not in state and "baseline_aud_per_cny" in state:
         try:
