@@ -24,7 +24,7 @@ from ... import config
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 EXPLICIT_PREFERENCE_KEYS = {
     "language",
@@ -33,6 +33,7 @@ EXPLICIT_PREFERENCE_KEYS = {
     "purpose",
     "preferred_summary_style",
     "preferred_topics",
+    "preferred_banks",
     "privacy_level",
     "preferred_reminder_time",
     "actionability_threshold",
@@ -76,6 +77,7 @@ MAX_TOPIC_BYTES = 96
 MAX_EVENT_TEXT_BYTES = 256
 MAX_METADATA_STRING_BYTES = 1024
 MAX_TOPICS_PER_FIELD = 20
+MAX_BANKS_PER_FIELD = 10
 
 PREFERRED_SUMMARY_STYLES = {"brief", "standard", "detailed", "action_first"}
 PRIVACY_LEVELS = {"minimal", "standard", "strict"}
@@ -111,6 +113,53 @@ DEFAULT_SAFE_USER_CONTEXT: dict[str, Any] = {
     "preferred_summary_style": "standard",
     "preferred_topics": [],
     "privacy_level": "standard",
+}
+
+CANONICAL_BANK_NAMES = {
+    "中国银行",
+    "工商银行",
+    "建设银行",
+    "农业银行",
+    "交通银行",
+    "招商银行",
+    "中信银行",
+    "兴业银行",
+    "光大银行",
+    "浦发银行",
+}
+DEFAULT_PREFERRED_BANKS = ["中国银行", "建设银行", "工商银行"]
+BANK_ALIASES = {
+    "boc": "中国银行",
+    "中行": "中国银行",
+    "中国银行": "中国银行",
+    "icbc": "工商银行",
+    "工行": "工商银行",
+    "工商银行": "工商银行",
+    "ccb": "建设银行",
+    "建行": "建设银行",
+    "建设银行": "建设银行",
+    "abc": "农业银行",
+    "农行": "农业银行",
+    "农业银行": "农业银行",
+    "bocom": "交通银行",
+    "bankcomm": "交通银行",
+    "交行": "交通银行",
+    "交通银行": "交通银行",
+    "cmb": "招商银行",
+    "招行": "招商银行",
+    "招商银行": "招商银行",
+    "citic": "中信银行",
+    "中信": "中信银行",
+    "中信银行": "中信银行",
+    "cib": "兴业银行",
+    "兴业": "兴业银行",
+    "兴业银行": "兴业银行",
+    "ceb": "光大银行",
+    "光大": "光大银行",
+    "光大银行": "光大银行",
+    "spdb": "浦发银行",
+    "浦发": "浦发银行",
+    "浦发银行": "浦发银行",
 }
 
 SENSITIVE_VALUE_PATTERNS = [
@@ -152,6 +201,8 @@ def _json_loads(value: str | None, default: Any = None) -> Any:
 
 
 def _is_sensitive_key(key: str) -> bool:
+    if key == "preferred_banks":
+        return False
     lowered = key.lower()
     return any(marker in lowered for marker in SENSITIVE_KEY_MARKERS)
 
@@ -220,6 +271,33 @@ def _validate_topic_list(value: Any, *, path: str) -> list[str]:
     return topics
 
 
+def normalize_preferred_banks(value: Any) -> list[str]:
+    if value in (None, ""):
+        return []
+    if isinstance(value, str):
+        raw_items = re.split(r"[,，、\s]+", value)
+    elif isinstance(value, list):
+        raw_items = value
+    else:
+        raise ValueError("preferred_banks must be a list")
+    if len(raw_items) > MAX_BANKS_PER_FIELD:
+        raise ValueError("Too many banks in preferred_banks")
+
+    banks: list[str] = []
+    for index, item in enumerate(raw_items):
+        if not isinstance(item, str):
+            raise ValueError(f"preferred_banks[{index}] must be a string")
+        item = item.strip()
+        if not item:
+            continue
+        bank = BANK_ALIASES.get(item.lower(), BANK_ALIASES.get(item))
+        if bank not in CANONICAL_BANK_NAMES:
+            raise ValueError(f"Unsupported preferred bank: {item}")
+        if bank not in banks:
+            banks.append(bank)
+    return banks
+
+
 def _validate_preference_value(key: str, value: Any) -> Any:
     if key in {"target_rate", "alert_threshold", "actionability_threshold"}:
         if value is None:
@@ -227,6 +305,8 @@ def _validate_preference_value(key: str, value: Any) -> Any:
         return float(value)
     if key == "preferred_topics":
         return _validate_topic_list(value, path=key)
+    if key == "preferred_banks":
+        return normalize_preferred_banks(value)
     if key == "preferred_summary_style":
         if value is None:
             return None
@@ -338,6 +418,8 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
     explicit_columns = _column_names(conn, "explicit_preferences")
     if explicit_columns and "alert_preference" not in explicit_columns:
         conn.execute("ALTER TABLE explicit_preferences ADD COLUMN alert_preference TEXT")
+    if explicit_columns and "preferred_banks_json" not in explicit_columns:
+        conn.execute("ALTER TABLE explicit_preferences ADD COLUMN preferred_banks_json TEXT")
 
     inferred_columns = _column_names(conn, "inferred_preferences")
     if inferred_columns and "confidence" not in inferred_columns:
@@ -376,6 +458,7 @@ def init_db(db_path: str | Path | None = None) -> Path:
                 purpose TEXT,
                 preferred_summary_style TEXT,
                 preferred_topics_json TEXT,
+                preferred_banks_json TEXT,
                 privacy_level TEXT,
                 preferred_reminder_time TEXT,
                 actionability_threshold REAL,
@@ -490,6 +573,7 @@ def _explicit_row_to_dict(row: sqlite3.Row | None) -> dict[str, Any]:
         "purpose": row["purpose"],
         "preferred_summary_style": row["preferred_summary_style"],
         "preferred_topics": _json_loads(row["preferred_topics_json"], []),
+        "preferred_banks": _json_loads(row["preferred_banks_json"], []),
         "privacy_level": row["privacy_level"],
         "preferred_reminder_time": row["preferred_reminder_time"],
         "actionability_threshold": row["actionability_threshold"],
@@ -647,11 +731,11 @@ def update_explicit_preferences(
             """
             INSERT INTO explicit_preferences (
                 user_id, language, target_rate, alert_threshold, purpose,
-                preferred_summary_style, preferred_topics_json, privacy_level,
+                preferred_summary_style, preferred_topics_json, preferred_banks_json, privacy_level,
                 preferred_reminder_time, actionability_threshold, alert_preference,
                 updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(user_id) DO UPDATE SET
                 language = excluded.language,
                 target_rate = excluded.target_rate,
@@ -659,6 +743,7 @@ def update_explicit_preferences(
                 purpose = excluded.purpose,
                 preferred_summary_style = excluded.preferred_summary_style,
                 preferred_topics_json = excluded.preferred_topics_json,
+                preferred_banks_json = excluded.preferred_banks_json,
                 privacy_level = excluded.privacy_level,
                 preferred_reminder_time = excluded.preferred_reminder_time,
                 actionability_threshold = excluded.actionability_threshold,
@@ -673,6 +758,7 @@ def update_explicit_preferences(
                 data.get("purpose"),
                 data.get("preferred_summary_style"),
                 _json_dumps(data.get("preferred_topics") or []),
+                _json_dumps(data.get("preferred_banks") or []),
                 data.get("privacy_level"),
                 data.get("preferred_reminder_time"),
                 data.get("actionability_threshold"),

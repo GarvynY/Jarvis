@@ -34,7 +34,7 @@ BANK_SOURCES = [
     ("ABC", "农业银行", "https://www.usdrate.top/ABCHINA.html"),
     ("BOCOM", "交通银行", "https://www.usdrate.top/BANKCOMM.html"),
     ("CMB", "招商银行", "https://www.usdrate.top/CMBCHINA.html"),
-    ("CMBC", "民生银行", "https://www.usdrate.top/CMBC.html"),
+    ("CITIC", "中信银行", "https://www.usdrate.top/ECITIC.html"),
     ("CIB", "兴业银行", "https://www.usdrate.top/CIB.html"),
     ("CEB", "光大银行", "https://www.usdrate.top/CEBBANK.html"),
     ("SPDB", "浦发银行", "https://www.usdrate.top/SPDB.html"),

@@ -42,6 +42,7 @@ import logging
 import math
 import queue as _queue
 import re
+import statistics
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -82,6 +83,7 @@ _WELCOME_GUIDE = (
     "📋 快捷指令（直接发送以下文字）：\n"
     "  最新新闻   — 拉取最新关键词新闻\n"
     "  最新汇率   — 查看当前 CNY/AUD 汇率\n"
+    "  银行牌价   — 查看十大银行 AUD 现汇买入/卖出价\n"
     "  汇率波动   — 查看近2日汇率走势图\n\n"
     "⚙️ 斜杠命令：\n"
     "  /start — 显示此说明\n"
@@ -130,9 +132,9 @@ _PRIVACY_TEXT = (
 
 _UPDATE_PROFILE_USAGE = (
     "格式示例：\n"
-    "/update_profile 目标汇率=4.85 提醒阈值=0.3 用途=学费 风格=简短 主题=RBA,oil,CNY 提醒偏好=重大新闻\n\n"
+    "/update_profile 目标汇率=4.85 提醒阈值=0.3 用途=学费 风格=简短 主题=RBA,oil,CNY 偏好银行=中国银行,建设银行,工商银行 提醒偏好=重大新闻\n\n"
     "等号两边可以有空格；提醒阈值=0.3 表示 0.3%。\n"
-    "可用字段：目标汇率、提醒阈值、用途、语言、风格、主题、提醒偏好、隐私级别。\n"
+    "可用字段：目标汇率、提醒阈值、用途、语言、风格、主题、偏好银行、提醒偏好、隐私级别。\n"
     "用途建议：学费、生活、投资、一般。风格可选：简短、普通、详细。"
 )
 
@@ -212,6 +214,114 @@ def _load_cnyaud(module_name: str):
     mod = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
     spec.loader.exec_module(mod)  # type: ignore[union-attr]
     return mod
+
+
+def _preferred_bank_names_for_user(telegram_user_id: int | None) -> list[str]:
+    from ..core.personalization import get_user_profile
+    from ..core.personalization.user_profile_store import DEFAULT_PREFERRED_BANKS
+
+    if telegram_user_id is None:
+        return list(DEFAULT_PREFERRED_BANKS)
+    try:
+        profile = get_user_profile(telegram_user_id)
+    except Exception:
+        logger.exception("[Telegram] Failed to load preferred banks for user_id=%s", telegram_user_id)
+        return list(DEFAULT_PREFERRED_BANKS)
+    explicit = profile.get("explicit_preferences") or {}
+    banks = explicit.get("preferred_banks") or []
+    return banks or list(DEFAULT_PREFERRED_BANKS)
+
+
+def _format_bank_rate_table(
+    data: dict[str, Any],
+    expected_sources: list[tuple[str, str, str]] | None = None,
+    *,
+    preferred_banks: list[str] | None = None,
+    show_all: bool = False,
+) -> str:
+    """Render AUD bank quotes for Telegram without using an LLM."""
+    quotes = list((data.get("bank_exchange_rates") or {}).get("quotes") or [])
+    if not quotes:
+        error = data.get("error") or "未获取到银行牌价。"
+        return f"⚠️ 银行牌价获取失败：{error}"
+
+    if preferred_banks and not show_all:
+        wanted = set(preferred_banks)
+        quotes = [q for q in quotes if q.get("bank") in wanted]
+        if not quotes:
+            return f"⚠️ 未获取到关注银行牌价：{'、'.join(preferred_banks)}"
+
+    quotes.sort(key=lambda q: (q.get("spot_sell_rate") is None, q.get("spot_sell_rate") or 999))
+    expected_names = (
+        [name for _, name, _ in (expected_sources or [])]
+        if show_all or not preferred_banks
+        else preferred_banks
+    )
+    fetched_names = {q.get("bank") for q in quotes}
+    missing = [name for name in expected_names if name not in fetched_names]
+
+    summary = (data.get("bank_exchange_rates") or {}).get("summary") or {}
+    ref = data.get("student_exchange_reference") or summary.get("best_for_buying_aud_with_cny") or {}
+    if quotes:
+        ref_quote = min(quotes, key=lambda q: q.get("spot_sell_rate") or 999)
+        ref = {
+            "bank": ref_quote.get("bank"),
+            "rate_1_aud_in_cny": ref_quote.get("spot_sell_rate"),
+        }
+        high_quote = max(quotes, key=lambda q: q.get("spot_sell_rate") or -1)
+    else:
+        high_quote = None
+
+    lines = [
+        "🏦 AUD 十大银行牌价（绕过 LLM）" if show_all else "🏦 AUD 关注银行牌价（绕过 LLM）",
+        f"时间: {data.get('fetched_at_utc', 'N/A')} UTC",
+        "",
+        "口径：1 AUD = X CNY",
+        "买 AUD 看现汇卖出价；卖 AUD 看现汇买入价。",
+    ]
+    if ref:
+        lines.append(
+            f"当前买 AUD 最低参考: {ref.get('bank', 'N/A')} {ref.get('rate_1_aud_in_cny', 'N/A')}"
+        )
+    if high_quote and high_quote.get("spot_sell_rate"):
+        lines.append(
+            f"当前买 AUD 最高参考: {high_quote.get('bank', 'N/A')} {high_quote.get('spot_sell_rate')}"
+        )
+    if data.get("market_1_AUD_in_CNY"):
+        lines.append(f"市场中间价参考: {data['market_1_AUD_in_CNY']:.4f}（非实际银行成交价）")
+    lines.extend([
+        "",
+        "银行       买入价   卖出价   更新时间",
+        "----------------------------------------",
+    ])
+    for q in quotes:
+        bank = str(q.get("bank", "N/A"))[:5]
+        buy = q.get("spot_buy_rate")
+        sell = q.get("spot_sell_rate")
+        published = str(q.get("published_at") or "").replace("2026-", "")
+        lines.append(
+            f"{bank:<5}  "
+            f"{buy:.4f}" if isinstance(buy, (int, float)) else f"{bank:<5}  {'N/A':>6}"
+        )
+        lines[-1] += (
+            f"  {sell:.4f}" if isinstance(sell, (int, float)) else f"  {'N/A':>6}"
+        )
+        if published:
+            lines[-1] += f"  {published}"
+
+    if summary.get("median_spot_sell_rate"):
+        sell_values = [q.get("spot_sell_rate") for q in quotes if isinstance(q.get("spot_sell_rate"), (int, float))]
+        lines.extend([
+            "",
+            f"卖出价中位数: {statistics.median(sell_values):.4f}" if sell_values else f"卖出价中位数: {summary['median_spot_sell_rate']:.4f}",
+            f"卖出价区间: {min(sell_values):.4f} - {max(sell_values):.4f}" if sell_values else f"卖出价区间: {summary.get('lowest_spot_sell_rate', 'N/A')} - {summary.get('highest_spot_sell_rate', 'N/A')}",
+        ])
+    if summary.get("median_bank_spread_pct") is not None:
+        lines.append(f"买卖价差中位: {summary['median_bank_spread_pct']:.3f}%")
+    if missing:
+        lines.append(f"未获取: {'、'.join(missing)}")
+    lines.append("实际成交价以银行 App/柜台为准。")
+    return "\n".join(lines)
 
 
 def _display_value(value: Any) -> str:
@@ -318,6 +428,7 @@ def _format_user_profile(profile: dict[str, Any], *, created: bool = False) -> s
             explicit.get("preferred_summary_style"),
         ),
         ("首选主题", _display_topics(explicit.get("preferred_topics")), explicit.get("preferred_topics")),
+        ("偏好银行", _display_topics(explicit.get("preferred_banks")), explicit.get("preferred_banks")),
         ("首选提醒时间", _display_value(explicit.get("preferred_reminder_time")), explicit.get("preferred_reminder_time")),
         ("可操作性阈值", _display_value(explicit.get("actionability_threshold")), explicit.get("actionability_threshold")),
         ("隐私级别", _display_profile_value("privacy_level", explicit.get("privacy_level")), explicit.get("privacy_level")),
@@ -379,6 +490,12 @@ _PROFILE_FIELD_ALIASES = {
     "preferred_topics": "preferred_topics",
     "主题": "preferred_topics",
     "关注主题": "preferred_topics",
+    "banks": "preferred_banks",
+    "bank": "preferred_banks",
+    "preferred_banks": "preferred_banks",
+    "银行": "preferred_banks",
+    "偏好银行": "preferred_banks",
+    "关注银行": "preferred_banks",
     "privacy_level": "privacy_level",
     "隐私级别": "privacy_level",
     "隐私": "privacy_level",
@@ -445,6 +562,7 @@ _UPDATE_PROFILE_LABELS = {
     "language": "语言",
     "preferred_summary_style": "摘要风格",
     "preferred_topics": "关注主题",
+    "preferred_banks": "偏好银行",
     "privacy_level": "隐私级别",
     "alert_preference": "提醒偏好",
 }
@@ -487,6 +605,7 @@ _UPDATE_PROFILE_ERROR_MESSAGES = {
     "purpose": "用途建议使用：学费、生活、投资、一般。",
     "style": "风格可选：简短、普通、详细。",
     "topics": "主题不能为空，可用逗号、中文逗号或顿号分隔，例如：RBA，oil，CNY。",
+    "preferred_banks": "偏好银行可选：中国银行、工商银行、建设银行、农业银行、交通银行、招商银行、中信银行、兴业银行、光大银行、浦发银行。",
     "privacy_level": "隐私级别可选：最少、标准、严格。",
     "alert_preference": "提醒偏好可选：目标汇率、波动率、重大新闻、晨报。",
 }
@@ -499,6 +618,7 @@ _UPDATE_PROFILE_WIZARD_STEPS = [
     ("purpose", "请输入用途：学费、生活、投资、一般"),
     ("preferred_summary_style", "请输入摘要风格：简短、普通、详细"),
     ("preferred_topics", "请输入关注主题，可用逗号或顿号分隔，例如：RBA，oil，CNY"),
+    ("preferred_banks", "请输入偏好银行，可用逗号或顿号分隔，例如：中国银行，建设银行，工商银行"),
     ("language", "请输入语言，例如：zh-CN 或 中文"),
     ("privacy_level", "请输入隐私级别：最少、标准、严格"),
 ]
@@ -569,6 +689,15 @@ def _parse_update_profile_value(field: str, value: str) -> Any:
         parsed = [item.strip() for item in normalized.split(",") if item.strip()]
         if not parsed:
             raise ValueError("topics")
+        return parsed
+    if field == "preferred_banks":
+        from ..core.personalization.user_profile_store import normalize_preferred_banks
+        try:
+            parsed = normalize_preferred_banks(value)
+        except ValueError:
+            raise ValueError("preferred_banks") from None
+        if not parsed:
+            raise ValueError("preferred_banks")
         return parsed
     if field == "privacy_level":
         parsed = _PRIVACY_ALIASES.get(value.lower(), _PRIVACY_ALIASES.get(value))
@@ -1197,6 +1326,11 @@ class TelegramBot:
         if command in {"/隐私", "/隐私说明"}:
             await self._cmd_privacy(update, context)
             return True
+        if command in {"/银行牌价", "/银行汇率", "/银行报价", "/十大银行"}:
+            if not await self._check_access(update, context):
+                return True
+            await self._shortcut_bank_rates(update, show_all=command == "/十大银行")
+            return True
         if command in {"/修改资料", "/更新资料", "/更新偏好"}:
             if not await self._check_access(update, context):
                 return True
@@ -1280,10 +1414,46 @@ class TelegramBot:
         try:
             fr = _load_cnyaud("fetch_rate")
             data = fr.fetch_rate()
-            text = fr._format_text(data)
+            preferred = _preferred_bank_names_for_user(
+                update.effective_user.id if update.effective_user else None
+            )
+            text = _format_bank_rate_table(
+                data,
+                getattr(fr, "BANK_SOURCES", None),
+                preferred_banks=preferred,
+            )
         except Exception as exc:
             logger.exception("[Telegram] 最新汇率 fetch failed")
             text = f"⚠️ 获取汇率失败: {exc}"
+        for chunk in _split_message(text):
+            await update.message.reply_text(chunk)
+
+    async def _cmd_bank_rates(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self._check_access(update, context):
+            return
+        args = {str(arg).lower() for arg in (context.args or [])}
+        show_all = bool(args & {"all", "全部", "十大银行", "10"})
+        await self._shortcut_bank_rates(update, show_all=show_all)
+
+    async def _shortcut_bank_rates(self, update: Update, *, show_all: bool = False) -> None:
+        """Fetch AUD quotes from the ten-bank board directly, bypassing LLM."""
+        notice = "十大银行" if show_all else "关注银行"
+        await update.message.reply_text(f"🏦 正在拉取{notice} AUD 牌价，请稍候…")
+        try:
+            fr = _load_cnyaud("fetch_rate")
+            data = fr.fetch_rate("7d")
+            preferred = _preferred_bank_names_for_user(
+                update.effective_user.id if update.effective_user else None
+            )
+            text = _format_bank_rate_table(
+                data,
+                getattr(fr, "BANK_SOURCES", None),
+                preferred_banks=preferred,
+                show_all=show_all,
+            )
+        except Exception as exc:
+            logger.exception("[Telegram] 银行牌价 fetch failed")
+            text = f"⚠️ 获取银行牌价失败: {exc}"
         for chunk in _split_message(text):
             await update.message.reply_text(chunk)
 
@@ -1345,6 +1515,12 @@ class TelegramBot:
             return
         if _cmd == "最新汇率":
             await self._shortcut_latest_rate(update)
+            return
+        if _cmd in {"银行牌价", "银行汇率", "银行报价"}:
+            await self._shortcut_bank_rates(update)
+            return
+        if _cmd in {"十大银行", "10大银行"}:
+            await self._shortcut_bank_rates(update, show_all=True)
             return
         if _cmd == "汇率波动":
             await self._shortcut_rate_chart(update)
@@ -1608,6 +1784,7 @@ class TelegramBot:
         BotCommand("feedback", "记录提醒反馈"),
         BotCommand("privacy", "查看隐私说明"),
         BotCommand("delete_profile", "删除我的个性化数据"),
+        BotCommand("bank_rates", "查看十大银行 AUD 牌价"),
         BotCommand("clear_files", "清空下载文件"),
     ]
 
@@ -1622,6 +1799,7 @@ class TelegramBot:
         app.add_handler(CommandHandler("feedback", self._cmd_feedback))
         app.add_handler(CommandHandler("privacy", self._cmd_privacy))
         app.add_handler(CommandHandler("delete_profile", self._cmd_delete_profile))
+        app.add_handler(CommandHandler("bank_rates", self._cmd_bank_rates))
         app.add_handler(CommandHandler("clear_files", self._cmd_clear_files))
         app.add_handler(MessageHandler(
             (filters.TEXT | filters.PHOTO | filters.VOICE | filters.AUDIO)
