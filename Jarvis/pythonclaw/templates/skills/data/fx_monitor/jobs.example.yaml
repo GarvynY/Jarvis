@@ -38,7 +38,7 @@ jobs:
       你是一位专业的外汇分析师。请完成以下任务，所有回复使用中文。
 
       ## 第一步：获取汇率数据
-      使用 cnyaud_monitor_data(action="fetch_rate", period="90d") 获取 JSON。
+      使用 fx_monitor_data(action="fetch_rate", period="90d") 获取 JSON。
       优先使用 student_exchange_reference 中的银行现汇卖出价作为留学生换汇参考价。
       每日早报必须展示 10 大银行 AUD 牌价，标明现汇卖出价最低和最高的银行。
       同时记录银行现汇买入/卖出价区间、市场中间参考价、90天趋势、波动率、线性回归方向。
@@ -91,7 +91,7 @@ jobs:
     deliver_to: telegram
     chat_id: YOUR_TELEGRAM_CHAT_ID
     prompt: |
-      使用 cnyaud_monitor 技能，运行:
+      使用 fx_monitor 技能，运行:
         python {skill_path}/fetch_rate.py --period 7d --format json
 
       用中文简报今日 CNY/AUD 收盘情况:
@@ -112,7 +112,7 @@ jobs:
     deliver_to: telegram
     chat_id: YOUR_TELEGRAM_CHAT_ID
     prompt: |
-      使用 cnyaud_monitor 技能，运行阈值检测:
+      使用 fx_monitor 技能，运行阈值检测:
         python {skill_path}/monitor_alert.py --threshold 0.3 --format json
 
       解读 JSON 输出:
@@ -137,7 +137,7 @@ jobs:
     deliver_to: telegram
     chat_id: YOUR_TELEGRAM_CHAT_ID
     prompt: |
-      使用 cnyaud_monitor 技能获取本周数据:
+      使用 fx_monitor 技能获取本周数据:
         python {skill_path}/fetch_rate.py --period 30d --format json
 
       同时使用 web_search 搜索本周重要事件:

@@ -266,13 +266,13 @@ def run_command(command: str) -> str:
         return f"Execution error: {exc}"
 
 
-def cnyaud_monitor_data(
+def fx_monitor_data(
     action: str,
     period: str = "90d",
     threshold: float = 0.3,
     no_mark_seen: bool = False,
 ) -> str:
-    """Run approved CNY/AUD monitor helpers without exposing a shell."""
+    """Run approved fx_monitor helpers without exposing a shell."""
     scripts = {
         "fetch_rate": "fetch_rate.py",
         "news_monitor": "news_monitor.py",
@@ -284,7 +284,7 @@ def cnyaud_monitor_data(
 
     skill_dir = os.path.join(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-        "templates", "skills", "data", "cnyaud_monitor",
+        "templates", "skills", "data", "fx_monitor",
     )
     script = os.path.join(skill_dir, script_name)
     if not os.path.isfile(script):
@@ -421,7 +421,7 @@ def send_file(path: str, caption: str = "") -> str:
 
 AVAILABLE_TOOLS: dict[str, callable] = {
     "run_command": run_command,
-    "cnyaud_monitor_data": cnyaud_monitor_data,
+    "fx_monitor_data": fx_monitor_data,
     "read_file": read_file,
     "write_file": write_file,
     "list_files": list_files,
@@ -453,9 +453,9 @@ def _fn(name: str, description: str, properties: dict, required: list[str]) -> d
 
 PRIMITIVE_TOOLS: list[dict] = [
     _fn(
-        "cnyaud_monitor_data",
+        "fx_monitor_data",
         (
-            "Approved CNY/AUD monitor helper. Use this instead of shell commands "
+            "Approved fx_monitor helper. Use this instead of shell commands "
             "to fetch exchange-rate JSON, check RSS news, or run threshold checks."
         ),
         {

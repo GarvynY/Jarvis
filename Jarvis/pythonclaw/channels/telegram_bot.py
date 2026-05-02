@@ -66,7 +66,7 @@ logger = logging.getLogger(__name__)
 # ── Skill directory & file paths ──────────────────────────────────────────────
 
 _SKILL_DIR = (
-    Path(__file__).parent.parent / "templates" / "skills" / "data" / "cnyaud_monitor"
+    Path(__file__).parent.parent / "templates" / "skills" / "data" / "fx_monitor"
 )
 _GREETED_FILE = config.PYTHONCLAW_HOME / "context" / "greeted_users.json"
 _NEWS_CACHE_FILE = config.PYTHONCLAW_HOME / "context" / "news_recent_cache.json"
@@ -207,7 +207,7 @@ def _get_recent_news_text(n: int = 5) -> str:
 
 
 def _load_cnyaud(module_name: str):
-    """Dynamically load a cnyaud_monitor skill module by filename (no .py)."""
+    """Dynamically load an fx_monitor skill module by filename (no .py)."""
     spec = importlib.util.spec_from_file_location(
         f"_cnyaud_{module_name}",
         _SKILL_DIR / f"{module_name}.py",

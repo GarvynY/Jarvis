@@ -1,5 +1,5 @@
 ---
-name: cnyaud_monitor
+name: fx_monitor
 description: >
   Monitor CNY/AUD (人民币/澳元) exchange rate with Chinese bank spot buy/sell
   quotes for student exchange decisions, market fallback data, 90-day history,

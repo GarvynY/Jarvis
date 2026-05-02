@@ -35,7 +35,7 @@ log = logging.getLogger(__name__)
 # ── config ──────────────────────────────────────────────────────────────────
 
 CONFIG_PATH  = Path.home() / ".pythonclaw" / "pythonclaw.json"
-SKILL_DIR    = Path.home() / ".pythonclaw" / "context" / "skills" / "cnyaud_monitor"
+SKILL_DIR    = Path.home() / ".pythonclaw" / "context" / "skills" / "fx_monitor"
 STATE_PATH   = Path.home() / ".pythonclaw" / "context" / "daemon_state.json"
 
 RATE_INTERVAL_SEC      = 30 * 60   # how often to fetch rate
