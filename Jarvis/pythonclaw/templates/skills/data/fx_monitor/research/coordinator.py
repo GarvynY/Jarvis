@@ -66,18 +66,6 @@ AGENT_REGISTRY: dict[str, type] = {
     # "sentiment_agent": SentimentAgent,   ← future
 }
 
-# ── Per-preset task defaults ──────────────────────────────────────────────────
-# Keeps CNY/AUD out of the main control flow.
-# Any preset that needs default focus_assets / focus_pair adds an entry here.
-
-_PRESET_TASK_DEFAULTS: dict[str, dict[str, Any]] = {
-    "fx_cnyaud": {
-        "research_topic": "CNY/AUD 外汇研究",
-        "focus_assets":   ["CNY", "AUD"],
-        "focus_pair":     "CNY/AUD",
-    },
-}
-
 # ── Haiku pricing (approximate, USD per token) ────────────────────────────────
 # claude-haiku-4-5-20251001: $0.25 / 1M input, $1.25 / 1M output
 _HAIKU_INPUT_PER_TOKEN  = 0.25  / 1_000_000
@@ -180,17 +168,22 @@ async def run_research(
     safe_ctx = SafeUserContext.from_dict(raw_ctx)
 
     # ── 3. Build ResearchTask ─────────────────────────────────────────────────
-    defaults = _PRESET_TASK_DEFAULTS.get(preset_name, {})
+    task_overrides: dict[str, Any] = {}
+    if research_topic is not None:
+        task_overrides["research_topic"] = research_topic
+    if focus_assets is not None:
+        task_overrides["focus_assets"] = list(focus_assets)
+    if focus_pair is not None:
+        task_overrides["focus_pair"] = focus_pair
+    if custom_subtopics is not None:
+        task_overrides["custom_subtopics"] = list(custom_subtopics)
+    if time_horizon is not None:
+        task_overrides["time_horizon"] = time_horizon
 
-    task = ResearchTask(
-        preset_name      = preset.name,
-        research_type    = preset.research_type,
-        safe_user_context= safe_ctx,
-        research_topic   = research_topic   or defaults.get("research_topic", preset.description),
-        focus_assets     = focus_assets     or list(defaults.get("focus_assets", [])),
-        focus_pair       = focus_pair       or defaults.get("focus_pair"),
-        custom_subtopics = list(custom_subtopics or []),
-        time_horizon     = time_horizon     or preset.default_time_horizon,
+    task = ResearchTask.from_preset(
+        preset,
+        safe_user_context=safe_ctx,
+        **task_overrides,
     )
 
     # ── 4. Instantiate phase-1 agents from registry ───────────────────────────

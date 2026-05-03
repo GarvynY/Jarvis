@@ -542,7 +542,7 @@ class MacroAgent:
             )
         finally:
             if "executor" in locals():
-                executor.shutdown(wait=True, cancel_futures=True)
+                executor.shutdown(wait=False, cancel_futures=True)
 
         latency_ms = int((time.monotonic() - t0) * 1000)
         return _build_macro_output(raw, task, latency_ms, self.agent_name)

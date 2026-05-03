@@ -10,10 +10,9 @@ Returns status="partial" for unsupported or missing focus_pair.
 
 Thread model
 ------------
-fetch_rate() is a blocking I/O function. FXAgent uses its own
-ThreadPoolExecutor (NOT asyncio's default executor) so asyncio.run()
-is not blocked waiting for our threads on shutdown. Call
-FXAgent.close_executor() after all run() calls to release the pool.
+fetch_rate() is a blocking I/O function. Each run uses a short-lived
+ThreadPoolExecutor (NOT asyncio's default executor) so repeated tests and
+serverless-style invocations do not share mutable executor state.
 """
 
 from __future__ import annotations
@@ -84,34 +83,21 @@ class FXAgent:
         agent.agent_name       → str
         await agent.run(task)  → AgentOutput
 
-    The class owns a ThreadPoolExecutor for offloading the blocking
+    Each call owns a small ThreadPoolExecutor for offloading the blocking
     fetch_rate() call. This avoids polluting asyncio's default executor
-    and prevents asyncio.run() from hanging on shutdown_default_executor().
+    and keeps invocations independent.
 
     Usage:
         agent = FXAgent()
         output = await agent.run(task)
-        FXAgent.close_executor()   # call once when done, e.g. in test finally
     """
 
     agent_name: str = "fx_agent"
 
-    # Class-level executor — shared across all instances, controlled lifecycle
-    _executor: concurrent.futures.ThreadPoolExecutor = (
-        concurrent.futures.ThreadPoolExecutor(
-            max_workers=2,
-            thread_name_prefix="fx-agent",
-        )
-    )
-
     @classmethod
     def close_executor(cls) -> None:
-        """Shut down the thread pool.
-
-        Safe to call multiple times. Call in test finally blocks or on
-        application shutdown to prevent process-exit hangs.
-        """
-        cls._executor.shutdown(wait=False, cancel_futures=True)
+        """Backward-compatible no-op; executors are per-run."""
+        return None
 
     async def run(self, task: ResearchTask) -> AgentOutput:
         """Fetch live CNY/AUD rate data and return structured findings."""
@@ -145,8 +131,12 @@ class FXAgent:
         # ── Fetch via own executor — non-blocking, no default executor ────────
         try:
             loop = asyncio.get_running_loop()
+            executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="fx-agent",
+            )
             data: dict[str, Any] = await loop.run_in_executor(
-                self._executor, _fetch_rate, "90d"
+                executor, _fetch_rate, "90d"
             )
         except Exception as exc:
             return AgentOutput.make_error(
@@ -154,6 +144,9 @@ class FXAgent:
                 error=f"fetch_rate failed: {exc}",
                 latency_ms=int((time.monotonic() - t0) * 1000),
             )
+        finally:
+            if "executor" in locals():
+                executor.shutdown(wait=False, cancel_futures=True)
 
         latency_ms = int((time.monotonic() - t0) * 1000)
         return _build_output(data, task, latency_ms, self.agent_name)

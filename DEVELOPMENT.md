@@ -674,3 +674,253 @@ Stop-Process -Name python -Force
 - Telegram bot token 可能出现在 HTTP 客户端 debug 日志中，建议生产环境提高 `httpx` 日志级别
 - 建议部署完成后修改服务器密码：`passwd root`
 - 建议配置 SSH Key 登录并禁用密码认证：在 `/etc/ssh/sshd_config` 设置 `PasswordAuthentication no`
+
+---
+
+## 十、第九阶段：并行研究工作流（金融研究 MVP）
+
+### 10.1 目标与架构原则
+
+第九阶段将 Jarvis 从单一用途的外汇监控代理，升级为具备**无服务器启发式并行研究工作流**的金融研究 MVP。
+
+**核心架构原则**：
+
+- 每个专家代理是**无状态的研究函数**——接收 `ResearchTask`，返回 `AgentOutput`，互不通信
+- 代理之间不直接交换数据；一个**研究协调员**独立运行它们
+- 一个**监督报告撰写人**将所有代理输出合并为结构化中文研究简报
+- 所有 I/O 均为 JSON 可序列化——为日后迁移至基于队列的工作者或无服务器运行时预留接口
+- 用户个性化信息**只通过 `build_safe_user_context()`** 传入，代理不读取原始用户资料或日志
+- 当前版本本地异步运行，代码设计可迁移至 Kubernetes / KEDA / Fission，**不引入 Redis、Celery、Kubernetes**
+
+### 10.2 新增文件结构
+
+```
+Jarvis/pythonclaw/templates/skills/data/fx_monitor/
+└── research/
+    ├── __init__.py
+    ├── schema.py          # 数据模式层（ResearchTask / AgentOutput / ResearchBrief 等）
+    ├── runner.py          # LocalAsyncRunner：并发运行 Phase-1 代理
+    ├── coordinator.py     # 研究协调员：preset 解析 → 用户上下文 → 调度代理
+    ├── supervisor.py      # 监督报告撰写人：单次 LLM 调用 → ResearchBrief
+    └── agents/
+        ├── __init__.py
+        ├── fx_agent.py    # FXAgent：CNY/AUD 实时汇率与历史分析（无 LLM）
+        ├── news_agent.py  # NewsAgent：新闻缓存 + 单次 LLM 方向分类
+        ├── macro_agent.py # MacroAgent：搜索宏观信号 + 单次 LLM 分析
+        └── risk_agent.py  # RiskAgent：读取 Phase-1 输出，合成矛盾与风险（无 LLM）
+```
+
+所有代码在 **业务技能层**（fx_monitor/research/），不修改 PythonClaw 核心。
+
+### 10.3 数据模式设计（schema.py）
+
+**设计原则**：
+
+- 所有时间戳使用 ISO 8601 字符串（`now_iso()`），禁止传递 `datetime` 对象
+- 全部 dataclass 均可通过 `to_dict()` / `from_dict()` 实现 JSON 序列化
+- 运行时 JSON 安全守卫（`_assert_json_safe`）在序列化时提前捕获非法类型
+- `AGENT_REGISTRY` 不在此层定义，由 `coordinator.py` 管理
+
+**主要数据类**：
+
+| 数据类 | 职责 |
+|--------|------|
+| `SafeUserContext` | 白名单用户上下文（目标汇率、用途、风险偏好等），代理只接收此对象 |
+| `ResearchPreset` | 研究类型定义（代理列表、报告章节、禁用词、时间范围等） |
+| `ResearchTask` | 单次研究任务（由 coordinator 构建，不可变，传给所有代理） |
+| `SourceRef` | 数据来源引用（标题、URL、来源标识、检索时间） |
+| `Finding` | 单条原子研究发现（key、摘要、方向、reserved 分数字段） |
+| `AgentOutput` | 代理唯一返回值（包含 findings、sources、risks、missing_data、token_usage 等） |
+| `ResearchSection` | 简报中的一个章节（标题、内容、来源代理列表、数据缺口标记） |
+| `ResearchBrief` | 完整研究简报（结论、章节列表、用户备注、数据缺口、来源汇总、免责声明、成本估算） |
+| `CostEstimate` | LLM 调用次数、tokens、费用、总延迟 |
+
+**CNY/AUD MVP Preset（`FX_CNYAUD_PRESET`）**：
+
+```python
+FX_CNYAUD_PRESET = ResearchPreset(
+    name="fx_cnyaud",
+    research_type="fx",
+    default_agents=["fx_agent", "news_agent", "macro_agent"],
+    report_sections=["汇率事实", "新闻驱动", "宏观信号", "风险与矛盾"],
+    banned_terms=["建议买入", "建议卖出", "换汇时机", "立即操作", ...],
+    required_agents=["fx_agent"],
+    optional_agents=["news_agent", "macro_agent"],
+    data_sources=["fetch_rate.py", "google_news_rss", "yfinance"],
+    task_defaults={"research_topic": "CNY/AUD 外汇研究", "focus_pair": "CNY/AUD"},
+)
+```
+
+`PRESET_REGISTRY` 通过名称索引，未来新增 preset 只需在此追加，无需改动核心逻辑。
+
+### 10.4 本地异步运行器（runner.py）
+
+`LocalAsyncRunner` 并发运行所有 Phase-1 代理：
+
+- **独立 `ThreadPoolExecutor`**（非 asyncio 默认执行器），避免 `asyncio.run()` 退出时等待线程池
+- 同步代理自动包装进 `loop.run_in_executor()`，异步代理直接 await
+- 超时（默认 30 秒）、异常、类型错误均被隔离，任意一个代理失败不影响其他代理
+- 返回顺序与输入代理顺序一致
+- 含 `agent_name` 修正（防止代理误报名称污染状态图）和 JSON 安全检查
+
+**迁移路径注释**（已写入代码注释）：
+
+```
+本地：LocalAsyncRunner().run_many(task, agents)
+  ↓ 替换 run_many 内部体为任务队列调度
+队列：_run_one 成为 worker 入口点
+  ↓ 每个代理成为独立函数调用
+无服务器：coordinator 通过 make_error_output 聚合结果
+```
+
+### 10.5 代理职责
+
+#### FXAgent（`agents/fx_agent.py`）
+
+- **无 LLM 调用**，完全基于 `fetch_rate.py` 工具
+- 分析当前汇率（银行牌价 + 市场中间价）、银行买卖价差、90 日历史趋势、近 5 日区间
+- 若 `safe_user_context.target_rate` 存在则追加目标汇率差距 finding
+- 置信度上限 0.85（银行抓取来源可靠性有限）
+- 只支持 `CNY/AUD`，不支持其他对返回 `partial`
+- 输入的 `focus_pair` 经过字符白名单过滤（防提示注入）
+
+#### NewsAgent（`agents/news_agent.py`）
+
+- 读取 `~/.pythonclaw/context/news_recent_cache.json`（由 `news_monitor` 守护进程填充）
+- **最多一次 LLM 调用**（claude-haiku-4-5）：分类每条新闻对 CNY/AUD 的方向影响
+- LLM 不可用时，降级为关键词启发式方向标注
+- 对多空矛盾信号追加风险 finding
+- 置信度上限 0.70
+
+#### MacroAgent（`agents/macro_agent.py`）
+
+- 搜索策略：优先 Tavily API（`TAVILY_API_KEY` 存在时）→ 降级 Google News RSS
+- 固定 MVP 查询集（RBA / PBoC / 美联储 / 澳中贸易，4 条查询）
+- **最多一次 LLM 调用**：分析 RBA 信号、PBoC 信号、美联储信号及整体方向
+- 所有查询使用记录在 `missing_data`，供下游审计
+- 置信度上限 0.75
+
+#### RiskAgent（`agents/risk_agent.py`）
+
+- **无 LLM 调用，无外部请求**，纯 CPU 合成
+- 在 Phase-1 代理完成后由 coordinator **顺序调用**（非并发）
+- 功能：
+  - 跨代理多空矛盾检测（bullish vs bearish finding 计数）
+  - 数据来源缺失检测
+  - 数据过期检测（超 48 小时标记为 stale）
+  - 代理失败/部分数据汇总
+  - 整体置信度警告（平均 < 40% 时）
+  - 主导信号摘要（多/空/中性）
+
+### 10.6 研究协调员（coordinator.py）
+
+```
+run_research(preset_name, user_id, ...)
+  │
+  ├─ 1. 从 PRESET_REGISTRY 解析 preset
+  ├─ 2. 调用 build_safe_user_context(user_id)  ← 全系统唯一调用点
+  ├─ 3. 构建 ResearchTask.from_preset(preset, safe_ctx)
+  ├─ 4. 从 AGENT_REGISTRY 实例化 Phase-1 代理
+  ├─ 5. async with LocalAsyncRunner() → runner.run_many(task, phase1_agents)
+  ├─ 6. RiskAgent.run(task, phase1_outputs)  ← 顺序执行
+  └─ 7. _compute_cost(all_outputs) → CostEstimate
+      返回 (ResearchTask, all_outputs, CostEstimate)
+```
+
+**关键架构约束**：
+
+- `coordinator.py` 是 Phase 9 **唯一**调用 `build_safe_user_context()` 的模块
+- `AGENT_REGISTRY` 定义在此文件（而非 schema），将代理名称字符串映射到可调用类
+- 未知 preset 或未注册代理不会崩溃，返回 `status=error` 的 AgentOutput
+
+### 10.7 监督报告撰写人（supervisor.py）
+
+**单次 LLM 调用**（claude-haiku-4-5），生成 `ResearchBrief`：
+
+- Prompt 仅包含 AgentOutput 中的结构化数据，**绝不注入先验知识或外部信息**
+- LLM 按 preset.report_sections 顺序生成每个章节
+- LLM 输出经 JSON 解析；章节标题模糊匹配 preset 列表，缺失章节用安全占位符填充
+- `user_notes` 由确定性函数 `_build_user_notes(safe_ctx)` 生成（不经 LLM）
+- `sources_summary` 只从 `SourceRef` 对象聚合（不由 LLM 编造）
+- `disclaimer` 硬编码，LLM 不可修改
+- **后处理安全过滤**：对 conclusion、user_notes、每个章节应用 `banned_terms` 替换
+- LLM 失败时自动降级为**确定性简报**（直接拼接各代理 summary，章节共享相同内容）
+- 使用独立短生命周期 `ThreadPoolExecutor`（非 asyncio 默认执行器）运行阻塞 LLM 调用
+
+### 10.8 Telegram 命令集成
+
+新增命令 `/fx_research`（中文别名：`/研究`）：
+
+```
+/fx_research
+  │
+  ├─ 发送"正在生成..."占位消息
+  ├─ run_research("fx_cnyaud", user_id)
+  ├─ SupervisorReportWriter().run(task, preset, outputs, cost)
+  ├─ _format_research_brief(brief, latency_s)
+  └─ 删除占位消息，发送格式化简报（如超 4096 字符分段发送）
+```
+
+简报格式包含：
+1. 研究主题 + 生成时间
+2. 总结论
+3. 各章节内容（含数据缺口标注）
+4. 用户专属备注（基于 safe_user_context，非 LLM 生成）
+5. 数据缺口汇总
+6. 来源引用
+7. 代理状态摘要（含延迟 ms）
+8. 成本摘要（LLM 调用次数 / token 数 / 估算费用）
+9. 固定免责声明
+
+### 10.9 成本影响
+
+| 命令 | LLM 调用次数 | 说明 |
+|------|------------|------|
+| `/fx_research` | 最多 3 次 | NewsAgent(1) + MacroAgent(1) + Supervisor(1)；FXAgent 和 RiskAgent 不调用 LLM |
+| FXAgent 失败时 | 最多 2 次 | |
+| 全部 LLM 不可用时 | 0 次 | 确定性降级，仍生成简报 |
+
+使用 claude-haiku-4-5 单次研究估算约 $0.001-0.003 USD。
+
+### 10.10 关键设计决策与架构约束汇总
+
+| 约束 | 实现 |
+|------|------|
+| 代理无状态 | 每次 `run()` 返回全新 AgentOutput，不持有跨请求状态 |
+| 只通过 SafeUserContext 访问用户数据 | coordinator 是唯一调用 `build_safe_user_context()` 的点 |
+| 代理不互相通信 | runner 并发运行，Phase-1 输出仅传给 RiskAgent 和 Supervisor |
+| JSON 可序列化 | `to_dict()` / `from_dict()` + 运行时守卫 |
+| LLM 上限每代理 1 次 | Supervisor 也只 1 次，共最多 3 次 |
+| 免责声明不可被 LLM 修改 | `_DISCLAIMER` 硬编码，`from_dict()` 忽略输入中的 disclaimer 字段 |
+| 禁用词过滤 | Preset 定义，Supervisor 生成后再次扫描 |
+| 任何代理失败不中断整体流程 | runner 捕获所有异常，返回 `status=error` AgentOutput |
+| 数据可追溯性 | 所有来源必须有 `SourceRef`，LLM 引用的代理名称需在输出集中存在 |
+
+### 10.11 测试文件
+
+每个模块均有对应测试：
+
+| 测试文件 | 覆盖内容 |
+|----------|---------|
+| `test_schema.py` | 所有 dataclass 的 JSON 序列化、validation、to_dict/from_dict |
+| `test_runner.py` | 并发运行、超时、异常隔离、sync 代理、agent_name 修正、JSON 安全检查 |
+| `test_coordinator.py` | 完整工作流、未知 preset、未注册代理、safe_user_context 注入 |
+| `test_supervisor.py` | LLM 路径、降级路径、banned_terms 过滤、sources_summary 构建 |
+| `agents/test_fx_agent.py` | fetch_rate mock、各字段提取、confidence 计算、unsupported pair |
+| `agents/test_news_agent.py` | 缓存读取 mock、LLM mock、启发式降级、banned_terms 过滤 |
+| `agents/test_macro_agent.py` | Tavily/RSS mock、LLM mock、全部搜索失败场景 |
+| `agents/test_risk_agent.py` | 矛盾检测、数据缺口、低置信度、过期数据检测 |
+
+### 10.12 长期迁移路径（已通过代码注释预埋）
+
+```
+Phase 9（当前）      Phase 10+（未来）
+─────────────       ───────────────────────────────
+LocalAsyncRunner  → 任务队列（Celery / SQS / KEDA）
+单进程协调          → 无服务器函数调度
+run_research()     → 异步队列消息发布
+AgentOutput        → 标准 JSON worker 返回体（to_dict() 即消息体）
+make_error_output  → 远程 worker 异常统一序列化
+```
+
+所有代理函数均无状态、输入/输出均 JSON 可序列化、无共享全局写入——满足迁移至容器或无服务器运行时的核心前提条件。

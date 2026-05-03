@@ -165,6 +165,10 @@ class ResearchPreset:
     data_sources: list[str] = field(default_factory=list)
     # e.g. ["fetch_rate.py", "google_news_rss", "yfinance"]
 
+    # ── Default task parameters for this preset ───────────────────────────────
+    task_defaults: dict[str, Any] = field(default_factory=dict)
+    # e.g. {"research_topic": "...", "focus_assets": [...], "focus_pair": "..."}
+
     def to_dict(self) -> dict[str, Any]:
         return to_dict(self)
 
@@ -183,6 +187,7 @@ class ResearchPreset:
             required_agents=list(d.get("required_agents") or []),
             optional_agents=list(d.get("optional_agents") or []),
             data_sources=list(d.get("data_sources") or []),
+            task_defaults=dict(d.get("task_defaults") or {}),
         )
 
 
@@ -205,6 +210,11 @@ FX_CNYAUD_PRESET = ResearchPreset(
     required_agents=["fx_agent"],
     optional_agents=["news_agent", "macro_agent"],
     data_sources=["fetch_rate.py", "google_news_rss", "yfinance"],
+    task_defaults={
+        "research_topic": "CNY/AUD 外汇研究",
+        "focus_assets": ["CNY", "AUD"],
+        "focus_pair": "CNY/AUD",
+    },
 )
 
 # Coordinator resolves preset by name.
@@ -263,14 +273,19 @@ class ResearchTask:
         **overrides: Any,
     ) -> "ResearchTask":
         """Build a task directly from a preset. Coordinator uses this."""
-        return cls(
-            preset_name=preset.name,
-            research_type=preset.research_type,
-            research_topic=preset.description,
-            time_horizon=preset.default_time_horizon,
-            safe_user_context=safe_user_context or SafeUserContext(),
-            **overrides,
-        )
+        defaults = dict(preset.task_defaults or {})
+        task_kwargs: dict[str, Any] = {
+            "preset_name": preset.name,
+            "research_type": preset.research_type,
+            "research_topic": defaults.get("research_topic", preset.description),
+            "focus_assets": list(defaults.get("focus_assets") or []),
+            "focus_pair": defaults.get("focus_pair"),
+            "custom_subtopics": list(defaults.get("custom_subtopics") or []),
+            "time_horizon": defaults.get("time_horizon", preset.default_time_horizon),
+            "safe_user_context": safe_user_context or SafeUserContext(),
+        }
+        task_kwargs.update(overrides)
+        return cls(**task_kwargs)
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "ResearchTask":

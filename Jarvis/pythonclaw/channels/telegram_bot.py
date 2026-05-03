@@ -68,6 +68,7 @@ logger = logging.getLogger(__name__)
 _SKILL_DIR = (
     Path(__file__).parent.parent / "templates" / "skills" / "data" / "fx_monitor"
 )
+_RESEARCH_DIR = _SKILL_DIR / "research"
 _GREETED_FILE = config.PYTHONCLAW_HOME / "context" / "greeted_users.json"
 _NEWS_CACHE_FILE = config.PYTHONCLAW_HOME / "context" / "news_recent_cache.json"
 
@@ -95,7 +96,8 @@ _WELCOME_GUIDE = (
     "  /feedback useful — 记录反馈；中文：/反馈 有用\n"
     "  /clear_inferred — 清空推断偏好；中文：/清空推断\n"
     "  /delete_profile — 删除个性化数据；中文：/删除资料\n"
-    "  /privacy — 查看隐私说明；中文：/隐私\n\n"
+    "  /privacy — 查看隐私说明；中文：/隐私\n"
+    "  /fx_research — 生成 CNY/AUD 研究简报（多代理 AI 分析）\n\n"
     "📝 常用中文示例：\n"
     "  /我的资料\n"
     "  /修改资料\n"
@@ -785,6 +787,80 @@ def _format_feedback_confirmation(event_type: str, topic: str | None) -> str:
     if topic:
         return f"已记录反馈：{label}（主题：{topic}）。谢谢。"
     return f"已记录反馈：{label}。谢谢。"
+
+
+# ── Phase 9 research helpers ──────────────────────────────────────────────────
+
+def _ensure_research_path() -> None:
+    """Add the Phase 9 research directory to sys.path (idempotent)."""
+    import sys as _sys
+    p = str(_RESEARCH_DIR)
+    if p not in _sys.path:
+        _sys.path.insert(0, p)
+
+
+_SECTION_EMOJIS: dict[str, str] = {
+    "汇率事实": "📈",
+    "新闻驱动": "📰",
+    "宏观信号": "🌐",
+    "风险与矛盾": "⚠️",
+}
+
+
+def _format_research_brief(brief: Any, latency_s: float) -> str:
+    """
+    Render a ResearchBrief as a plain-text Telegram message.
+
+    Layout (per spec):
+      📊 CNY/AUD 研究简报
+      🔍 结论摘要 …
+      [sections in preset order]
+      📋 数据缺失 (if any)
+      👤 个性化备注 (if any)
+      📎 数据来源 (if any)
+      💰 成本 · ⏱ 耗时
+      ⚠️ 免责声明
+
+    No LLM involved — pure string assembly from ResearchBrief fields.
+    """
+    lines: list[str] = [
+        "📊 CNY/AUD 研究简报",
+        "",
+        "🔍 结论摘要",
+        brief.conclusion or "（暂无结论）",
+        "",
+    ]
+
+    for sec in brief.sections:
+        emoji = _SECTION_EMOJIS.get(sec.title, "📌")
+        header = f"{emoji} {sec.title}"
+        if sec.has_data_gap:
+            header += "  ⚠️ 数据不完整"
+        lines.append(header)
+        lines.append(sec.content or "（无内容）")
+        lines.append("")
+
+    if brief.data_gaps:
+        lines += ["📋 数据缺失", brief.data_gaps, ""]
+
+    if brief.user_notes:
+        lines += ["👤 个性化备注", f"{brief.user_notes}（仅基于您的明确偏好）", ""]
+
+    if brief.sources_summary:
+        lines += ["📎 数据来源", brief.sources_summary, ""]
+
+    c = brief.cost_estimate
+    cost_str = f"~${c.estimated_cost_usd:.4f}" if c.estimated_cost_usd > 0 else "~$0.0000"
+    lines.append(
+        f"💰 本次研究成本：~{c.llm_calls} 次 LLM 调用 · "
+        f"~{c.estimated_tokens:,} 个令牌 · {cost_str}"
+    )
+    lines.append(f"⏱ 总耗时：{latency_s:.1f}s")
+    lines.append(f"🔖 简报 ID：{brief.task_id[:8]}")
+    lines.append("")
+    lines.append(f"{brief.disclaimer}")
+
+    return "\n".join(lines)
 
 
 class TelegramBot:
@@ -1527,6 +1603,110 @@ class TelegramBot:
             logger.exception("[Telegram] 汇率波动 chart failed")
             await notice.edit_text(f"⚠️ 生成图表失败: {exc}")
 
+    # ── /fx_research — Phase 9 preset-driven research workflow ───────────────
+
+    async def _cmd_fx_research(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """
+        /fx_research — run the Phase 9 multi-agent research workflow and
+        deliver a ResearchBrief as a Telegram message.
+
+        Flow:
+          coordinator.run_research("fx_cnyaud", user_id)
+              → (ResearchTask, [AgentOutput], CostEstimate)
+          SupervisorReportWriter.run(task, preset, outputs, cost)
+              → ResearchBrief
+          _format_research_brief(brief, latency_s)
+              → plain-text Telegram message(s)
+
+        Errors:  if the whole workflow fails, a friendly error is sent.
+        Partial: if some agents failed, the brief is still sent with
+                 data_gaps populated — no message is suppressed.
+        """
+        if not await self._check_access(update, context):
+            return
+        if update.effective_user is None or update.message is None:
+            return
+
+        user_id  = update.effective_user.id
+        chat_id  = update.effective_chat.id
+
+        notice = await update.message.reply_text(
+            "⏳ 正在生成 CNY/AUD 研究简报，请稍候（约 10–30 秒）…"
+        )
+        typing_task = asyncio.create_task(self._keep_typing(chat_id))
+        t0 = time.monotonic()
+
+        try:
+            _ensure_research_path()
+            import importlib as _importlib  # noqa: PLC0415
+            _coord  = _importlib.import_module("coordinator")
+            _super  = _importlib.import_module("supervisor")
+            _schema = _importlib.import_module("schema")
+
+            run_research          = _coord.run_research
+            SupervisorWriter      = _super.SupervisorReportWriter
+            PRESET_REGISTRY       = _schema.PRESET_REGISTRY
+
+            logger.info(
+                "[Telegram] /fx_research user_id=%s — calling run_research", user_id
+            )
+
+            task, outputs, cost_estimate = await run_research(
+                preset_name="fx_cnyaud",
+                user_id=user_id,
+            )
+
+            logger.info(
+                "[Telegram] /fx_research task_id=%s — phase-1 done, agent_statuses=%s",
+                task.task_id[:8],
+                {o.agent_name: o.status for o in outputs},
+            )
+
+            preset = PRESET_REGISTRY.get(task.preset_name)
+            if preset is None:
+                raise ValueError(f"Preset {task.preset_name!r} not found in registry")
+
+            brief = await SupervisorWriter().run(task, preset, outputs, cost_estimate)
+
+            latency_s = time.monotonic() - t0
+            logger.info(
+                "[Telegram] /fx_research task_id=%s — brief done latency=%.1fs "
+                "sections=%d data_gaps=%r",
+                task.task_id[:8],
+                latency_s,
+                len(brief.sections),
+                bool(brief.data_gaps),
+            )
+
+            text = _format_research_brief(brief, latency_s)
+
+            try:
+                await notice.delete()
+            except Exception:
+                pass
+
+            for chunk in _split_message(text):
+                await update.message.reply_text(chunk)
+
+        except Exception as exc:
+            latency_s = time.monotonic() - t0
+            logger.exception(
+                "[Telegram] /fx_research failed user_id=%s latency=%.1fs",
+                user_id, latency_s,
+            )
+            try:
+                await notice.edit_text(
+                    "⚠️ 研究简报生成失败，请稍后再试。\n"
+                    f"（错误类型：{type(exc).__name__}）\n\n"
+                    "可能原因：模型服务、数据源、搜索配置或本地缓存问题。"
+                )
+            except Exception:
+                await update.message.reply_text("⚠️ 研究简报生成失败，请稍后再试。")
+        finally:
+            typing_task.cancel()
+
     # ── Message handler (text + photos) ───────────────────────────────────────
 
     async def _handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1837,6 +2017,7 @@ class TelegramBot:
         BotCommand("delete_profile", "删除我的个性化数据"),
         BotCommand("clear_inferred", "清空 Jarvis 的推断偏好（保留明确设置）"),
         BotCommand("bank_rates", "查看十大银行 AUD 牌价"),
+        BotCommand("fx_research", "生成 CNY/AUD 研究简报（多代理分析）"),
         BotCommand("clear_files", "清空下载文件"),
     ]
 
@@ -1853,6 +2034,7 @@ class TelegramBot:
         app.add_handler(CommandHandler("delete_profile", self._cmd_delete_profile))
         app.add_handler(CommandHandler("clear_inferred", self._cmd_clear_inferred))
         app.add_handler(CommandHandler("bank_rates", self._cmd_bank_rates))
+        app.add_handler(CommandHandler("fx_research", self._cmd_fx_research))
         app.add_handler(CommandHandler("clear_files", self._cmd_clear_files))
         app.add_handler(MessageHandler(
             (filters.TEXT | filters.PHOTO | filters.VOICE | filters.AUDIO)
