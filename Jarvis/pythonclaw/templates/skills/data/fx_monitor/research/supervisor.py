@@ -40,11 +40,13 @@ try:
         AgentOutput, CostEstimate, ResearchBrief,
         ResearchPreset, ResearchSection, ResearchTask, now_iso,
     )
+    from .llm_bridge import call_llm as _call_llm_bridge
 except ImportError:
     from schema import (  # type: ignore[no-redef]
         AgentOutput, CostEstimate, ResearchBrief,
         ResearchPreset, ResearchSection, ResearchTask, now_iso,
     )
+    from llm_bridge import call_llm as _call_llm_bridge  # type: ignore[no-redef]
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -59,43 +61,15 @@ _DISCLAIMER = (
 )
 
 
-# ── LLM caller (blocking, mockable module-level function) ─────────────────────
+# ── LLM caller — delegates to llm_bridge (Anthropic → DeepSeek fallback) ──────
 
 def _call_llm(
     prompt: str,
     system: str,
     max_tokens: int = _LLM_MAX_TOKENS,
 ) -> tuple[str, dict[str, int]]:
-    """
-    One Anthropic API call (blocking).
-    Returns (response_text, token_usage_dict).
-    Returns ("", {}) when anthropic is not installed or API key is missing.
-    """
-    try:
-        import anthropic  # optional dependency
-    except ImportError:
-        return "", {}
-
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-    if not api_key:
-        return "", {}
-
-    try:
-        client = anthropic.Anthropic(api_key=api_key, timeout=45.0)
-        msg = client.messages.create(
-            model=_LLM_MODEL,
-            max_tokens=max_tokens,
-            system=system,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        text: str = msg.content[0].text if msg.content else ""
-        usage: dict[str, int] = {
-            "prompt_tokens":     msg.usage.input_tokens,
-            "completion_tokens": msg.usage.output_tokens,
-        }
-        return text, usage
-    except Exception:  # noqa: BLE001
-        return "", {}
+    """Thin wrapper; real logic is in llm_bridge.call_llm()."""
+    return _call_llm_bridge(prompt, system, max_tokens=max_tokens, timeout=45.0)
 
 
 # ── Prompt builder ────────────────────────────────────────────────────────────

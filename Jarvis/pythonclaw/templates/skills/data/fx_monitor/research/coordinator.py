@@ -203,7 +203,7 @@ async def run_research(
     # ── 5. Run phase-1 agents in parallel ─────────────────────────────────────
     phase1_outputs: list[AgentOutput]
     async with LocalAsyncRunner() as runner:
-        phase1_outputs = await runner.run_many(task, phase1_agents)
+        phase1_outputs = await runner.run_many(task, phase1_agents, timeout_seconds=60)
 
     phase1_outputs = skipped + phase1_outputs   # skipped agents prepended
 

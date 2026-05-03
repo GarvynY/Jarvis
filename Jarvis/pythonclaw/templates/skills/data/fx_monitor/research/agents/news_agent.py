@@ -42,8 +42,10 @@ if str(_SKILL_DIR) not in sys.path:
 
 try:
     from ..schema import AgentOutput, Finding, ResearchTask, SourceRef, now_iso
+    from ..llm_bridge import call_llm as _call_llm
 except ImportError:
     from schema import AgentOutput, Finding, ResearchTask, SourceRef, now_iso  # type: ignore[no-redef]
+    from llm_bridge import call_llm as _call_llm  # type: ignore[no-redef]
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -105,42 +107,7 @@ def _read_news_cache() -> tuple[list[dict[str, Any]], str | None, str]:
         return [], f"news_cache_read_error: {exc}", ""
 
 
-def _call_llm(
-    prompt: str,
-    system: str,
-    max_tokens: int = _LLM_MAX_TOKENS,
-) -> tuple[str, dict[str, int]]:
-    """
-    Make one Anthropic API call (blocking).
-
-    Returns (response_text, token_usage_dict).
-    Returns ("", {}) if anthropic is not installed or API key is missing.
-    """
-    try:
-        import anthropic  # optional dependency
-    except ImportError:
-        return "", {}
-
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-    if not api_key:
-        return "", {}
-
-    try:
-        client = anthropic.Anthropic(api_key=api_key, timeout=30.0)
-        msg = client.messages.create(
-            model=_LLM_MODEL,
-            max_tokens=max_tokens,
-            system=system,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        text: str = msg.content[0].text if msg.content else ""
-        usage: dict[str, int] = {
-            "prompt_tokens":     msg.usage.input_tokens,
-            "completion_tokens": msg.usage.output_tokens,
-        }
-        return text, usage
-    except Exception:
-        return "", {}
+# _call_llm is imported from llm_bridge (Anthropic → DeepSeek fallback)
 
 
 # ── Prompt builder ────────────────────────────────────────────────────────────
