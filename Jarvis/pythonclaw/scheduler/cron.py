@@ -48,6 +48,15 @@ from typing import TYPE_CHECKING
 import yaml
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+
+def _morning_feedback_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("👍 有用",    callback_data="fb:useful:morning"),
+        InlineKeyboardButton("👎 无用",    callback_data="fb:not_useful:morning"),
+        InlineKeyboardButton("🚫 不感兴趣", callback_data="fb:not_interested:morning"),
+    ]])
 
 if TYPE_CHECKING:
     from ..channels.telegram_bot import TelegramBot
@@ -203,7 +212,9 @@ class CronScheduler:
             for cid in recipients:
                 try:
                     await self._telegram_bot.send_message(
-                        cid, header + body, parse_mode="HTML"
+                        cid, header + body,
+                        parse_mode="HTML",
+                        reply_markup=_morning_feedback_keyboard(),
                     )
                 except Exception as exc:
                     logger.error(

@@ -69,15 +69,32 @@ def _save_state(state: dict) -> None:
 
 # ── telegram ─────────────────────────────────────────────────────────────────
 
-def _telegram_send(token: str, chat_id: int | list, text: str) -> None:
+def _feedback_keyboard(source: str) -> dict:
+    """Return a raw Telegram InlineKeyboardMarkup dict for the given source tag."""
+    return {
+        "inline_keyboard": [[
+            {"text": "👍 有用",    "callback_data": f"fb:useful:{source}"},
+            {"text": "👎 无用",    "callback_data": f"fb:not_useful:{source}"},
+            {"text": "🚫 不感兴趣", "callback_data": f"fb:not_interested:{source}"},
+        ]]
+    }
+
+
+def _telegram_send(
+    token: str,
+    chat_id: int | list,
+    text: str,
+    reply_markup: dict | None = None,
+) -> None:
     if isinstance(chat_id, list):
         for cid in chat_id:
-            _telegram_send(token, cid, text)
+            _telegram_send(token, cid, text, reply_markup)
         return
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = json.dumps(
-        {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
-    ).encode()
+    payload_dict: dict = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
+    if reply_markup:
+        payload_dict["reply_markup"] = reply_markup
+    payload = json.dumps(payload_dict).encode()
     req = urllib.request.Request(
         url, data=payload,
         headers={"Content-Type": "application/json"},
@@ -462,7 +479,7 @@ def check_news(api_key: str, token: str, chat_id: int,
         rate_footer = _format_bank_rate_footer(fresh, preferred_banks)
 
     msg = f"📰 <b>CNY/AUD 相关新闻</b>\n\n{lines}{rate_footer}"
-    _telegram_send(token, chat_id, msg)
+    _telegram_send(token, chat_id, msg, reply_markup=_feedback_keyboard("news"))
     log.info("News alert sent: %d/%d articles relevant", len(relevant), len(articles))
     return articles
 
@@ -526,7 +543,7 @@ def check_combined(
         f"🤖 <b>AI 简析</b>\n{analysis}\n\n"
         f"⚠️ 仅供参考，不构成投资建议"
     )
-    _telegram_send(token, chat_id, msg)
+    _telegram_send(token, chat_id, msg, reply_markup=_feedback_keyboard("alert"))
     state["last_combined_alert"] = datetime.now(timezone.utc).isoformat()
     log.info("Combined LLM alert sent.")
 
