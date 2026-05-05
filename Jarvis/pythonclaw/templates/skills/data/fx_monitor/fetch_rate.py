@@ -4,7 +4,7 @@ Fetch CNY/AUD exchange rate with bank quote context and trend analysis.
 
 Bank quote source      : Chinese bank FX boards (spot buy/sell, best effort)
 Market fallback source : open.er-api.com  (free, no key, ~1 min delay)
-Historical data source : yfinance CNYAUD=X (daily closes, free)
+Historical data source : Alpha Vantage FX_DAILY (primary) → yfinance CNYAUD=X (fallback)
 """
 
 from __future__ import annotations
@@ -13,6 +13,7 @@ import argparse
 import datetime
 import html
 import json
+import os
 import re
 import statistics
 import urllib.request
@@ -26,6 +27,10 @@ except ImportError:
 
 TICKER = "CNYAUD=X"          # yfinance: 1 CNY = ? AUD  (for historical only)
 ER_API_URL = "https://open.er-api.com/v6/latest/CNY"   # real-time source
+
+# Alpha Vantage — historical FX data (primary source, replaces yfinance history)
+_AV_API_KEY  = os.environ.get("ALPHAVANTAGE_API_KEY", "6B5UOBORPQ6GRJJS")
+_AV_BASE_URL = "https://www.alphavantage.co/query"
 
 BANK_SOURCES = [
     ("BOC", "中国银行", "https://www.boc.cn/sourcedb/whpj/"),
@@ -211,67 +216,143 @@ def _fetch_market_rate() -> tuple[float, str] | tuple[None, str]:
     return None, "unavailable"
 
 
-# ── Historical data (yfinance) ────────────────────────────────────────────────
+# ── Historical data ───────────────────────────────────────────────────────────
 
-def _fetch_history(period: str) -> tuple[list, dict] | tuple[list, None]:
-    """Returns (recent_history_list, stats_dict). Both empty/None on failure."""
+_PERIOD_DAYS: dict[str, int] = {"7d": 7, "30d": 30, "90d": 90, "1y": 365}
+
+
+def _build_stats(
+    closes: list[float],
+    dates: list[str],
+    period: str,
+    data_source: str,
+) -> tuple[list[dict], dict]:
+    """
+    Compute stats dict and recent_history list from a list of daily close values.
+
+    closes[i] = AUD per CNY  (same orientation as yfinance CNYAUD=X).
+    dates[i]  = "YYYY-MM-DD" string, same length as closes, ascending.
+    """
+    start_val = closes[0]
+    end_val   = closes[-1]
+
+    stats: dict = {
+        "period":                  period,
+        "trading_days":            len(closes),
+        "start_rate_cny_per_aud":  round(1 / start_val, 4),
+        "end_rate_cny_per_aud":    round(1 / end_val, 4),
+        "period_change_pct":       round((end_val / start_val - 1) * 100, 4),
+        "high_cny_aud":            round(max(closes), 6),   # max AUD/CNY = min CNY/AUD
+        "low_cny_aud":             round(min(closes), 6),   # min AUD/CNY = max CNY/AUD
+        "mean_cny_aud":            round(statistics.mean(closes), 6),
+        "volatility_std":          round(statistics.stdev(closes), 6) if len(closes) >= 2 else 0.0,
+        "data_source":             data_source,
+    }
+
+    if len(closes) >= 14:
+        recent_7 = statistics.mean(closes[-7:])
+        prior_7  = statistics.mean(closes[-14:-7])
+        trend_7d = (recent_7 / prior_7 - 1) * 100
+        stats["trend_7d_pct"]      = round(trend_7d, 4)
+        stats["trend_direction"]   = (
+            "CNY升值 (AUD贬值)" if trend_7d > 0.05
+            else "CNY贬值 (AUD升值)" if trend_7d < -0.05
+            else "横盘震荡"
+        )
+
+    if np is not None and len(closes) >= 5:
+        x     = np.arange(len(closes), dtype=float)
+        c_arr = np.array(closes, dtype=float)
+        slope, _ = np.polyfit(x, c_arr, 1)
+        stats["regression_trend_annualised_pct"] = round(
+            (slope * 252 / float(c_arr.mean())) * 100, 2
+        )
+
+    tail = list(zip(dates, closes))[-30:]
+    recent = [
+        {
+            "date":        d,
+            "cny_per_aud": round(1 / v, 4),
+            "aud_per_cny": round(v, 6),
+        }
+        for d, v in tail
+    ]
+    return recent, stats
+
+
+def _fetch_history_av(period_days: int, period_label: str) -> tuple[list, dict | None]:
+    """
+    Primary historical source: Alpha Vantage FX_DAILY (CNY → AUD).
+
+    Returns AUD-per-CNY closes (same orientation as yfinance CNYAUD=X).
+    Falls back gracefully to ([], None) on any error.
+    """
     try:
-        if yf is None or np is None:
+        outputsize = "full" if period_days > 100 else "compact"
+        url = (
+            f"{_AV_BASE_URL}?function=FX_DAILY"
+            f"&from_symbol=CNY&to_symbol=AUD"
+            f"&outputsize={outputsize}"
+            f"&apikey={_AV_API_KEY}"
+        )
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode())
+
+        ts = data.get("Time Series FX (Daily)", {})
+        if not ts:
+            return [], None
+
+        cutoff = (
+            datetime.datetime.utcnow() - datetime.timedelta(days=period_days + 5)
+        ).strftime("%Y-%m-%d")
+
+        # ascending order, only dates within the requested window
+        sorted_dates = sorted(d for d in ts if d >= cutoff)
+        if len(sorted_dates) < 2:
+            return [], None
+
+        closes = [float(ts[d]["4. close"]) for d in sorted_dates]
+        return _build_stats(closes, sorted_dates, period_label, "Alpha Vantage FX_DAILY")
+
+    except Exception:
+        return [], None
+
+
+def _fetch_history_yf(period: str) -> tuple[list, dict | None]:
+    """
+    Fallback historical source: yfinance CNYAUD=X.
+    Only used when Alpha Vantage is unavailable.
+    """
+    try:
+        if yf is None:
             return [], None
         hist = yf.Ticker(TICKER).history(period=period)
         if hist.empty:
             return [], None
-        closes = hist["Close"].dropna()
-        if len(closes) < 2:
+        closes_s = hist["Close"].dropna()
+        if len(closes_s) < 2:
             return [], None
 
-        start_val = float(closes.iloc[0])
-        end_val   = float(closes.iloc[-1])
-
-        stats: dict = {
-            "period": period,
-            "trading_days": int(len(closes)),
-            "start_rate_cny_per_aud": round(1 / start_val, 4),
-            "end_rate_cny_per_aud":   round(1 / end_val, 4),
-            "period_change_pct": round((end_val / start_val - 1) * 100, 4),
-            "high_cny_aud": round(float(closes.max()), 6),
-            "low_cny_aud":  round(float(closes.min()), 6),
-            "mean_cny_aud": round(float(closes.mean()), 6),
-            "volatility_std": round(float(closes.std()), 6),
-            "data_source": "yfinance CNYAUD=X",
-        }
-
-        if len(closes) >= 14:
-            recent_7 = float(closes.iloc[-7:].mean())
-            prior_7  = float(closes.iloc[-14:-7].mean())
-            trend_7d = (recent_7 / prior_7 - 1) * 100
-            stats["trend_7d_pct"] = round(trend_7d, 4)
-            stats["trend_direction"] = (
-                "CNY升值 (AUD贬值)" if trend_7d > 0.05
-                else "CNY贬值 (AUD升值)" if trend_7d < -0.05
-                else "横盘震荡"
-            )
-
-        if len(closes) >= 5:
-            x = np.arange(len(closes), dtype=float)
-            slope, _ = np.polyfit(x, closes.values.astype(float), 1)
-            stats["regression_trend_annualised_pct"] = round(
-                (slope * 252 / float(closes.mean())) * 100, 2
-            )
-
-        tail = closes.iloc[-30:]
-        recent = [
-            {
-                "date": str(idx.date()),
-                "cny_per_aud": round(1 / float(v), 4),
-                "aud_per_cny": round(float(v), 6),
-            }
-            for idx, v in zip(tail.index, tail)
-        ]
-        return recent, stats
+        closes = [float(v) for v in closes_s]
+        dates  = [str(idx.date()) for idx in closes_s.index]
+        return _build_stats(closes, dates, period, "yfinance CNYAUD=X (fallback)")
 
     except Exception:
         return [], None
+
+
+def _fetch_history(period: str) -> tuple[list, dict] | tuple[list, None]:
+    """
+    Returns (recent_history_list, stats_dict). Both empty/None on total failure.
+
+    Priority: Alpha Vantage FX_DAILY → yfinance CNYAUD=X.
+    """
+    period_days = _PERIOD_DAYS.get(period, 90)
+    recent, stats = _fetch_history_av(period_days, period)
+    if stats is not None:
+        return recent, stats
+    return _fetch_history_yf(period)
 
 
 # ── Main fetch ────────────────────────────────────────────────────────────────
