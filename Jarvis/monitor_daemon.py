@@ -20,15 +20,28 @@ import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+try:
+    from pythonclaw.core.rate_limit import call_with_backoff
+except Exception:  # noqa: BLE001 - daemon can run before editable install.
+    def call_with_backoff(provider, func, *args, **kwargs):  # type: ignore[no-redef]
+        return func(*args, **kwargs)
+
+_PYTHONCLAW_HOME = Path.home() / ".pythonclaw"
+_LOG_HANDLERS: list[logging.Handler] = [logging.StreamHandler(sys.stdout)]
+try:
+    _PYTHONCLAW_HOME.mkdir(parents=True, exist_ok=True)
+    _LOG_HANDLERS.append(
+        logging.FileHandler(
+            _PYTHONCLAW_HOME / "monitor_daemon.log", encoding="utf-8"
+        )
+    )
+except OSError:
+    pass
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler(
-            Path.home() / ".pythonclaw" / "monitor_daemon.log", encoding="utf-8"
-        ),
-    ],
+    handlers=_LOG_HANDLERS,
 )
 log = logging.getLogger(__name__)
 
@@ -80,6 +93,17 @@ def _feedback_keyboard(source: str) -> dict:
     }
 
 
+def _reply_markup_source(reply_markup: dict | None) -> str:
+    """Extract the feedback source tag from inline keyboard callback data."""
+    try:
+        buttons = (reply_markup or {}).get("inline_keyboard") or []
+        first = buttons[0][0] if buttons and buttons[0] else {}
+        data = first.get("callback_data", "")
+        return data.rsplit(":", 1)[-1] if ":" in data else "unknown"
+    except Exception:
+        return "unknown"
+
+
 def _telegram_send(
     token: str,
     chat_id: int | list,
@@ -101,9 +125,24 @@ def _telegram_send(
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
+        with call_with_backoff("telegram", urllib.request.urlopen, req, timeout=15) as resp:
+            body = resp.read().decode()
             if resp.status != 200:
-                log.error("Telegram API error: %s", resp.read().decode())
+                log.error("Telegram API error: %s", body)
+                return
+            if reply_markup:
+                try:
+                    sent = json.loads(body)
+                    result = sent.get("result") or {}
+                    if result.get("reply_markup"):
+                        log.info("Telegram message sent with feedback keyboard: source=%s", _reply_markup_source(reply_markup))
+                    else:
+                        log.warning(
+                            "Telegram accepted message but response has no reply_markup; source=%s",
+                            _reply_markup_source(reply_markup),
+                        )
+                except Exception:
+                    log.info("Telegram message sent with feedback keyboard; response parse skipped")
     except Exception as e:
         log.error("Failed to send Telegram message: %s", e)
 
@@ -300,7 +339,9 @@ def _llm_per_article_analysis(
         base_url="https://api.deepseek.com/v1",
         timeout=60.0,
     )
-    response = client.chat.completions.create(
+    response = call_with_backoff(
+        "deepseek",
+        client.chat.completions.create,
         model="deepseek-chat",
         max_tokens=400,
         messages=[{"role": "user", "content": prompt}],
@@ -352,7 +393,9 @@ def _llm_combined_analysis(
         base_url="https://api.deepseek.com/v1",
         timeout=60.0,
     )
-    response = client.chat.completions.create(
+    response = call_with_backoff(
+        "deepseek",
+        client.chat.completions.create,
         model="deepseek-chat",
         max_tokens=200,
         messages=[{"role": "user", "content": prompt}],

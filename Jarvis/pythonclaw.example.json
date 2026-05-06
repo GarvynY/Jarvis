@@ -72,6 +72,17 @@
   "concurrency": {
     "maxAgents": 4
   },
+  "rateLimits": {
+    "deepseek": {"concurrency": 3, "maxRetries": 4, "baseDelay": 1, "maxDelay": 30},
+    "openai_compatible": {"concurrency": 3, "maxRetries": 4, "baseDelay": 1, "maxDelay": 30},
+    "anthropic": {"concurrency": 3, "maxRetries": 3, "baseDelay": 1, "maxDelay": 30},
+    "gemini": {"concurrency": 3, "maxRetries": 3, "baseDelay": 1, "maxDelay": 30},
+    "tavily": {"concurrency": 2, "maxRetries": 3, "baseDelay": 1, "maxDelay": 20},
+    "google_news": {"concurrency": 2, "maxRetries": 2, "baseDelay": 1, "maxDelay": 20},
+    "telegram": {"concurrency": 5, "maxRetries": 3, "baseDelay": 0.5, "maxDelay": 10},
+    "fx_data": {"concurrency": 4, "maxRetries": 2, "baseDelay": 0.5, "maxDelay": 10},
+    "image_fetch": {"concurrency": 4, "maxRetries": 2, "baseDelay": 0.5, "maxDelay": 10}
+  },
   "heartbeat": {
     "intervalSec": 60,
     "alertChatId": null

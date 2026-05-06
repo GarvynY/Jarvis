@@ -19,6 +19,12 @@ import statistics
 import urllib.request
 
 try:
+    from pythonclaw.core.rate_limit import call_with_backoff
+except Exception:  # noqa: BLE001 - script can run standalone from skill dir.
+    def call_with_backoff(provider, func, *args, **kwargs):  # type: ignore[no-redef]
+        return func(*args, **kwargs)
+
+try:
     import numpy as np
     import yfinance as yf
 except ImportError:
@@ -124,7 +130,7 @@ def _fetch_bank_quotes() -> tuple[list[dict], str]:
     for code, name, url in BANK_SOURCES:
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=8) as resp:
+            with call_with_backoff("fx_data", urllib.request.urlopen, req, timeout=8) as resp:
                 text = _decode_response(resp.read())
             quote = _parse_bank_quote_page(text, code, name, url)
             if quote:
@@ -192,7 +198,7 @@ def _fetch_market_rate() -> tuple[float, str] | tuple[None, str]:
     # 1) open.er-api.com  (accurate, ~1 min delay, no key needed)
     try:
         req = urllib.request.Request(ER_API_URL, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=8) as resp:
+        with call_with_backoff("fx_data", urllib.request.urlopen, req, timeout=8) as resp:
             data = json.loads(resp.read().decode())
         if data.get("result") == "success":
             aud = data["rates"].get("AUD")
@@ -296,7 +302,7 @@ def _fetch_history_av(period_days: int, period_label: str) -> tuple[list, dict |
             f"&apikey={_AV_API_KEY}"
         )
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=15) as resp:
+        with call_with_backoff("fx_data", urllib.request.urlopen, req, timeout=15) as resp:
             data = json.loads(resp.read().decode())
 
         ts = data.get("Time Series FX (Daily)", {})

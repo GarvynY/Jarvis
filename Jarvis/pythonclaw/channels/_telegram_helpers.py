@@ -798,6 +798,44 @@ _SECTION_EMOJIS: dict[str, str] = {
 }
 
 
+def _split_brief_points(text: str, *, max_points: int = 10) -> list[str]:
+    """Split dense research prose into readable Telegram bullet points."""
+    cleaned = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not cleaned:
+        return []
+    if cleaned.startswith(("•", "-", "1.")):
+        return [line.strip() for line in cleaned.splitlines() if line.strip()]
+
+    parts = re.split(r"(?<=[。！？!?])\s*|[；;]\s*", cleaned)
+    points: list[str] = []
+    for part in parts:
+        item = part.strip(" ，,")
+        if not item:
+            continue
+        if len(item) > 180:
+            comma_parts = [
+                p.strip(" ，,") for p in re.split(r"，|,\s+", item) if p.strip(" ，,")
+            ]
+            points.extend(comma_parts if len(comma_parts) > 1 else [item])
+        else:
+            points.append(item)
+    return points[:max_points] or [cleaned]
+
+
+def _format_brief_points(text: str, *, max_points: int = 10) -> str:
+    """Render text as bullet points, preserving existing bullet-like lines."""
+    points = _split_brief_points(text, max_points=max_points)
+    if not points:
+        return "（无内容）"
+    rendered: list[str] = []
+    for point in points:
+        if point.startswith(("•", "-")):
+            rendered.append(point)
+        else:
+            rendered.append(f"• {point}")
+    return "\n".join(rendered)
+
+
 def _format_research_brief(brief: Any, latency_s: float) -> str:
     """
     Render a ResearchBrief as a plain-text Telegram message.
@@ -817,11 +855,11 @@ def _format_research_brief(brief: Any, latency_s: float) -> str:
         if sec.has_data_gap:
             header += "  ⚠️ 数据不完整"
         lines.append(header)
-        lines.append(sec.content or "（无内容）")
+        lines.append(_format_brief_points(sec.content, max_points=12))
         lines.append("")
 
     if brief.data_gaps:
-        lines += ["📋 数据缺失", brief.data_gaps, ""]
+        lines += ["📋 研究覆盖不足", _format_brief_points(brief.data_gaps, max_points=8), ""]
 
     if brief.user_notes:
         lines += ["👤 个性化备注", f"{brief.user_notes}（仅基于您的明确偏好）", ""]

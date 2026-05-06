@@ -56,6 +56,12 @@ except ImportError:
     from schema import AgentOutput, Finding, ResearchTask, SourceRef, now_iso  # type: ignore[no-redef]
     from llm_bridge import call_llm as _call_llm  # type: ignore[no-redef]
 
+try:
+    from pythonclaw.core.rate_limit import call_with_backoff
+except Exception:  # noqa: BLE001 - research agents can run from skill dir.
+    def call_with_backoff(provider, func, *args, **kwargs):  # type: ignore[no-redef]
+        return func(*args, **kwargs)
+
 # ── Constants ─────────────────────────────────────────────────────────────────
 
 # Fixed query set for CNY/AUD macro research (MVP)
@@ -109,7 +115,9 @@ def _search_tavily(query: str, max_results: int) -> list[dict[str, Any]]:
 
     try:
         client = TavilyClient(api_key)
-        response = client.search(
+        response = call_with_backoff(
+            "tavily",
+            client.search,
             query=query,
             search_depth="basic",
             topic="news",

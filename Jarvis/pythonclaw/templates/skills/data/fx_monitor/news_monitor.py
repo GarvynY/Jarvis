@@ -19,6 +19,12 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 
+try:
+    from pythonclaw.core.rate_limit import call_with_backoff
+except Exception:  # noqa: BLE001 - skill can run outside installed package.
+    def call_with_backoff(provider, func, *args, **kwargs):  # type: ignore[no-redef]
+        return func(*args, **kwargs)
+
 STATE_FILE = os.path.expanduser(
     os.path.join("~", ".pythonclaw", "context", "news_monitor_state.json")
 )
@@ -113,7 +119,7 @@ def _fetch_google_news_rss(query: str, lang: str = "en", max_items: int = 5) -> 
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
             "Accept": "application/rss+xml, application/xml, text/xml",
         })
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with call_with_backoff("google_news", urllib.request.urlopen, req, timeout=10) as resp:
             raw = resp.read()
     except Exception as exc:
         return [{"error": f"RSS fetch failed for '{query}': {exc}"}]

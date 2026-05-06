@@ -156,6 +156,25 @@ def _mock_llm_text(text: str):
     )
 
 
+def _mock_monitor_refresh(articles: list | None = None, error: str | None = None):
+    import agents.news_agent as _mod
+    items = articles if articles is not None else _EXAMPLE_ARTICLES
+    return unittest.mock.patch.object(
+        _mod,
+        "_refresh_news_via_monitor",
+        return_value=(items, error, "2026-05-06T10:00:00Z"),
+    )
+
+
+def _mock_cache_not_mocked():
+    import agents.news_agent as _mod
+    return unittest.mock.patch.object(
+        _mod,
+        "_cache_reader_is_mocked",
+        return_value=False,
+    )
+
+
 def _print_output(output: AgentOutput) -> None:
     print(f"   status={output.status}  conf={output.confidence:.2f}  "
           f"latency={output.latency_ms}ms  findings={len(output.findings)}")
@@ -347,6 +366,54 @@ async def test_banned_terms_sanitized() -> None:
     print("   PASS")
 
 
+async def test_stale_cache_refreshes() -> None:
+    """Stale cache triggers a no-mark-seen refresh before LLM analysis."""
+    stale_articles = [
+        {
+            **_EXAMPLE_ARTICLES[0],
+            "published": "Wed, 29 Apr 2026 12:00:00 +0000",
+        }
+    ]
+    fresh_articles = [
+        {
+            **_EXAMPLE_ARTICLES[2],
+            "published": "Wed, 06 May 2026 09:30:00 +0000",
+        }
+    ]
+    with _mock_cache_not_mocked(), _mock_cache_ok(stale_articles), \
+         _mock_monitor_refresh(fresh_articles), _mock_llm_ok():
+        raw = _collect_and_analyse()
+
+    assert raw["articles"] == fresh_articles
+    assert raw["updated_at"] == "2026-05-06T10:00:00Z"
+
+    print("\n-- test_stale_cache_refreshes")
+    print(f"   refreshed title: {raw['articles'][0]['title'][:60]}")
+    print("   PASS")
+
+
+async def test_stale_cache_no_recent_news() -> None:
+    """Stale cache + empty refresh returns no-news partial, not old headlines."""
+    stale_articles = [
+        {
+            **_EXAMPLE_ARTICLES[0],
+            "published": "Wed, 29 Apr 2026 12:00:00 +0000",
+        }
+    ]
+    with _mock_cache_not_mocked(), _mock_cache_ok(stale_articles), \
+         _mock_monitor_refresh([], "news_monitor_refresh_empty"):
+        output = await NewsAgent().run(_make_task())
+
+    assert output.status == "partial"
+    assert not output.findings
+    assert "暂无近期相关新闻" in output.summary
+    assert any("news_monitor_refresh_empty" in m for m in output.missing_data)
+
+    print("\n-- test_stale_cache_no_recent_news")
+    _print_output(output)
+    print("   PASS")
+
+
 # ── Runner ────────────────────────────────────────────────────────────────────
 
 async def main() -> None:
@@ -363,9 +430,11 @@ async def main() -> None:
     await test_json_safe()
     await test_no_banned_terms()
     await test_banned_terms_sanitized()
+    await test_stale_cache_refreshes()
+    await test_stale_cache_no_recent_news()
 
     print("\n" + "=" * 60)
-    print("All 9 tests passed.")
+    print("All 11 tests passed.")
 
 
 if __name__ == "__main__":

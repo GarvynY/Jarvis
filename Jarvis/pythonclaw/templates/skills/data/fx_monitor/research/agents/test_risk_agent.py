@@ -277,14 +277,14 @@ async def test_missing_sources_detected() -> None:
     print("   PASS")
 
 
-async def test_stale_data_detected() -> None:
-    """Old as_of / published_at timestamps → stale_data finding."""
+async def test_stale_news_data_detected() -> None:
+    """News older than default 48h threshold → stale_data finding."""
     old = (datetime.now(timezone.utc) - timedelta(days=4)).isoformat()
-    out = _ok_output("macro_agent", ["neutral"])
+    out = _ok_output("news_agent", ["neutral"])
     out.as_of = old
     out.sources = [
         SourceRef(
-            title="old macro source",
+            title="old news source",
             url="https://example.com/old",
             source="mock",
             retrieved_at=old,
@@ -294,11 +294,53 @@ async def test_stale_data_detected() -> None:
     output = await RiskAgent().run(_make_task(), [out])
 
     keys = {f.key for f in output.findings}
-    assert "stale_data_macro_agent" in keys, f"Expected stale data finding, got: {keys}"
-    assert "stale_data:macro_agent" in output.missing_data
+    assert "stale_data_news_agent" in keys, f"Expected stale data finding, got: {keys}"
+    assert "stale_data:news_agent" in output.missing_data
 
-    print("\n-- test_stale_data_detected")
+    print("\n-- test_stale_news_data_detected")
     _print_output(output)
+    print("   PASS")
+
+
+async def test_macro_data_allows_one_week() -> None:
+    """Macro data within one week is not stale, but older macro data is."""
+    recent = (datetime.now(timezone.utc) - timedelta(days=4)).isoformat()
+    old = (datetime.now(timezone.utc) - timedelta(days=8)).isoformat()
+
+    recent_out = _ok_output("macro_agent", ["neutral"])
+    recent_out.as_of = recent
+    recent_out.sources = [
+        SourceRef(
+            title="recent macro source",
+            url="https://example.com/recent",
+            source="mock",
+            retrieved_at=recent,
+            published_at=recent,
+        )
+    ]
+    recent_result = await RiskAgent().run(_make_task(), [recent_out])
+    recent_keys = {f.key for f in recent_result.findings}
+    assert "stale_data_macro_agent" not in recent_keys
+
+    old_out = _ok_output("macro_agent", ["neutral"])
+    old_out.as_of = old
+    old_out.sources = [
+        SourceRef(
+            title="old macro source",
+            url="https://example.com/old",
+            source="mock",
+            retrieved_at=old,
+            published_at=old,
+        )
+    ]
+    old_result = await RiskAgent().run(_make_task(), [old_out])
+    old_keys = {f.key for f in old_result.findings}
+    assert "stale_data_macro_agent" in old_keys
+    assert "stale_data:macro_agent" in old_result.missing_data
+
+    print("\n-- test_macro_data_allows_one_week")
+    print(f"   recent_keys={recent_keys}")
+    print(f"   old_keys={old_keys}")
     print("   PASS")
 
 
@@ -341,7 +383,8 @@ async def main() -> None:
     await test_json_safe()
     await test_dedup_risks()
     await test_missing_sources_detected()
-    await test_stale_data_detected()
+    await test_stale_news_data_detected()
+    await test_macro_data_allows_one_week()
     await test_missing_source_timestamp()
     print("\n" + "=" * 60)
     print("All 13 tests passed.")

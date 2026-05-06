@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional
 
 import anthropic
 
+from ..rate_limit import call_with_backoff, rate_limit_context
 from .base import LLMProvider
 from .response import MockChoice, MockFunction, MockMessage, MockResponse, MockToolCall
 
@@ -158,7 +159,11 @@ class AnthropicProvider(LLMProvider):
         api_kwargs = self._prepare_request(
             messages, tools, tool_choice, **kwargs
         )
-        response = self.client.messages.create(**api_kwargs)
+        response = call_with_backoff(
+            "anthropic",
+            self.client.messages.create,
+            **api_kwargs,
+        )
 
         content_text = ""
         tool_calls: list[MockToolCall] = []
@@ -194,34 +199,35 @@ class AnthropicProvider(LLMProvider):
         tool_calls: list[MockToolCall] = []
         current_tool: dict[str, Any] | None = None
 
-        with self.client.messages.stream(**api_kwargs) as stream:
-            for event in stream:
-                if event.type == "content_block_start":
-                    block = event.content_block
-                    if block.type == "tool_use":
-                        current_tool = {
-                            "id": block.id,
-                            "name": block.name,
-                            "args": "",
-                        }
-                elif event.type == "content_block_delta":
-                    delta = event.delta
-                    if delta.type == "text_delta":
-                        content_text += delta.text
-                        yield {"type": "text_delta", "text": delta.text}
-                    elif delta.type == "input_json_delta":
+        with rate_limit_context("anthropic"):
+            with self.client.messages.stream(**api_kwargs) as stream:
+                for event in stream:
+                    if event.type == "content_block_start":
+                        block = event.content_block
+                        if block.type == "tool_use":
+                            current_tool = {
+                                "id": block.id,
+                                "name": block.name,
+                                "args": "",
+                            }
+                    elif event.type == "content_block_delta":
+                        delta = event.delta
+                        if delta.type == "text_delta":
+                            content_text += delta.text
+                            yield {"type": "text_delta", "text": delta.text}
+                        elif delta.type == "input_json_delta":
+                            if current_tool is not None:
+                                current_tool["args"] += delta.partial_json
+                    elif event.type == "content_block_stop":
                         if current_tool is not None:
-                            current_tool["args"] += delta.partial_json
-                elif event.type == "content_block_stop":
-                    if current_tool is not None:
-                        tool_calls.append(MockToolCall(
-                            id=current_tool["id"],
-                            function=MockFunction(
-                                name=current_tool["name"],
-                                arguments=current_tool["args"] or "{}",
-                            ),
-                        ))
-                        current_tool = None
+                            tool_calls.append(MockToolCall(
+                                id=current_tool["id"],
+                                function=MockFunction(
+                                    name=current_tool["name"],
+                                    arguments=current_tool["args"] or "{}",
+                                ),
+                            ))
+                            current_tool = None
 
         return self._response_from_blocks(content_text, tool_calls)
 
@@ -258,7 +264,12 @@ class AnthropicProvider(LLMProvider):
                     try:
                         import urllib.request
 
-                        resp = urllib.request.urlopen(url, timeout=15)
+                        resp = call_with_backoff(
+                            "image_fetch",
+                            urllib.request.urlopen,
+                            url,
+                            timeout=15,
+                        )
                         data = resp.read()
                         ct = resp.headers.get(
                             "Content-Type", "image/jpeg"

@@ -25,6 +25,9 @@ except ImportError:
     from schema import AgentOutput, Finding, ResearchTask, now_iso  # type: ignore[no-redef]
 
 _STALE_SOURCE_HOURS = 48.0
+_STALE_SOURCE_HOURS_BY_AGENT = {
+    "macro_agent": 24.0 * 7,
+}
 
 
 def _parse_iso(value: str | None) -> datetime | None:
@@ -75,6 +78,10 @@ class RiskAgent:
         # ── Collect all directions from Phase-1 findings ──────────────────────
         all_findings: list[Finding] = []
         for output in phase1_outputs:
+            stale_threshold = _STALE_SOURCE_HOURS_BY_AGENT.get(
+                output.agent_name,
+                _STALE_SOURCE_HOURS,
+            )
             all_findings.extend(output.findings)
             risks.extend(output.risks)
             for item in output.missing_data:
@@ -108,7 +115,7 @@ class RiskAgent:
                 src_age = _age_hours(timestamp, now_dt)
                 if src_age is not None:
                     ages.append((src.title or src.source or "source", src_age))
-            stale = [(label, age) for label, age in ages if age > _STALE_SOURCE_HOURS]
+            stale = [(label, age) for label, age in ages if age > stale_threshold]
             if stale:
                 label, age = max(stale, key=lambda item: item[1])
                 findings.append(Finding(

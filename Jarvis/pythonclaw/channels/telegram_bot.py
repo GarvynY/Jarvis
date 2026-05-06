@@ -154,14 +154,21 @@ class TelegramBot:
     # ── Push message (called by cron / heartbeat) ─────────────────────────────
 
     async def send_message(
-        self, chat_id: int, text: str, parse_mode: str | None = None
+        self,
+        chat_id: int,
+        text: str,
+        parse_mode: str | None = None,
+        reply_markup: Any | None = None,
     ) -> None:
         """Send a message to a specific chat (used by cron/heartbeat)."""
         if self._app is None:
             logger.warning("[Telegram] send_message called before bot is running")
             return
         await self._app.bot.send_message(
-            chat_id=chat_id, text=text, parse_mode=parse_mode
+            chat_id=chat_id,
+            text=text,
+            parse_mode=parse_mode,
+            reply_markup=reply_markup,
         )
 
     # ── Access control ────────────────────────────────────────────────────────
@@ -857,8 +864,10 @@ class TelegramBot:
         except Exception as exc:
             logger.exception("[Telegram] 最新新闻 fetch failed")
             text = f"⚠️ 获取新闻失败: {exc}"
-        for chunk in _split_message(text):
-            await update.message.reply_text(chunk)
+        chunks = _split_message(text)
+        for i, chunk in enumerate(chunks):
+            kb = _make_feedback_keyboard("news") if i == len(chunks) - 1 else None
+            await update.message.reply_text(chunk, reply_markup=kb)
 
     async def _shortcut_latest_rate(self, update: Update) -> None:
         """Fetch current CNY/AUD rate directly without LLM and send formatted result."""

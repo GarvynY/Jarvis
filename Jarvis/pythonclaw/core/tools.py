@@ -22,6 +22,8 @@ import re
 import subprocess
 import sys
 
+from .rate_limit import call_with_backoff
+
 logger = logging.getLogger(__name__)
 
 
@@ -677,7 +679,7 @@ def web_search(
         if exclude_domains:
             kwargs["exclude_domains"] = exclude_domains
 
-        response = client.search(**kwargs)
+        response = call_with_backoff("tavily", client.search, **kwargs)
     except Exception as exc:
         logger.warning("[web_search] Tavily API error: %s", exc)
         return f"Web search error: {exc}"

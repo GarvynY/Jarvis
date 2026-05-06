@@ -17,6 +17,12 @@ import json
 import os
 from pathlib import Path
 
+try:
+    from pythonclaw.core.rate_limit import call_with_backoff
+except Exception:  # noqa: BLE001 - skill can run outside installed package.
+    def call_with_backoff(provider, func, *args, **kwargs):  # type: ignore[no-redef]
+        return func(*args, **kwargs)
+
 
 # ── Provider constants ────────────────────────────────────────────────────────
 
@@ -65,7 +71,9 @@ def call_llm(
                 base_url=_DEEPSEEK_BASE_URL,
                 timeout=timeout,
             )
-            resp = client.chat.completions.create(
+            resp = call_with_backoff(
+                "deepseek",
+                client.chat.completions.create,
                 model=_DEEPSEEK_MODEL,
                 max_tokens=max_tokens,
                 messages=[
@@ -89,7 +97,9 @@ def call_llm(
         try:
             import anthropic  # optional
             client = anthropic.Anthropic(api_key=anthropic_key, timeout=timeout)
-            msg = client.messages.create(
+            msg = call_with_backoff(
+                "anthropic",
+                client.messages.create,
                 model=_ANTHROPIC_MODEL,
                 max_tokens=max_tokens,
                 system=system,

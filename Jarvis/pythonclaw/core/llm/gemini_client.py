@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional
 import google.generativeai as genai
 from google.generativeai.types import content_types
 
+from ..rate_limit import call_with_backoff
 from .base import LLMProvider
 from .response import MockChoice, MockFunction, MockMessage, MockResponse, MockToolCall
 
@@ -101,7 +102,9 @@ class GeminiProvider(LLMProvider):
             if isinstance(first_parts, list):
                 first_parts.insert(0, f"System Instruction: {system_instruction}")
 
-        response = self.model.generate_content(
+        response = call_with_backoff(
+            "gemini",
+            self.model.generate_content,
             contents=gemini_history,
             tools=gemini_tools,
             request_options={"timeout": 300},
@@ -162,7 +165,12 @@ class GeminiProvider(LLMProvider):
                     try:
                         import urllib.request
 
-                        resp = urllib.request.urlopen(url, timeout=15)
+                        resp = call_with_backoff(
+                            "image_fetch",
+                            urllib.request.urlopen,
+                            url,
+                            timeout=15,
+                        )
                         data = resp.read()
                         ct = resp.headers.get(
                             "Content-Type", "image/jpeg"

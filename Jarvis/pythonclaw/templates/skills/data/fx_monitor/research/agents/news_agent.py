@@ -33,6 +33,8 @@ import os
 import re
 import sys
 import time
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
 
@@ -56,6 +58,8 @@ _NEWS_CACHE_FILE: str = os.path.expanduser(
 _MAX_ARTICLES: int   = 10      # max articles sent to LLM
 _MAX_FINDINGS: int   = 8       # max findings in AgentOutput
 _MAX_CONFIDENCE: float = 0.70  # news headlines have limited reliability
+_CACHE_MAX_AGE_HOURS: float = 12.0
+_ARTICLE_MAX_AGE_HOURS: float = 48.0
 
 _LLM_MODEL:      str = "deepseek-chat"
 _LLM_MAX_TOKENS: int = 800
@@ -129,6 +133,52 @@ def _refresh_news_via_monitor() -> tuple[list[dict[str, Any]], str | None, str]:
 def _cache_reader_is_mocked() -> bool:
     """Return True in standalone tests that patch _read_news_cache."""
     return _read_news_cache.__class__.__module__.startswith("unittest.mock")
+
+
+def _parse_datetime(value: str | None) -> datetime | None:
+    """Parse ISO or RFC2822-ish timestamps from cache/news RSS."""
+    if not value:
+        return None
+    text = str(value).strip()
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        try:
+            dt = parsedate_to_datetime(text)
+        except (TypeError, ValueError, IndexError, AttributeError):
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _age_hours(value: str | None, now: datetime | None = None) -> float | None:
+    dt = _parse_datetime(value)
+    if dt is None:
+        return None
+    ref = now or datetime.now(timezone.utc)
+    return max(0.0, (ref - dt).total_seconds() / 3600.0)
+
+
+def _news_cache_stale(
+    articles: list[dict[str, Any]],
+    updated_at: str,
+) -> tuple[bool, str | None]:
+    """Return whether cached news is too old for research use."""
+    now = datetime.now(timezone.utc)
+    cache_age = _age_hours(updated_at, now)
+    if cache_age is None:
+        return True, "news_cache_updated_at_missing"
+    if cache_age > _CACHE_MAX_AGE_HOURS:
+        return True, f"news_cache_stale:{cache_age:.0f}h"
+
+    article_ages = [
+        age for age in (_age_hours(a.get("published"), now) for a in articles)
+        if age is not None
+    ]
+    if article_ages and min(article_ages) > _ARTICLE_MAX_AGE_HOURS:
+        return True, f"news_articles_stale:{min(article_ages):.0f}h"
+    return False, None
 
 
 # _call_llm is imported from llm_bridge (Anthropic → DeepSeek fallback)
@@ -276,6 +326,22 @@ def _collect_and_analyse() -> dict[str, Any]:
         articles = refreshed
         updated_at = refresh_at
         cache_error = None
+    else:
+        stale, stale_reason = _news_cache_stale(articles, updated_at)
+        if stale and not _cache_reader_is_mocked():
+            refreshed, refresh_error, refresh_at = _refresh_news_via_monitor()
+            if refresh_error:
+                return {
+                    "articles": [],
+                    "llm_text": "",
+                    "tokens": {},
+                    "cache_error": f"{stale_reason}; {refresh_error}",
+                    "updated_at": updated_at or refresh_at,
+                    "no_recent_news": True,
+                }
+            articles = refreshed
+            updated_at = refresh_at
+            cache_error = None
 
     prompt = _build_llm_prompt(articles)
     llm_text, tokens = _call_llm(prompt, _SYSTEM_PROMPT)
@@ -302,6 +368,17 @@ def _build_news_output(
     # ── Cache error → partial ─────────────────────────────────────────────
     if raw.get("cache_error"):
         missing.append(raw["cache_error"])
+        if raw.get("no_recent_news"):
+            return AgentOutput(
+                agent_name=agent_name,
+                status="partial",
+                summary="暂无近期相关新闻，新闻信号未纳入本次研究",
+                missing_data=missing,
+                latency_ms=latency_ms,
+                confidence=0.0,
+                token_usage={},
+                regulatory_flags=[],
+            )
         return AgentOutput(
             agent_name=agent_name,
             status="partial",

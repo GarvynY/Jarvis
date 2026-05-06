@@ -11,6 +11,7 @@ from typing import Any
 
 from openai import OpenAI
 
+from ..rate_limit import call_with_backoff, rate_limit_context
 from .base import LLMProvider
 from .response import MockChoice, MockFunction, MockMessage, MockResponse, MockToolCall
 
@@ -25,6 +26,7 @@ class OpenAICompatibleProvider(LLMProvider):
             timeout=300.0,
         )
         self.model_name = model_name
+        self.rate_limit_provider = _provider_from_base_url(base_url)
 
     def chat(
         self,
@@ -42,7 +44,11 @@ class OpenAICompatibleProvider(LLMProvider):
             req["tools"] = tools
             req["tool_choice"] = tool_choice
 
-        return self.client.chat.completions.create(**req)
+        return call_with_backoff(
+            self.rate_limit_provider,
+            self.client.chat.completions.create,
+            **req,
+        )
 
     def chat_stream(
         self,
@@ -65,33 +71,34 @@ class OpenAICompatibleProvider(LLMProvider):
         content_text = ""
         tool_calls_acc: dict[int, dict] = {}
 
-        for chunk in self.client.chat.completions.create(**req):
-            delta = chunk.choices[0].delta if chunk.choices else None
-            if delta is None:
-                continue
+        with rate_limit_context(self.rate_limit_provider):
+            for chunk in self.client.chat.completions.create(**req):
+                delta = chunk.choices[0].delta if chunk.choices else None
+                if delta is None:
+                    continue
 
-            if delta.content:
-                content_text += delta.content
-                yield {"type": "text_delta", "text": delta.content}
+                if delta.content:
+                    content_text += delta.content
+                    yield {"type": "text_delta", "text": delta.content}
 
-            if delta.tool_calls:
-                for tc_delta in delta.tool_calls:
-                    idx = tc_delta.index
-                    if idx not in tool_calls_acc:
-                        tool_calls_acc[idx] = {
-                            "id": tc_delta.id or "",
-                            "name": "",
-                            "args": "",
-                        }
-                    if tc_delta.id:
-                        tool_calls_acc[idx]["id"] = tc_delta.id
-                    if tc_delta.function:
-                        if tc_delta.function.name:
-                            tool_calls_acc[idx]["name"] = tc_delta.function.name
-                        if tc_delta.function.arguments:
-                            tool_calls_acc[idx]["args"] += (
-                                tc_delta.function.arguments
-                            )
+                if delta.tool_calls:
+                    for tc_delta in delta.tool_calls:
+                        idx = tc_delta.index
+                        if idx not in tool_calls_acc:
+                            tool_calls_acc[idx] = {
+                                "id": tc_delta.id or "",
+                                "name": "",
+                                "args": "",
+                            }
+                        if tc_delta.id:
+                            tool_calls_acc[idx]["id"] = tc_delta.id
+                        if tc_delta.function:
+                            if tc_delta.function.name:
+                                tool_calls_acc[idx]["name"] = tc_delta.function.name
+                            if tc_delta.function.arguments:
+                                tool_calls_acc[idx]["args"] += (
+                                    tc_delta.function.arguments
+                                )
 
         mock_tool_calls = [
             MockToolCall(
@@ -107,3 +114,18 @@ class OpenAICompatibleProvider(LLMProvider):
                 tool_calls=mock_tool_calls or None,
             ))
         ])
+
+
+def _provider_from_base_url(base_url: str) -> str:
+    lowered = (base_url or "").lower()
+    if "deepseek" in lowered:
+        return "deepseek"
+    if "api.openai.com" in lowered:
+        return "openai"
+    if "x.ai" in lowered:
+        return "openai_compatible"
+    if "moonshot" in lowered:
+        return "openai_compatible"
+    if "bigmodel" in lowered or "zhipu" in lowered:
+        return "openai_compatible"
+    return "openai_compatible"
