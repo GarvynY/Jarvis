@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import copy
 import json
 import os
 import re
@@ -70,7 +71,7 @@ _MAX_RESULTS_TO_LLM:    int  = 10   # total results passed to LLM
 _MAX_FINDINGS:          int  = 8    # max findings in AgentOutput
 _MAX_CONFIDENCE:        float = 0.75
 
-_LLM_MODEL:      str = "claude-haiku-4-5-20251001"
+_LLM_MODEL:      str = "deepseek-chat"
 _LLM_MAX_TOKENS: int = 1000
 
 _SYSTEM_PROMPT: str = (
@@ -86,6 +87,8 @@ _BANNED_TERMS: tuple[str, ...] = (
 )
 _SAFE_REPLACEMENT = "（已移除确定性建议）"
 _VALID_DIRECTIONS = {"bullish_aud", "bearish_aud", "neutral"}
+_CACHE_TTL_SECONDS: float = 180.0
+_COLLECT_CACHE: dict[tuple[int, int], tuple[float, dict[str, Any]]] = {}
 
 
 # ── Search layer (mockable) ───────────────────────────────────────────────────
@@ -364,6 +367,25 @@ def _collect_and_analyse() -> dict[str, Any]:
     }
 
 
+def _collect_and_analyse_cached() -> dict[str, Any]:
+    """Return cached macro research data for short repeated invocations."""
+    now = time.monotonic()
+    cache_key = (id(_search_once), id(_call_llm))
+    cached = _COLLECT_CACHE.get(cache_key)
+    if cached and now - cached[0] < _CACHE_TTL_SECONDS:
+        cached_raw = cached[1]
+        raw = copy.deepcopy(cached_raw)
+        raw["cache_hit"] = True
+        raw["tokens"] = {"prompt_tokens": 0, "completion_tokens": 0}
+        return raw
+
+    raw = _collect_and_analyse()
+    _COLLECT_CACHE[cache_key] = (now, copy.deepcopy(raw))
+    raw = copy.deepcopy(raw)
+    raw["cache_hit"] = False
+    return raw
+
+
 # ── Output builder (pure — no I/O, no LLM) ───────────────────────────────────
 
 def _build_macro_output(
@@ -399,7 +421,8 @@ def _build_macro_output(
         )
 
     # ── LLM unavailable note ──────────────────────────────────────────────
-    llm_used = bool(llm_text and tokens)
+    cache_hit = bool(raw.get("cache_hit"))
+    llm_used = bool(llm_text and (tokens or cache_hit))
     if not llm_used:
         missing.append("llm_unavailable_used_raw_results")
         tokens = {
@@ -497,7 +520,7 @@ class MacroAgent:
             )
             raw: dict[str, Any] = await loop.run_in_executor(
                 executor,
-                _collect_and_analyse,
+                _collect_and_analyse_cached,
             )
         except Exception as exc:
             return AgentOutput.make_error(

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import copy
 import sys
 import time
 from pathlib import Path
@@ -61,6 +62,25 @@ _HIGH_VOLATILITY_STD: float = 0.003
 
 # Confidence ceiling — bank scraping and real-time sources are not perfectly reliable
 _MAX_CONFIDENCE: float = 0.85
+_CACHE_TTL_SECONDS: float = 180.0
+_FETCH_CACHE: dict[tuple[str, int], tuple[float, dict[str, Any]]] = {}
+
+
+def _fetch_rate_cached(period: str = "90d") -> dict[str, Any]:
+    """Fetch FX data with a short in-memory TTL to avoid duplicate HTTP bursts."""
+    now = time.monotonic()
+    cache_key = (period, id(_fetch_rate))
+    cached = _FETCH_CACHE.get(cache_key)
+    if cached and now - cached[0] < _CACHE_TTL_SECONDS:
+        data = copy.deepcopy(cached[1])
+        data["_cache"] = {"hit": True, "ttl_seconds": _CACHE_TTL_SECONDS}
+        return data
+
+    data = _fetch_rate(period)
+    _FETCH_CACHE[cache_key] = (now, copy.deepcopy(data))
+    data = copy.deepcopy(data)
+    data["_cache"] = {"hit": False, "ttl_seconds": _CACHE_TTL_SECONDS}
+    return data
 
 
 def _sanitise_pair(pair: str) -> str:
@@ -136,7 +156,7 @@ class FXAgent:
                 thread_name_prefix="fx-agent",
             )
             data: dict[str, Any] = await loop.run_in_executor(
-                executor, _fetch_rate, "90d"
+                executor, _fetch_rate_cached, "90d"
             )
         except Exception as exc:
             return AgentOutput.make_error(

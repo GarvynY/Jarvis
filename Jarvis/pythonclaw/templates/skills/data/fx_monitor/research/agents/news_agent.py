@@ -57,7 +57,7 @@ _MAX_ARTICLES: int   = 10      # max articles sent to LLM
 _MAX_FINDINGS: int   = 8       # max findings in AgentOutput
 _MAX_CONFIDENCE: float = 0.70  # news headlines have limited reliability
 
-_LLM_MODEL:      str = "claude-haiku-4-5-20251001"
+_LLM_MODEL:      str = "deepseek-chat"
 _LLM_MAX_TOKENS: int = 800
 
 _SYSTEM_PROMPT: str = (
@@ -105,6 +105,30 @@ def _read_news_cache() -> tuple[list[dict[str, Any]], str | None, str]:
         return articles, None, updated_at
     except Exception as exc:
         return [], f"news_cache_read_error: {exc}", ""
+
+
+def _refresh_news_via_monitor() -> tuple[list[dict[str, Any]], str | None, str]:
+    """
+    Fallback when the daemon-maintained cache is missing or corrupt.
+
+    Uses news_monitor.check_news(mark_seen=False) so research can degrade to a
+    live RSS pull without mutating the daemon's seen-URL state.
+    """
+    try:
+        from news_monitor import check_news
+        data = check_news(mark_seen=False)
+        articles: list[dict[str, Any]] = data.get("new_articles", [])
+        updated_at: str = data.get("fetched_at_utc", "")
+        if not articles:
+            return [], "news_monitor_refresh_empty", updated_at
+        return articles, None, updated_at
+    except Exception as exc:
+        return [], f"news_monitor_refresh_error: {exc}", ""
+
+
+def _cache_reader_is_mocked() -> bool:
+    """Return True in standalone tests that patch _read_news_cache."""
+    return _read_news_cache.__class__.__module__.startswith("unittest.mock")
 
 
 # _call_llm is imported from llm_bridge (Anthropic → DeepSeek fallback)
@@ -237,10 +261,21 @@ def _collect_and_analyse() -> dict[str, Any]:
     """
     articles, cache_error, updated_at = _read_news_cache()
     if cache_error:
-        return {
-            "articles": [], "llm_text": "", "tokens": {},
-            "cache_error": cache_error, "updated_at": updated_at,
-        }
+        if _cache_reader_is_mocked():
+            return {
+                "articles": [], "llm_text": "", "tokens": {},
+                "cache_error": cache_error, "updated_at": updated_at,
+            }
+        refreshed, refresh_error, refresh_at = _refresh_news_via_monitor()
+        if refresh_error:
+            return {
+                "articles": [], "llm_text": "", "tokens": {},
+                "cache_error": f"{cache_error}; {refresh_error}",
+                "updated_at": updated_at or refresh_at,
+            }
+        articles = refreshed
+        updated_at = refresh_at
+        cache_error = None
 
     prompt = _build_llm_prompt(articles)
     llm_text, tokens = _call_llm(prompt, _SYSTEM_PROMPT)

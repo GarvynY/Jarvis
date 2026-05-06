@@ -964,6 +964,7 @@ class TelegramBot:
         t0 = time.monotonic()
 
         try:
+            await notice.edit_text("🧭 正在分解研究主题与读取安全偏好…")
             _ensure_research_path()
             import importlib as _importlib  # noqa: PLC0415
             _coord  = _importlib.import_module("coordinator")
@@ -978,6 +979,7 @@ class TelegramBot:
                 "[Telegram] /fx_research user_id=%s — calling run_research", user_id
             )
 
+            await notice.edit_text("🔎 正在使用多元 Agent 挖掘汇率、新闻与宏观信号…")
             task, outputs, cost_estimate = await run_research(
                 preset_name="fx_cnyaud",
                 user_id=user_id,
@@ -993,6 +995,7 @@ class TelegramBot:
             if preset is None:
                 raise ValueError(f"Preset {task.preset_name!r} not found in registry")
 
+            await notice.edit_text("🧠 核心大脑正在校验证据并组装研究简报…")
             brief = await SupervisorWriter().run(task, preset, outputs, cost_estimate)
 
             latency_s = time.monotonic() - t0

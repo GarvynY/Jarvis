@@ -66,10 +66,13 @@ AGENT_REGISTRY: dict[str, type] = {
     # "sentiment_agent": SentimentAgent,   ← future
 }
 
-# ── Haiku pricing (approximate, USD per token) ────────────────────────────────
-# claude-haiku-4-5-20251001: $0.25 / 1M input, $1.25 / 1M output
-_HAIKU_INPUT_PER_TOKEN  = 0.25  / 1_000_000
-_HAIKU_OUTPUT_PER_TOKEN = 1.25  / 1_000_000
+# ── DeepSeek pricing (USD per token) ──────────────────────────────────────────
+# Official deepseek-chat pricing, USD per 1M tokens:
+#   cache miss input: $0.27, output: $1.10
+# This estimate intentionally ignores cache-hit discounts because token_usage
+# from the SDK does not identify cache-hit tokens.
+_DEEPSEEK_CHAT_INPUT_PER_TOKEN  = 0.27 / 1_000_000
+_DEEPSEEK_CHAT_OUTPUT_PER_TOKEN = 1.10 / 1_000_000
 
 
 # ── CostEstimate helper ───────────────────────────────────────────────────────
@@ -95,8 +98,8 @@ def _compute_cost(
 
     estimated_tokens   = total_input + total_output
     estimated_cost_usd = (
-        total_input  * _HAIKU_INPUT_PER_TOKEN
-        + total_output * _HAIKU_OUTPUT_PER_TOKEN
+        total_input  * _DEEPSEEK_CHAT_INPUT_PER_TOKEN
+        + total_output * _DEEPSEEK_CHAT_OUTPUT_PER_TOKEN
     )
 
     # phase-1 agents ran in parallel → wall time ≈ max latency
