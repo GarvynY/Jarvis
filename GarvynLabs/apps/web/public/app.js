@@ -25,6 +25,12 @@ const CATEGORY_META = {
   }
 };
 
+const JARVIS_SUBCATEGORIES = [
+  { key: "fix-updates", title: "修复更新" },
+  { key: "product-iteration", title: "产品迭代" },
+  { key: "product-analysis", title: "产品分析" }
+];
+
 let manifest = { articles: [] };
 let manifestSignature = "";
 
@@ -102,7 +108,7 @@ async function loadManifest() {
 
 function signatureForManifest(data) {
   const articles = (data.articles || [])
-    .map((article) => `${article.slug}:${article.category}:${article.title}:${article.summary}:${article.date}:${article.file}`)
+    .map((article) => `${article.slug}:${article.category}:${article.subcategory || ""}:${article.title}:${article.summary}:${article.date}:${article.file}`)
     .sort()
     .join("|");
   return `${data.updatedAt || ""}:${articles}`;
@@ -114,10 +120,19 @@ function articlesFor(category) {
     .sort((a, b) => String(b.date || "").localeCompare(String(a.date || "")));
 }
 
+function jarvisSubcategoryKey(article) {
+  return JARVIS_SUBCATEGORIES.some((item) => item.key === article.subcategory) ? article.subcategory : "product-iteration";
+}
+
+function jarvisSubcategoryLabel(article) {
+  return JARVIS_SUBCATEGORIES.find((item) => item.key === jarvisSubcategoryKey(article))?.title || "产品迭代";
+}
+
 function articleCard(article) {
+  const isPdf = article.kind === "pdf" || String(article.file || "").toLowerCase().endsWith(".pdf");
   return `
     <a class="article-card" href="/article/?slug=${encodeURIComponent(article.slug)}">
-      <span class="article-meta">${article.date || ""} · ${CATEGORY_META[article.category]?.title || ""}</span>
+      <span class="article-meta">${article.date || ""} · ${CATEGORY_META[article.category]?.title || ""}${article.category === "jarvis" ? ` · ${jarvisSubcategoryLabel(article)}` : ""}${isPdf ? " · PDF" : ""}</span>
       <h2>${escapeHtml(article.title)}</h2>
       <p>${escapeHtml(article.summary || "")}</p>
     </a>
@@ -170,6 +185,10 @@ function renderCategory(category) {
 
 function renderJarvis() {
   const articles = articlesFor("jarvis");
+  const groups = JARVIS_SUBCATEGORIES.map((subcategory) => {
+    const groupedArticles = articles.filter((article) => jarvisSubcategoryKey(article) === subcategory.key);
+    return { ...subcategory, articles: groupedArticles };
+  }).filter((group) => group.articles.length);
   app.innerHTML = `
     <section class="jarvis-hero">
       <div class="jarvis-panel">
@@ -180,9 +199,21 @@ function renderJarvis() {
     </section>
     <section class="section">
       <div class="section-inner">
-        <div class="articles">
-          ${articles.length ? articles.map(articleCard).join("") : `<div class="empty">Jarvis 的专题笔记结构还在整理中。</div>`}
-        </div>
+        ${groups.length ? `
+          <div class="jarvis-groups">
+            ${groups.map((group) => `
+              <section class="jarvis-group">
+                <div class="jarvis-group-heading">
+                  <h2>${group.title}</h2>
+                  <span>${group.articles.length}</span>
+                </div>
+                <div class="articles">
+                  ${group.articles.map(articleCard).join("")}
+                </div>
+              </section>
+            `).join("")}
+          </div>
+        ` : `<div class="empty">Jarvis 的专题笔记结构还在整理中。</div>`}
       </div>
     </section>
   `;
@@ -194,19 +225,25 @@ async function renderArticle(slug) {
     app.innerHTML = `<section class="article-shell"><article class="article"><h1>文章不存在</h1><p>没有找到这篇笔记。</p></article></section>`;
     return;
   }
+  if (article.kind === "pdf" || String(article.file || "").toLowerCase().endsWith(".pdf")) {
+    await renderPdfArticle(article);
+    return;
+  }
   try {
     const res = await fetch(`${article.file}?v=${Date.now()}`, { cache: "no-store" });
     const raw = res.ok ? await res.text() : "# 加载失败\n\n这篇笔记暂时无法读取。";
     const body = renderMarkdown(raw);
     app.innerHTML = `
       <section class="article-shell">
+        <aside class="article-toc" id="articleToc" aria-label="文章目录"></aside>
         <article class="article">
-          <span class="article-meta">${article.date || ""} · ${CATEGORY_META[article.category]?.title || ""}</span>
+          <span class="article-meta">${article.date || ""} · ${CATEGORY_META[article.category]?.title || ""}${article.category === "jarvis" ? ` · ${jarvisSubcategoryLabel(article)}` : ""}</span>
           <h1>${escapeHtml(article.title)}</h1>
           <div class="article-body">${body}</div>
         </article>
       </section>
     `;
+    buildArticleToc();
     const highlighter = window.hljs;
     if (highlighter?.highlightElement) {
       document.querySelectorAll("pre code").forEach((block) => highlighter.highlightElement(block));
@@ -221,6 +258,42 @@ async function renderArticle(slug) {
       </section>
     `;
   }
+}
+
+async function renderPdfArticle(article) {
+  const file = `${article.file}?v=${Date.now()}`;
+  let body = "";
+  if (article.bodyFile) {
+    try {
+      const res = await fetch(`${article.bodyFile}?v=${Date.now()}`, { cache: "no-store" });
+      body = res.ok ? await res.text() : "";
+    } catch (error) {
+      body = "";
+    }
+  }
+  const renderedBody = body ? renderMarkdown(body) : `<p>这份 PDF 暂时没有可渲染的网页正文。</p>`;
+  app.innerHTML = `
+    <section class="article-shell">
+      <aside class="article-toc" id="articleToc" aria-label="文章目录"></aside>
+      <article class="article pdf-article">
+        <span class="article-meta">${article.date || ""} · ${CATEGORY_META[article.category]?.title || ""}${article.category === "jarvis" ? ` · ${jarvisSubcategoryLabel(article)}` : ""} · PDF</span>
+        <h1>${escapeHtml(article.title)}</h1>
+        ${article.summary ? `<p class="pdf-summary">${escapeHtml(article.summary)}</p>` : ""}
+        <div class="pdf-document">
+          <div>
+            <span class="pdf-label">PDF 原件</span>
+            <p>下面是从 PDF 提取并生成的网页正文。</p>
+          </div>
+          <div class="pdf-actions">
+            <a href="${file}" target="_blank" rel="noopener">打开 PDF</a>
+            <a href="${file}" download>下载 PDF</a>
+          </div>
+        </div>
+        <div class="article-body">${renderedBody}</div>
+      </article>
+    </section>
+  `;
+  buildArticleToc();
 }
 
 function renderMarkdown(raw) {
@@ -243,8 +316,8 @@ function renderMarkdown(raw) {
   });
   const html = md.render(source);
   return DOMPurify.sanitize(html, {
-    ADD_TAGS: ["mark", "input"],
-    ADD_ATTR: ["class", "target", "rel", "type", "checked", "disabled"]
+    ADD_TAGS: ["mark", "input", "img"],
+    ADD_ATTR: ["class", "target", "rel", "type", "checked", "disabled", "src", "alt", "title", "loading"]
   });
 }
 
@@ -267,6 +340,66 @@ function escapeHtml(value) {
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#039;");
+}
+
+function slugForHeading(value, index) {
+  const slug = String(value || "")
+    .normalize("NFKC")
+    .toLowerCase()
+    .trim()
+    .replace(/[^\p{Letter}\p{Number}]+/gu, "-")
+    .replace(/^-+|-+$/g, "");
+  return slug || `heading-${index + 1}`;
+}
+
+function buildArticleToc() {
+  const toc = document.getElementById("articleToc");
+  const body = document.querySelector(".article-body");
+  if (!toc || !body) return;
+  const headings = [...body.querySelectorAll("h2, h3, h4")];
+  if (headings.length < 2) {
+    toc.remove();
+    return;
+  }
+  const used = new Map();
+  const items = headings.map((heading, index) => {
+    const base = slugForHeading(heading.textContent, index);
+    const count = used.get(base) || 0;
+    used.set(base, count + 1);
+    const id = count ? `${base}-${count + 1}` : base;
+    heading.id = id;
+    return {
+      id,
+      text: heading.textContent.trim(),
+      level: heading.tagName.toLowerCase()
+    };
+  });
+  toc.innerHTML = `
+    <div class="toc-title">目录</div>
+    <nav>
+      ${items.map((item) => `<a class="toc-link toc-${item.level}" href="#${encodeURIComponent(item.id)}">${escapeHtml(item.text)}</a>`).join("")}
+    </nav>
+  `;
+  const links = [...toc.querySelectorAll("a")];
+  links.forEach((link) => {
+    link.addEventListener("click", (event) => {
+      event.preventDefault();
+      const id = decodeURIComponent(link.getAttribute("href").slice(1));
+      document.getElementById(id)?.scrollIntoView({ behavior: "smooth", block: "start" });
+      history.replaceState({}, "", `${location.pathname}${location.search}#${encodeURIComponent(id)}`);
+    });
+  });
+  if ("IntersectionObserver" in window) {
+    const byId = new Map(links.map((link) => [decodeURIComponent(link.getAttribute("href").slice(1)), link]));
+    const observer = new IntersectionObserver((entries) => {
+      const visible = entries
+        .filter((entry) => entry.isIntersecting)
+        .sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top)[0];
+      if (!visible) return;
+      links.forEach((link) => link.classList.toggle("active", link === byId.get(visible.target.id)));
+    }, { rootMargin: "-130px 0px -68% 0px", threshold: 0 });
+    headings.forEach((heading) => observer.observe(heading));
+  }
 }
 
 async function route(options = {}) {
