@@ -1,0 +1,28 @@
+{
+  "articles": [
+    {
+      "slug": "ai-news-first-signal",
+      "category": "ai-news",
+      "title": "AI 动态追踪的第一条记录",
+      "summary": "建立 AI 动态追踪栏目，用来记录模型、产品和行业变化。",
+      "date": "2026-05-07",
+      "file": "/content/ai-news/ai-news-first-signal.md"
+    },
+    {
+      "slug": "agent-product-thinking",
+      "category": "ai-thinking",
+      "title": "为什么 Agent 产品需要长期记忆",
+      "summary": "从 Jarvis 的实践出发，记录 Agent 产品中上下文、信任和可控性的关系。",
+      "date": "2026-05-07",
+      "file": "/content/ai-thinking/agent-product-thinking.md"
+    },
+    {
+      "slug": "rate-limit-architecture",
+      "category": "ai-technology",
+      "title": "外部接口并发墙与 Provider 级限流",
+      "summary": "记录 Jarvis 从单机 Semaphore 到未来 Redis 分布式 limiter 的架构预埋。",
+      "date": "2026-05-07",
+      "file": "/content/ai-technology/rate-limit-architecture.md"
+    }
+  ]
+}

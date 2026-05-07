@@ -28,3 +28,9 @@ pythonclaw.json
 # Temp / scratch
 tmp/
 note.md
+
+# backup
+jarvis-runtime-backup-20260506-160845.tar.gz
+
+# key
+Jarvis-Server_key.pem
