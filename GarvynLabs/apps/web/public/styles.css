@@ -301,6 +301,10 @@ body {
 .article-body h2,
 .article-body h3 { margin-top: 34px; }
 .article-body p { color: #334155; }
+.article-body strong {
+  color: var(--ink);
+  font-weight: 800;
+}
 .article-body a { color: var(--blue); }
 .article-body blockquote {
   margin: 24px 0;

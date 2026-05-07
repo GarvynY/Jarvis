@@ -11,6 +11,7 @@ import base64
 import json
 import os
 import re
+import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -25,7 +26,13 @@ HOST = os.environ.get("GARVYNLABS_ADMIN_HOST", "127.0.0.1")
 PORT = int(os.environ.get("GARVYNLABS_ADMIN_PORT", "8090"))
 
 CATEGORIES = {"ai-news", "ai-thinking", "ai-technology", "jarvis"}
-SLUG_RE = re.compile(r"[^a-z0-9-]+")
+CATEGORY_LABELS = {
+    "jarvis": "Jarvis",
+    "ai-news": "AI动态",
+    "ai-thinking": "AI产品思考",
+    "ai-technology": "AI产品技术",
+}
+SLUG_RE = re.compile(r"[^\w-]+", re.UNICODE)
 
 
 ADMIN_HTML = """<!doctype html>
@@ -49,7 +56,9 @@ ADMIN_HTML = """<!doctype html>
     button.primary { background:var(--teal); color:white; border-color:var(--teal); }
     button.danger { color:#b42318; border-color:#f3b7b1; }
     button.danger:disabled { color:#9aa4b2; border-color:var(--line); cursor:not-allowed; }
-    .list { display:grid; gap:8px; margin-top:12px; }
+    .list { display:grid; gap:14px; margin-top:12px; }
+    .group { display:grid; gap:8px; }
+    .group-title { margin:8px 0 0; padding-bottom:6px; border-bottom:1px solid var(--line); font-size:13px; color:var(--muted); font-weight:700; }
     .item { display:grid; grid-template-columns:24px minmax(0,1fr); gap:8px; align-items:start; text-align:left; padding:10px; border:1px solid var(--line); border-radius:6px; background:#fff; }
     .item input { width:auto; margin-top:3px; }
     .item strong { display:block; }
@@ -88,6 +97,7 @@ ADMIN_HTML = """<!doctype html>
     let current = null;
     const $ = (id) => document.getElementById(id);
     const CATS = ['ai-news', 'ai-thinking', 'ai-technology', 'jarvis'];
+    const CAT_LABELS = { 'jarvis': 'Jarvis', 'ai-news': 'AI动态', 'ai-thinking': 'AI产品思考', 'ai-technology': 'AI产品技术' };
 
     function parseFrontmatter(text) {
       const m = text.match(/^---\\r?\\n([\\s\\S]*?)\\r?\\n---\\r?\\n?([\\s\\S]*)$/);
@@ -106,7 +116,18 @@ ADMIN_HTML = """<!doctype html>
 
     function today() { return new Date().toISOString().slice(0, 10); }
     function slugify(value) {
-      return String(value).toLowerCase().trim().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+      return String(value)
+        .normalize("NFKC")
+        .toLowerCase()
+        .trim()
+        .replace(/[^\\p{Letter}\\p{Number}]+/gu, "-")
+        .replace(/^-+|-+$/g, "");
+    }
+    function escapeHtml(value) {
+      return String(value || "").replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;").replaceAll("'", "&#039;");
+    }
+    function notifyPublicSite() {
+      localStorage.setItem("garvynlabs-content-updated", String(Date.now()));
     }
     function selectedSlugs() {
       return [...document.querySelectorAll(".article-check:checked")].map((item) => item.value);
@@ -131,13 +152,24 @@ ADMIN_HTML = """<!doctype html>
     }
     async function load() {
       manifest = await api("/api/articles");
-      $("articles").innerHTML = manifest.articles.map((a) => `
-        <div class="item" data-slug="${a.slug}">
-          <input class="article-check" type="checkbox" value="${a.slug}" aria-label="选择 ${a.title}">
-          <button type="button" data-open="${a.slug}" style="padding:0;border:0;background:transparent;text-align:left">
-            <strong>${a.title}</strong><span>${a.date || ""} · ${a.category}</span>
-          </button>
-        </div>`).join("");
+      const groups = CATS.map((category) => {
+        const articles = (manifest.articles || [])
+          .filter((a) => a.category === category)
+          .sort((a, b) => String(b.date || "").localeCompare(String(a.date || "")) || String(a.title || "").localeCompare(String(b.title || "")));
+        if (!articles.length) return "";
+        return `
+          <div class="group">
+            <div class="group-title">${CAT_LABELS[category]} · ${articles.length}</div>
+            ${articles.map((a) => `
+              <div class="item" data-slug="${escapeHtml(a.slug)}">
+                <input class="article-check" type="checkbox" value="${escapeHtml(a.slug)}" aria-label="选择 ${escapeHtml(a.title)}">
+                <button type="button" data-open="${escapeHtml(a.slug)}" style="padding:0;border:0;background:transparent;text-align:left">
+                  <strong>${escapeHtml(a.title)}</strong><span>${escapeHtml(a.date || "")} · ${escapeHtml(a.slug)}</span>
+                </button>
+              </div>`).join("")}
+          </div>`;
+      }).join("");
+      $("articles").innerHTML = groups || `<div class="empty">还没有 Markdown 文档。</div>`;
       document.querySelectorAll("[data-open]").forEach((item) => item.onclick = () => openArticle(item.dataset.open));
       document.querySelectorAll(".article-check").forEach((item) => item.onchange = updateDeleteSelectedState);
       updateDeleteSelectedState();
@@ -178,6 +210,7 @@ ADMIN_HTML = """<!doctype html>
       $("status").textContent = "保存中...";
       const saved = await api("/api/article", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(payload) });
       $("status").textContent = `已保存：${saved.slug}`;
+      notifyPublicSite();
       await load();
       await openArticle(saved.slug);
     };
@@ -189,6 +222,7 @@ ADMIN_HTML = """<!doctype html>
       for (const slug of slugs) {
         await api(`/api/article?slug=${encodeURIComponent(slug)}`, { method: "DELETE" });
       }
+      notifyPublicSite();
       await load();
       if (current && slugs.includes(current.slug)) clearEditor(`已删除 ${slugs.length} 篇文章`);
       else $("status").textContent = `已删除 ${slugs.length} 篇文章`;
@@ -318,13 +352,15 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def _load_manifest() -> dict:
-    if not MANIFEST_PATH.exists():
-        return {"articles": []}
-    return json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
+    data = {"articles": []}
+    if MANIFEST_PATH.exists():
+        data = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
+    return _merge_disk_articles(data)
 
 
 def _write_manifest(data: dict) -> None:
     CONTENT_ROOT.mkdir(parents=True, exist_ok=True)
+    data["updatedAt"] = int(time.time() * 1000)
     MANIFEST_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
@@ -335,9 +371,93 @@ def _find_article(slug: str) -> dict | None:
     return None
 
 
+def _parse_frontmatter(text: str) -> tuple[dict, str]:
+    match = re.match(r"^---\s*\n([\s\S]*?)\n---\s*\n?([\s\S]*)$", text)
+    if not match:
+        return {}, text
+    meta = {}
+    for line in match.group(1).splitlines():
+        key, sep, value = line.partition(":")
+        if sep:
+            meta[key.strip()] = value.strip().strip("\"'")
+    return meta, match.group(2)
+
+
+def _title_from_body(body: str, fallback: str) -> str:
+    match = re.search(r"^#\s+(.+)$", body, flags=re.MULTILINE)
+    return match.group(1).strip() if match else fallback
+
+
+def _article_from_path(path: Path) -> dict | None:
+    try:
+        rel = path.resolve().relative_to(CONTENT_ROOT.resolve())
+    except ValueError:
+        return None
+    if len(rel.parts) < 2:
+        return None
+    category = rel.parts[0]
+    if category not in CATEGORIES or path.suffix.lower() != ".md":
+        return None
+    slug = path.stem
+    try:
+        text = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    meta, body = _parse_frontmatter(text)
+    return {
+        "slug": _safe_slug(meta.get("slug") or slug),
+        "category": meta.get("category") if meta.get("category") in CATEGORIES else category,
+        "title": meta.get("title") or _title_from_body(body, slug),
+        "summary": meta.get("summary", ""),
+        "date": meta.get("date", ""),
+        "file": f"/content/{category}/{path.name}",
+    }
+
+
+def _merge_disk_articles(data: dict) -> dict:
+    articles_by_slug = {
+        article.get("slug"): article
+        for article in data.get("articles", [])
+        if article.get("slug")
+    }
+    if CONTENT_ROOT.exists():
+        for category in CATEGORIES:
+            category_dir = CONTENT_ROOT / category
+            if not category_dir.exists():
+                continue
+            for path in sorted(category_dir.glob("*.md")):
+                article = _article_from_path(path)
+                if article:
+                    articles_by_slug[article["slug"]] = {**articles_by_slug.get(article["slug"], {}), **article}
+    merged = dict(data)
+    merged["articles"] = sorted(
+        articles_by_slug.values(),
+        key=lambda article: (
+            article.get("category", ""),
+            str(article.get("date", "")),
+            str(article.get("title", "")).lower(),
+        ),
+    )
+    return merged
+
+
 def _safe_slug(value: str) -> str:
-    slug = SLUG_RE.sub("-", value.lower()).strip("-")
+    slug = SLUG_RE.sub("-", str(value or "").lower()).strip("-_")
     return slug or "untitled"
+
+
+def _unique_slug(slug: str, articles: list[dict], original_slug: str = "") -> str:
+    existing = {
+        article.get("slug")
+        for article in articles
+        if article.get("slug") and article.get("slug") != original_slug
+    }
+    if slug not in existing:
+        return slug
+    index = 2
+    while f"{slug}-{index}" in existing:
+        index += 1
+    return f"{slug}-{index}"
 
 
 def _article_path(article: dict) -> Path:
@@ -356,7 +476,11 @@ def _save_article(payload: dict) -> dict:
     category = payload.get("category", "ai-news")
     if category not in CATEGORIES:
         raise ValueError("invalid category")
+    manifest = _load_manifest()
+    articles = manifest.setdefault("articles", [])
+    original_slug = payload.get("originalSlug") or ""
     slug = _safe_slug(payload.get("slug") or payload.get("title") or "untitled")
+    slug = _unique_slug(slug, articles, original_slug=original_slug)
     body = payload.get("body", "")
     article = {
         "slug": slug,
@@ -377,12 +501,9 @@ def _save_article(payload: dict) -> dict:
     )
     path.write_text(frontmatter + body.lstrip(), encoding="utf-8")
 
-    manifest = _load_manifest()
-    articles = manifest.setdefault("articles", [])
-    original_slug = payload.get("originalSlug") or slug
     replaced = False
     for index, existing in enumerate(articles):
-        if existing.get("slug") in {original_slug, slug}:
+        if original_slug and existing.get("slug") == original_slug:
             old_path = _article_path(existing)
             articles[index] = article
             replaced = True

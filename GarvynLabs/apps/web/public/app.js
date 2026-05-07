@@ -26,6 +26,7 @@ const CATEGORY_META = {
 };
 
 let manifest = { articles: [] };
+let manifestSignature = "";
 
 const app = document.getElementById("app");
 const canvas = document.getElementById("field");
@@ -85,10 +86,26 @@ function setActiveNav(route) {
 async function loadManifest() {
   try {
     const res = await fetch(`/content/manifest.json?v=${Date.now()}`, { cache: "no-store" });
-    if (res.ok) manifest = await res.json();
+    if (!res.ok) return false;
+    const nextManifest = await res.json();
+    const nextSignature = signatureForManifest(nextManifest);
+    const changed = Boolean(manifestSignature && nextSignature !== manifestSignature);
+    manifest = nextManifest;
+    manifestSignature = nextSignature;
+    return changed;
   } catch (error) {
     manifest = { articles: [] };
+    manifestSignature = "";
+    return false;
   }
+}
+
+function signatureForManifest(data) {
+  const articles = (data.articles || [])
+    .map((article) => `${article.slug}:${article.category}:${article.title}:${article.summary}:${article.date}:${article.file}`)
+    .sort()
+    .join("|");
+  return `${data.updatedAt || ""}:${articles}`;
 }
 
 function articlesFor(category) {
@@ -207,7 +224,7 @@ async function renderArticle(slug) {
 }
 
 function renderMarkdown(raw) {
-  const source = raw
+  const source = normalizeInlineMarkdown(raw)
     .replace(/^---[\s\S]*?---\s*/, "")
     .replace(/==(.+?)==/g, "<mark>$1</mark>")
     .replace(/^(\s*[-*+]) \[x\] /gim, '$1 <input type="checkbox" checked disabled class="task-cb"> ')
@@ -231,6 +248,18 @@ function renderMarkdown(raw) {
   });
 }
 
+function normalizeInlineMarkdown(raw) {
+  return String(raw || "")
+    .split(/(```[\s\S]*?```)/g)
+    .map((part) => {
+      if (part.startsWith("```")) return part;
+      return part
+        .replace(/\*\*([^*\n][^*\n]*?)\*\*/g, "<strong>$1</strong>")
+        .replace(/__([^_\n][^_\n]*?)__/g, "<strong>$1</strong>");
+    })
+    .join("");
+}
+
 function escapeHtml(value) {
   return String(value || "")
     .replaceAll("&", "&amp;")
@@ -240,9 +269,9 @@ function escapeHtml(value) {
     .replaceAll("'", "&#039;");
 }
 
-async function route() {
+async function route(options = {}) {
   const next = currentRoute();
-  await loadManifest();
+  if (!options.skipManifest) await loadManifest();
   setActiveNav(next);
   if (next.type === "home") renderHome();
   if (next.type === "category") renderCategory(next.category);
@@ -251,6 +280,10 @@ async function route() {
 }
 
 window.addEventListener("popstate", route);
+window.addEventListener("storage", (event) => {
+  if (event.key === "garvynlabs-content-updated") route();
+});
+window.addEventListener("focus", () => route());
 document.addEventListener("click", (event) => {
   const link = event.target.closest("a");
   if (!link) return;
@@ -265,4 +298,8 @@ document.addEventListener("click", (event) => {
 resizeCanvas();
 window.addEventListener("resize", resizeCanvas);
 requestAnimationFrame(drawField);
-loadManifest().then(route);
+setInterval(async () => {
+  const changed = await loadManifest();
+  if (changed) route({ skipManifest: true });
+}, 1000);
+route();
