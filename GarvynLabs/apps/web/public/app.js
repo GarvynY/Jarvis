@@ -84,7 +84,7 @@ function setActiveNav(route) {
 
 async function loadManifest() {
   try {
-    const res = await fetch("/content/manifest.json", { cache: "no-store" });
+    const res = await fetch(`/content/manifest.json?v=${Date.now()}`, { cache: "no-store" });
     if (res.ok) manifest = await res.json();
   } catch (error) {
     manifest = { articles: [] };
@@ -115,7 +115,7 @@ function renderHome() {
     </section>
     <section class="section">
       <div class="section-inner intro-section">
-        <span class="eyebrow intro-tagline">AI agents, product thinking, and engineering notes.</span>
+        <span class="eyebrow intro-tagline">AI agents, Product thinking, Engineering notes</span>
         <div class="intro-grid">
           ${Object.entries(CATEGORY_META).map(([key, item], index) => `
             <a class="intro-card" href="/${key}/">
@@ -177,40 +177,57 @@ async function renderArticle(slug) {
     app.innerHTML = `<section class="article-shell"><article class="article"><h1>文章不存在</h1><p>没有找到这篇笔记。</p></article></section>`;
     return;
   }
-  const res = await fetch(article.file, { cache: "no-store" });
-  const raw = res.ok ? await res.text() : "# 加载失败\n\n这篇笔记暂时无法读取。";
-  const body = renderMarkdown(raw);
-  app.innerHTML = `
-    <section class="article-shell">
-      <article class="article">
-        <span class="article-meta">${article.date || ""} · ${CATEGORY_META[article.category]?.title || ""}</span>
-        <h1>${escapeHtml(article.title)}</h1>
-        <div class="article-body">${body}</div>
-      </article>
-    </section>
-  `;
-  document.querySelectorAll("pre code").forEach((block) => hljs.highlightElement(block));
+  try {
+    const res = await fetch(`${article.file}?v=${Date.now()}`, { cache: "no-store" });
+    const raw = res.ok ? await res.text() : "# 加载失败\n\n这篇笔记暂时无法读取。";
+    const body = renderMarkdown(raw);
+    app.innerHTML = `
+      <section class="article-shell">
+        <article class="article">
+          <span class="article-meta">${article.date || ""} · ${CATEGORY_META[article.category]?.title || ""}</span>
+          <h1>${escapeHtml(article.title)}</h1>
+          <div class="article-body">${body}</div>
+        </article>
+      </section>
+    `;
+    const highlighter = window.hljs;
+    if (highlighter?.highlightElement) {
+      document.querySelectorAll("pre code").forEach((block) => highlighter.highlightElement(block));
+    }
+  } catch (err) {
+    app.innerHTML = `
+      <section class="article-shell">
+        <article class="article">
+          <h1>渲染出错</h1>
+          <pre style="white-space:pre-wrap;color:#dc2626">${escapeHtml(err.message)}\n${escapeHtml(err.stack || "")}</pre>
+        </article>
+      </section>
+    `;
+  }
 }
 
 function renderMarkdown(raw) {
   const source = raw
     .replace(/^---[\s\S]*?---\s*/, "")
-    .replace(/==(.+?)==/g, "<mark>$1</mark>");
+    .replace(/==(.+?)==/g, "<mark>$1</mark>")
+    .replace(/^(\s*[-*+]) \[x\] /gim, '$1 <input type="checkbox" checked disabled class="task-cb"> ')
+    .replace(/^(\s*[-*+]) \[ \] /gim, '$1 <input type="checkbox" disabled class="task-cb"> ');
   const md = window.markdownit({
     html: true,
     linkify: true,
     typographer: true,
     highlight(code, lang) {
-      if (lang && hljs.getLanguage(lang)) {
-        return `<pre><code class="hljs language-${lang}">${hljs.highlight(code, { language: lang }).value}</code></pre>`;
+      const highlighter = window.hljs;
+      if (lang && highlighter?.getLanguage?.(lang) && highlighter?.highlight) {
+        return `<pre><code class="hljs language-${escapeHtml(lang)}">${highlighter.highlight(code, { language: lang }).value}</code></pre>`;
       }
       return `<pre><code class="hljs">${md.utils.escapeHtml(code)}</code></pre>`;
     }
   });
   const html = md.render(source);
   return DOMPurify.sanitize(html, {
-    ADD_TAGS: ["mark"],
-    ADD_ATTR: ["class", "target", "rel"]
+    ADD_TAGS: ["mark", "input"],
+    ADD_ATTR: ["class", "target", "rel", "type", "checked", "disabled"]
   });
 }
 
@@ -225,6 +242,7 @@ function escapeHtml(value) {
 
 async function route() {
   const next = currentRoute();
+  await loadManifest();
   setActiveNav(next);
   if (next.type === "home") renderHome();
   if (next.type === "category") renderCategory(next.category);

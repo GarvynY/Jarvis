@@ -24,9 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
-import json
 import os
-import re
 import sys
 import time
 from pathlib import Path
@@ -42,12 +40,14 @@ try:
         ResearchPreset, ResearchSection, ResearchTask, now_iso,
     )
     from .llm_bridge import call_llm as _call_llm_bridge
+    from .structured_llm import call_json_with_repair
 except ImportError:
     from schema import (  # type: ignore[no-redef]
         AgentOutput, CostEstimate, ResearchBrief,
         ResearchPreset, ResearchSection, ResearchTask, now_iso,
     )
     from llm_bridge import call_llm as _call_llm_bridge  # type: ignore[no-redef]
+    from structured_llm import call_json_with_repair  # type: ignore[no-redef]
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -169,45 +169,22 @@ def _build_prompt(
     return system, user
 
 
-def _build_repair_prompt(
-    original_user_prompt: str,
-    bad_response: str,
-    error: Exception,
-) -> str:
-    """Build a focused JSON repair prompt after parse/validation failure."""
-    clipped_response = bad_response[:4000] if bad_response else "（空响应）"
-    return (
-        f"{original_user_prompt}\n\n"
-        "━━━ 上一次输出解析失败 ━━━\n"
-        f"解析错误：{type(error).__name__}: {error}\n\n"
-        "上一次模型输出如下，请修复为严格合法 JSON：\n"
-        f"{clipped_response}\n\n"
-        "修复要求：\n"
-        "1. 只返回一个 JSON object，不要 markdown，不要解释。\n"
-        "2. 保留 required keys: conclusion, sections。\n"
-        "3. sections 必须是数组，每项包含 title, content, source_agents。\n"
-        "4. title 必须来自原任务章节列表，source_agents 只能来自可用代理名称。"
-    )
+def _validate_supervisor_json(data: dict[str, Any]) -> None:
+    sections = data.get("sections")
+    if not isinstance(sections, list):
+        raise TypeError("sections must be a list")
+    for index, section in enumerate(sections):
+        if not isinstance(section, dict):
+            raise TypeError(f"sections[{index}] must be an object")
+        for key in ("title", "content", "source_agents"):
+            if key not in section:
+                raise KeyError(f"sections[{index}] missing {key}")
 
 
 # ── LLM response parser ───────────────────────────────────────────────────────
 
-def _extract_json(text: str) -> str:
-    """Extract the first {...} block from possibly-decorated LLM output."""
-    # strip markdown code fences if present
-    fenced = re.search(r"```(?:json)?\s*(\{.*\})\s*```", text, re.DOTALL)
-    if fenced:
-        return fenced.group(1)
-    # find outermost { ... }
-    start = text.find("{")
-    end   = text.rfind("}")
-    if start != -1 and end > start:
-        return text[start : end + 1]
-    return text
-
-
-def _parse_llm_response(
-    text: str,
+def _parse_llm_payload(
+    raw: dict[str, Any],
     task: ResearchTask,
     preset: ResearchPreset,
     outputs: list[AgentOutput],
@@ -220,8 +197,6 @@ def _parse_llm_response(
     Sections are matched to preset.report_sections by title (case-insensitive).
     If the LLM omits a section it is filled with a safe placeholder.
     """
-    raw = json.loads(_extract_json(text))
-
     conclusion = str(raw.get("conclusion", ""))
     # user_notes is never taken from LLM — generated deterministically below
     user_notes = _build_user_notes(task.safe_user_context)
@@ -307,56 +282,48 @@ async def _run_llm_with_json_retries(
 ) -> ResearchBrief | None:
     """Call the supervisor LLM and retry JSON repair up to two times."""
     system, user = _build_prompt(task, preset, outputs)
-    token_usage_total = {"prompt_tokens": 0, "completion_tokens": 0}
-    llm_calls = 0
-    last_text = ""
-    current_user = user
+    schema_hint = (
+        "{\n"
+        '  "conclusion": "...",\n'
+        '  "sections": [{"title": "...", "content": "...", "source_agents": ["fx_agent"]}]\n'
+        "}"
+    )
 
-    for attempt in range(_LLM_JSON_REPAIR_RETRIES + 1):
-        with concurrent.futures.ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="supervisor-llm"
-        ) as executor:
-            loop = asyncio.get_running_loop()
-            llm_text, token_usage = await loop.run_in_executor(
-                executor, _call_llm, current_user, system, _LLM_MAX_TOKENS
-            )
-
-        llm_calls += 1
-        last_text = llm_text or ""
-        for key in ("prompt_tokens", "completion_tokens"):
-            token_usage_total[key] += int((token_usage or {}).get(key, 0) or 0)
-
-        if not last_text:
-            if attempt >= _LLM_JSON_REPAIR_RETRIES:
-                return None
-            current_user = _build_repair_prompt(
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=1, thread_name_prefix="supervisor-llm"
+    ) as executor:
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(
+            executor,
+            lambda: call_json_with_repair(
+                _call_llm,
                 user,
-                last_text,
-                ValueError("LLM returned empty response"),
-            )
-            continue
+                system,
+                max_tokens=_LLM_MAX_TOKENS,
+                required_keys=("conclusion", "sections"),
+                validate=_validate_supervisor_json,
+                repair_retries=_LLM_JSON_REPAIR_RETRIES,
+                schema_hint=schema_hint,
+            ),
+        )
 
-        try:
-            adjusted_cost = CostEstimate(
-                llm_calls=cost_estimate.llm_calls + llm_calls - 1,
-                estimated_tokens=cost_estimate.estimated_tokens,
-                estimated_cost_usd=cost_estimate.estimated_cost_usd,
-                total_latency_ms=cost_estimate.total_latency_ms,
-            )
-            return _parse_llm_response(
-                last_text,
-                task,
-                preset,
-                outputs,
-                adjusted_cost,
-                token_usage_total,
-            )
-        except Exception as exc:  # noqa: BLE001
-            if attempt >= _LLM_JSON_REPAIR_RETRIES:
-                return None
-            current_user = _build_repair_prompt(user, last_text, exc)
+    if not result.ok or result.data is None:
+        return None
 
-    return None
+    adjusted_cost = CostEstimate(
+        llm_calls=cost_estimate.llm_calls + result.attempts - 1,
+        estimated_tokens=cost_estimate.estimated_tokens,
+        estimated_cost_usd=cost_estimate.estimated_cost_usd,
+        total_latency_ms=cost_estimate.total_latency_ms,
+    )
+    return _parse_llm_payload(
+        result.data,
+        task,
+        preset,
+        outputs,
+        adjusted_cost,
+        result.token_usage,
+    )
 
 
 # ── Deterministic fallback ────────────────────────────────────────────────────

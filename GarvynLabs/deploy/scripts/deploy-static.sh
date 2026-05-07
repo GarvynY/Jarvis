@@ -15,16 +15,37 @@ USER="${DEPLOY_USER:-root}"
 WEB_ROOT="${WEB_ROOT:-/var/www/garvynlabs}"
 ARCHIVE="/tmp/garvynlabs-web.tar.gz"
 API_ARCHIVE="/tmp/garvynlabs-api.tar.gz"
+CONTENT_ARCHIVE="/tmp/garvynlabs-content-seed.tar.gz"
 
-tar -C "$ROOT_DIR/apps/web/public" -czf "$ARCHIVE" .
+SSH_RUN=(ssh)
+SCP_RUN=(scp)
+if [[ -n "${DEPLOY_PASS:-}" ]]; then
+  ASKPASS_SCRIPT="$(mktemp)"
+  printf '%s\n' '#!/usr/bin/env bash' 'printf '\''%s\n'\'' "$DEPLOY_PASS"' > "$ASKPASS_SCRIPT"
+  chmod 700 "$ASKPASS_SCRIPT"
+  trap 'rm -f "$ASKPASS_SCRIPT"' EXIT
+  export DEPLOY_PASS
+  export SSH_ASKPASS="$ASKPASS_SCRIPT"
+  export SSH_ASKPASS_REQUIRE=force
+  export DISPLAY="${DISPLAY:-:0}"
+  SSH_RUN=(setsid ssh)
+  SCP_RUN=(setsid scp)
+fi
+
+tar -C "$ROOT_DIR/apps/web/public" --exclude="./content" -czf "$ARCHIVE" .
+tar -C "$ROOT_DIR/apps/web/public" -czf "$CONTENT_ARCHIVE" ./content
 tar -C "$ROOT_DIR/apps/api" -czf "$API_ARCHIVE" .
-scp "$ARCHIVE" "$USER@$HOST:/tmp/garvynlabs-web.tar.gz"
-scp "$API_ARCHIVE" "$USER@$HOST:/tmp/garvynlabs-api.tar.gz"
-scp "$ROOT_DIR/deploy/nginx/garvynlabs.conf" "$USER@$HOST:/tmp/garvynlabs.conf"
+"${SCP_RUN[@]}" "$ARCHIVE" "$USER@$HOST:/tmp/garvynlabs-web.tar.gz"
+"${SCP_RUN[@]}" "$CONTENT_ARCHIVE" "$USER@$HOST:/tmp/garvynlabs-content-seed.tar.gz"
+"${SCP_RUN[@]}" "$API_ARCHIVE" "$USER@$HOST:/tmp/garvynlabs-api.tar.gz"
+"${SCP_RUN[@]}" "$ROOT_DIR/deploy/nginx/garvynlabs.conf" "$USER@$HOST:/tmp/garvynlabs.conf"
 
-ssh "$USER@$HOST" "set -e
+"${SSH_RUN[@]}" "$USER@$HOST" "set -e
 mkdir -p '$WEB_ROOT'
 tar xzf /tmp/garvynlabs-web.tar.gz -C '$WEB_ROOT'
+if [ ! -f '$WEB_ROOT/content/manifest.json' ]; then
+  tar xzf /tmp/garvynlabs-content-seed.tar.gz -C '$WEB_ROOT'
+fi
 mkdir -p /opt/GarvynLabs/api
 tar xzf /tmp/garvynlabs-api.tar.gz -C /opt/GarvynLabs/api
 if [ ! -f /etc/garvynlabs-admin.env ]; then
@@ -57,7 +78,8 @@ RestartSec=5
 WantedBy=multi-user.target
 EOF
 systemctl daemon-reload
-systemctl enable --now garvynlabs-admin
+systemctl enable garvynlabs-admin
+systemctl restart garvynlabs-admin
 install -m 0644 /tmp/garvynlabs.conf /etc/nginx/sites-available/garvynlabs
 rm -f /etc/nginx/sites-enabled/default
 ln -sf /etc/nginx/sites-available/garvynlabs /etc/nginx/sites-enabled/garvynlabs

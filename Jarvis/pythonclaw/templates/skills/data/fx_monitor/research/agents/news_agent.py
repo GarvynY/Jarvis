@@ -8,7 +8,7 @@ Cache path: ~/.pythonclaw/context/news_recent_cache.json
 Cache format:
   { "articles": [{title, url, published, snippet, keyword}, ...], "updated_at": ISO }
 
-LLM (at most one call):
+LLM (at most three calls: one initial call plus two JSON-repair retries):
   - System: classify direction only from provided articles, no fabrication,
             no definitive recommendations.
   - User:   numbered article list from cache (up to _MAX_ARTICLES).
@@ -45,9 +45,11 @@ if str(_SKILL_DIR) not in sys.path:
 try:
     from ..schema import AgentOutput, Finding, ResearchTask, SourceRef, now_iso
     from ..llm_bridge import call_llm as _call_llm
+    from ..structured_llm import call_json_with_repair, parse_json_object
 except ImportError:
     from schema import AgentOutput, Finding, ResearchTask, SourceRef, now_iso  # type: ignore[no-redef]
     from llm_bridge import call_llm as _call_llm  # type: ignore[no-redef]
+    from structured_llm import call_json_with_repair, parse_json_object  # type: ignore[no-redef]
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -257,7 +259,7 @@ def _parse_llm_response(
         try:
             m = re.search(r"\{.*\}", text, re.DOTALL)
             if m:
-                data = json.loads(m.group())
+                data = parse_json_object(text)
                 summary, unsafe_removed = _sanitize_llm_text(data.get("summary", ""))
                 risks: list[str] = []
                 for r in data.get("risks", []):
@@ -305,7 +307,7 @@ def _parse_llm_response(
 
 def _collect_and_analyse() -> dict[str, Any]:
     """
-    Blocking: read news cache + call LLM once.
+    Blocking: read news cache + call LLM with structured-output repair.
 
     Returns a raw-data dict consumed by _build_news_output().
     """
@@ -344,11 +346,27 @@ def _collect_and_analyse() -> dict[str, Any]:
             cache_error = None
 
     prompt = _build_llm_prompt(articles)
-    llm_text, tokens = _call_llm(prompt, _SYSTEM_PROMPT)
+    result = call_json_with_repair(
+        _call_llm,
+        prompt,
+        _SYSTEM_PROMPT,
+        max_tokens=_LLM_MAX_TOKENS,
+        required_keys=("summary", "findings", "risks"),
+        repair_retries=2,
+        schema_hint=(
+            "{\n"
+            '  "summary": "...",\n'
+            '  "findings": [{"index": 1, "direction": "bullish_aud|bearish_aud|neutral", "reason": "..."}],\n'
+            '  "overall_direction": "bullish_aud|bearish_aud|mixed|neutral",\n'
+            '  "risks": []\n'
+            "}"
+        ),
+    )
     return {
         "articles": articles,
-        "llm_text": llm_text,
-        "tokens": tokens,
+        "llm_text": result.text if result.ok else "",
+        "tokens": result.token_usage if result.ok else {},
+        "structured_error": result.error,
         "cache_error": None,
         "updated_at": updated_at,
     }

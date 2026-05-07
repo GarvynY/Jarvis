@@ -17,7 +17,7 @@ Fixed MVP query set (covers RBA / PBoC / Fed / AUD macro):
 All queries used are preserved in findings / missing_data so the supervisor
 can trace what was searched.
 
-LLM call (at most one):
+LLM call (at most three calls: one initial call plus two JSON-repair retries):
   - System: summarise only from provided snippets, no fabrication,
             no definitive recommendations.
   - User:   numbered search-result list with titles + snippets.
@@ -37,7 +37,6 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import copy
-import json
 import os
 import re
 import sys
@@ -52,9 +51,11 @@ if str(_SKILL_DIR) not in sys.path:
 try:
     from ..schema import AgentOutput, Finding, ResearchTask, SourceRef, now_iso
     from ..llm_bridge import call_llm as _call_llm
+    from ..structured_llm import call_json_with_repair, parse_json_object
 except ImportError:
     from schema import AgentOutput, Finding, ResearchTask, SourceRef, now_iso  # type: ignore[no-redef]
     from llm_bridge import call_llm as _call_llm  # type: ignore[no-redef]
+    from structured_llm import call_json_with_repair, parse_json_object  # type: ignore[no-redef]
 
 try:
     from pythonclaw.core.rate_limit import call_with_backoff
@@ -274,7 +275,7 @@ def _parse_llm_response(
         try:
             m = re.search(r"\{.*\}", text, re.DOTALL)
             if m:
-                data = json.loads(m.group())
+                data = parse_json_object(text)
                 summary, unsafe_removed = _sanitize_text(data.get("summary", ""))
                 risks: list[str] = []
                 for r in data.get("risks", []):
@@ -348,7 +349,7 @@ def _parse_llm_response(
 
 def _collect_and_analyse() -> dict[str, Any]:
     """
-    Blocking: run search queries + call LLM once.
+    Blocking: run search queries + call LLM with structured-output repair.
 
     Returns a raw-data dict consumed by _build_macro_output().
     """
@@ -364,11 +365,31 @@ def _collect_and_analyse() -> dict[str, Any]:
         }
 
     prompt = _build_llm_prompt(results, successful)
-    llm_text, tokens = _call_llm(prompt, _SYSTEM_PROMPT)
+    result = call_json_with_repair(
+        _call_llm,
+        prompt,
+        _SYSTEM_PROMPT,
+        max_tokens=_LLM_MAX_TOKENS,
+        required_keys=("summary", "overall_direction", "risks", "data_gaps"),
+        repair_retries=2,
+        schema_hint=(
+            "{\n"
+            '  "summary": "...",\n'
+            '  "rba_signal": "bullish_aud|bearish_aud|neutral|unknown",\n'
+            '  "pboc_signal": "bullish_aud|bearish_aud|neutral|unknown",\n'
+            '  "usd_signal": "bullish_aud|bearish_aud|neutral|unknown",\n'
+            '  "overall_direction": "bullish_aud|bearish_aud|mixed|neutral",\n'
+            '  "key_findings": [],\n'
+            '  "risks": [],\n'
+            '  "data_gaps": []\n'
+            "}"
+        ),
+    )
     return {
         "results": results,
-        "llm_text": llm_text,
-        "tokens": tokens,
+        "llm_text": result.text if result.ok else "",
+        "tokens": result.token_usage if result.ok else {},
+        "structured_error": result.error,
         "successful_queries": successful,
         "failed_queries": failed,
         "retrieved_at": retrieved_at,

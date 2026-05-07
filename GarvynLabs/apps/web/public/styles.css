@@ -189,6 +189,7 @@ body {
 
 .intro-tagline {
   justify-content: center;
+  font-size: 17px;
   width: 100%;
 }
 
@@ -328,6 +329,34 @@ body {
 .article-body .color-teal { color: #0f766e; }
 .article-body .color-red { color: #dc2626; }
 .article-body .color-amber { color: #b45309; }
+
+.article-body table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 24px 0;
+  font-size: 15px;
+  display: block;
+  overflow-x: auto;
+}
+.article-body th,
+.article-body td {
+  padding: 10px 14px;
+  border: 1px solid rgba(103, 119, 141, 0.3);
+  text-align: left;
+}
+.article-body th {
+  background: #f0f5f9;
+  font-weight: 680;
+  white-space: nowrap;
+}
+.article-body tr:nth-child(even) td { background: #f8fafc; }
+
+.task-cb {
+  margin-right: 6px;
+  vertical-align: middle;
+  accent-color: var(--teal);
+  cursor: default;
+}
 
 .jarvis-hero {
   min-height: 100vh;

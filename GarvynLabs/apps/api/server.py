@@ -47,15 +47,18 @@ ADMIN_HTML = """<!doctype html>
     button, input, select, textarea { font:inherit; }
     button { border:1px solid var(--line); border-radius:6px; background:#fff; padding:9px 12px; cursor:pointer; }
     button.primary { background:var(--teal); color:white; border-color:var(--teal); }
+    button.danger { color:#b42318; border-color:#f3b7b1; }
+    button.danger:disabled { color:#9aa4b2; border-color:var(--line); cursor:not-allowed; }
     .list { display:grid; gap:8px; margin-top:12px; }
-    .item { text-align:left; padding:10px; border:1px solid var(--line); border-radius:6px; background:#fff; }
+    .item { display:grid; grid-template-columns:24px minmax(0,1fr); gap:8px; align-items:start; text-align:left; padding:10px; border:1px solid var(--line); border-radius:6px; background:#fff; }
+    .item input { width:auto; margin-top:3px; }
     .item strong { display:block; }
     .item span { color:var(--muted); font-size:12px; }
     .grid { display:grid; grid-template-columns:1fr 190px 160px; gap:10px; margin-bottom:10px; }
     label { display:block; color:var(--muted); font-size:12px; margin:10px 0 5px; }
     input, select, textarea { width:100%; border:1px solid var(--line); border-radius:6px; padding:10px; background:#fff; }
     textarea { min-height:54vh; resize:vertical; font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; line-height:1.55; }
-    .toolbar { display:flex; gap:10px; align-items:center; margin-bottom:12px; }
+    .toolbar { display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin-bottom:12px; }
     .status { color:var(--muted); font-size:13px; }
     @media (max-width: 920px) { main { grid-template-columns:1fr; } .grid { grid-template-columns:1fr; } aside { min-height:auto; } }
   </style>
@@ -64,7 +67,8 @@ ADMIN_HTML = """<!doctype html>
   <header><h1>Garvyn Labs Admin</h1><a href="/" target="_blank">打开网站</a></header>
   <main>
     <aside>
-      <div class="toolbar"><button class="primary" id="newBtn">新建笔记</button><button id="refreshBtn">刷新</button></div>
+      <div class="toolbar"><button class="primary" id="newBtn">新建笔记</button><button id="uploadBtn" style="color:var(--teal);border-color:var(--teal)">上传 MD</button><button class="danger" id="deleteSelectedBtn" disabled>删除选中</button><button id="refreshBtn">刷新</button></div>
+      <input type="file" id="uploadInput" accept=".md" style="display:none">
       <div class="list" id="articles"></div>
     </aside>
     <section>
@@ -83,10 +87,42 @@ ADMIN_HTML = """<!doctype html>
     let manifest = { articles: [] };
     let current = null;
     const $ = (id) => document.getElementById(id);
+    const CATS = ['ai-news', 'ai-thinking', 'ai-technology', 'jarvis'];
+
+    function parseFrontmatter(text) {
+      const m = text.match(/^---\\r?\\n([\\s\\S]*?)\\r?\\n---\\r?\\n?([\\s\\S]*)$/);
+      if (!m) return { meta: {}, body: text };
+      const meta = {};
+      m[1].split(/\\r?\\n/).forEach(line => {
+        const ci = line.indexOf(':');
+        if (ci > 0) meta[line.slice(0, ci).trim()] = line.slice(ci + 1).trim().replace(/^["']|["']$/g, '');
+      });
+      return { meta, body: m[2] };
+    }
+    function extractH1(body) {
+      const m = body.match(/^#\\s+(.+)$/m);
+      return m ? m[1].trim() : '';
+    }
 
     function today() { return new Date().toISOString().slice(0, 10); }
     function slugify(value) {
       return String(value).toLowerCase().trim().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+    }
+    function selectedSlugs() {
+      return [...document.querySelectorAll(".article-check:checked")].map((item) => item.value);
+    }
+    function updateDeleteSelectedState() {
+      $("deleteSelectedBtn").disabled = selectedSlugs().length === 0;
+    }
+    function clearEditor(status) {
+      current = null;
+      $("title").value = "";
+      $("category").value = "ai-news";
+      $("date").value = today();
+      $("slug").value = "";
+      $("summary").value = "";
+      $("body").value = "";
+      $("status").textContent = status || "";
     }
     async function api(path, options) {
       const res = await fetch(path, options);
@@ -95,8 +131,16 @@ ADMIN_HTML = """<!doctype html>
     }
     async function load() {
       manifest = await api("/api/articles");
-      $("articles").innerHTML = manifest.articles.map((a) => `<button class="item" data-slug="${a.slug}"><strong>${a.title}</strong><span>${a.date || ""} · ${a.category}</span></button>`).join("");
-      document.querySelectorAll(".item").forEach((item) => item.onclick = () => openArticle(item.dataset.slug));
+      $("articles").innerHTML = manifest.articles.map((a) => `
+        <div class="item" data-slug="${a.slug}">
+          <input class="article-check" type="checkbox" value="${a.slug}" aria-label="选择 ${a.title}">
+          <button type="button" data-open="${a.slug}" style="padding:0;border:0;background:transparent;text-align:left">
+            <strong>${a.title}</strong><span>${a.date || ""} · ${a.category}</span>
+          </button>
+        </div>`).join("");
+      document.querySelectorAll("[data-open]").forEach((item) => item.onclick = () => openArticle(item.dataset.open));
+      document.querySelectorAll(".article-check").forEach((item) => item.onchange = updateDeleteSelectedState);
+      updateDeleteSelectedState();
     }
     async function openArticle(slug) {
       current = manifest.articles.find((a) => a.slug === slug);
@@ -136,6 +180,39 @@ ADMIN_HTML = """<!doctype html>
       $("status").textContent = `已保存：${saved.slug}`;
       await load();
       await openArticle(saved.slug);
+    };
+    $("deleteSelectedBtn").onclick = async () => {
+      const slugs = selectedSlugs();
+      if (!slugs.length) return;
+      if (!confirm(`确定删除选中的 ${slugs.length} 篇文章？此操作会删除 Markdown 文件并从列表移除。`)) return;
+      $("status").textContent = "删除中...";
+      for (const slug of slugs) {
+        await api(`/api/article?slug=${encodeURIComponent(slug)}`, { method: "DELETE" });
+      }
+      await load();
+      if (current && slugs.includes(current.slug)) clearEditor(`已删除 ${slugs.length} 篇文章`);
+      else $("status").textContent = `已删除 ${slugs.length} 篇文章`;
+    };
+    $("uploadBtn").onclick = () => $("uploadInput").click();
+    $("uploadInput").onchange = (e) => {
+      const file = e.target.files[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = (ev) => {
+        const text = ev.target.result;
+        const { meta, body } = parseFrontmatter(text);
+        const title = meta.title || extractH1(body) || file.name.replace(/\\.md$/, '');
+        current = null;
+        $("title").value = title;
+        $("category").value = CATS.includes(meta.category) ? meta.category : 'ai-news';
+        $("date").value = meta.date || today();
+        $("slug").value = meta.slug ? slugify(meta.slug) : slugify(title);
+        $("summary").value = meta.summary || '';
+        $("body").value = body.trim();
+        $("status").textContent = `已从文件加载：${file.name}`;
+      };
+      reader.readAsText(file, 'utf-8');
+      e.target.value = '';
     };
     load().catch((error) => $("status").textContent = error.message);
   </script>
@@ -184,6 +261,18 @@ class Handler(BaseHTTPRequestHandler):
         payload = json.loads(self.rfile.read(length).decode("utf-8"))
         saved = _save_article(payload)
         return self._send_json(saved)
+
+    def do_DELETE(self) -> None:
+        if not self._authenticated():
+            return self._auth_required()
+        parsed = urlparse(self.path)
+        if parsed.path != "/api/article":
+            return self._send_error(HTTPStatus.NOT_FOUND, "not found")
+        slug = parse_qs(parsed.query).get("slug", [""])[0]
+        deleted = _delete_article(slug)
+        if not deleted:
+            return self._send_error(HTTPStatus.NOT_FOUND, "article not found")
+        return self._send_json(deleted)
 
     def _authenticated(self) -> bool:
         if not PASSWORD:
@@ -304,6 +393,21 @@ def _save_article(payload: dict) -> dict:
         articles.append(article)
     _write_manifest(manifest)
     return article
+
+
+def _delete_article(slug: str) -> dict | None:
+    manifest = _load_manifest()
+    articles = manifest.setdefault("articles", [])
+    for index, article in enumerate(articles):
+        if article.get("slug") != slug:
+            continue
+        path = _article_path(article)
+        if path.exists():
+            path.unlink()
+        deleted = articles.pop(index)
+        _write_manifest(manifest)
+        return {"deleted": True, "slug": deleted.get("slug", slug)}
+    return None
 
 
 def main() -> None:

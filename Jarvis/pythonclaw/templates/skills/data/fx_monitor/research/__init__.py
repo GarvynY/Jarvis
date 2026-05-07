@@ -15,6 +15,9 @@ Public surface of this package:
         now_iso, to_dict, to_json,
         validate_status, validate_confidence
 
+    Structured LLM output:
+        StructuredLLMResult, call_json_with_repair, parse_json_object
+
 Note: AGENT_REGISTRY is NOT exported from here.
 It is owned by the coordinator module, which maps agent-name
 strings to callable agents at runtime.
@@ -41,6 +44,11 @@ from .schema import (
     FX_CNYAUD_PRESET,
     PRESET_REGISTRY,
 )
+from .structured_llm import (
+    StructuredLLMResult,
+    call_json_with_repair,
+    parse_json_object,
+)
 
 __all__ = [
     "now_iso",
@@ -59,4 +67,7 @@ __all__ = [
     "ResearchBrief",
     "FX_CNYAUD_PRESET",
     "PRESET_REGISTRY",
+    "StructuredLLMResult",
+    "call_json_with_repair",
+    "parse_json_object",
 ]

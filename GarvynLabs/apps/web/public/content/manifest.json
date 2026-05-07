@@ -23,6 +23,14 @@
       "summary": "记录 Jarvis 从单机 Semaphore 到未来 Redis 分布式 limiter 的架构预埋。",
       "date": "2026-05-07",
       "file": "/content/ai-technology/rate-limit-architecture.md"
+    },
+    {
+      "slug": "jarvis",
+      "category": "jarvis",
+      "title": "Jarvis初始部署记录",
+      "summary": "记录 Jarvis 初始开发部署、技术选型、核心监控脚本和部署过程。",
+      "date": "2026-05-07",
+      "file": "/content/jarvis/jarvis.md"
     }
   ]
 }
