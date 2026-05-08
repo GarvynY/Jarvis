@@ -50,6 +50,39 @@ let manifestSignature = "";
 const app = document.getElementById("app");
 const canvas = document.getElementById("field");
 const ctx = canvas.getContext("2d");
+const analyticsState = {
+  sessionId: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`,
+  lastPath: ""
+};
+
+function visitorId() {
+  const key = "garvynlabs-visitor-id";
+  let id = localStorage.getItem(key);
+  if (!id) {
+    id = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`;
+    localStorage.setItem(key, id);
+  }
+  return id;
+}
+
+function trackPageview() {
+  const path = `${location.pathname}${location.search}`;
+  if (path === analyticsState.lastPath || path.startsWith("/admin") || path.startsWith("/api")) return;
+  analyticsState.lastPath = path;
+  const payload = {
+    path,
+    title: document.title,
+    referrer: document.referrer,
+    visitorId: visitorId(),
+    sessionId: analyticsState.sessionId
+  };
+  const body = JSON.stringify(payload);
+  if (navigator.sendBeacon) {
+    navigator.sendBeacon("/api/track", new Blob([body], { type: "application/json" }));
+    return;
+  }
+  fetch("/api/track", { method: "POST", headers: { "content-type": "application/json" }, body, keepalive: true }).catch(() => {});
+}
 
 function resizeCanvas() {
   const dpr = Math.min(window.devicePixelRatio || 1, 2);
@@ -557,6 +590,7 @@ async function route(options = {}) {
   if (next.type === "category") renderCategory(next.category);
   if (next.type === "jarvis") renderJarvis();
   if (next.type === "article") await renderArticle(next.slug);
+  trackPageview();
 }
 
 window.addEventListener("popstate", route);

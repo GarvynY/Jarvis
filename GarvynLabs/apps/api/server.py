@@ -8,9 +8,12 @@ HTTP Basic Auth and writes Markdown files plus content/manifest.json.
 from __future__ import annotations
 
 import base64
+import hashlib
+import hmac
 import json
 import os
 import re
+import threading
 import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -21,6 +24,7 @@ SITE_ROOT = Path(os.environ.get("GARVYNLABS_SITE_ROOT", "/var/www/garvynlabs"))
 CONTENT_ROOT = SITE_ROOT / "content"
 ASSET_ROOT = CONTENT_ROOT / "assets"
 MANIFEST_PATH = CONTENT_ROOT / "manifest.json"
+ANALYTICS_PATH = SITE_ROOT / "analytics-events.jsonl"
 USERNAME = os.environ.get("GARVYNLABS_ADMIN_USER", "garvyn")
 PASSWORD = os.environ.get("GARVYNLABS_ADMIN_PASSWORD", "")
 HOST = os.environ.get("GARVYNLABS_ADMIN_HOST", "127.0.0.1")
@@ -34,6 +38,8 @@ JARVIS_SUBCATEGORIES = {
 }
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
 ASSET_TTL_SECONDS = 24 * 60 * 60
+ANALYTICS_MAX_EVENTS = 20000
+ANALYTICS_LOCK = threading.Lock()
 CATEGORY_LABELS = {
     "jarvis": "Jarvis",
     "ai-news": "AI动态",
@@ -53,9 +59,14 @@ ADMIN_HTML = """<!doctype html>
     :root { --ink:#111827; --muted:#607085; --line:#d9dee7; --teal:#0f766e; --paper:#fbfdff; }
     * { box-sizing: border-box; }
     body { margin:0; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color:var(--ink); background:linear-gradient(180deg,#f7fcff,#fff); }
-    header { position:sticky; top:0; z-index:3; padding:18px 28px; display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid var(--line); background:rgba(255,255,255,.88); backdrop-filter:blur(18px); }
+    header { position:sticky; top:0; z-index:3; padding:16px 28px; display:flex; justify-content:space-between; align-items:center; gap:18px; border-bottom:1px solid var(--line); background:rgba(255,255,255,.9); backdrop-filter:blur(18px); }
     h1 { margin:0; font-size:20px; }
-    main { display:grid; grid-template-columns:320px minmax(0,1fr); gap:18px; padding:18px; }
+    .admin-nav { display:flex; flex-wrap:wrap; gap:8px; align-items:center; justify-content:flex-end; }
+    .admin-nav button.active { background:var(--teal); color:#fff; border-color:var(--teal); }
+    .admin-nav a { color:var(--teal); font-size:14px; text-decoration:none; padding:9px 0; }
+    main { padding:18px; }
+    .view.hidden { display:none; }
+    .content-view { display:grid; grid-template-columns:320px minmax(0,1fr); gap:18px; }
     aside, section { border:1px solid var(--line); border-radius:8px; background:rgba(255,255,255,.82); }
     aside { padding:14px; min-height:calc(100vh - 94px); }
     section { padding:18px; }
@@ -66,7 +77,10 @@ ADMIN_HTML = """<!doctype html>
     button.danger:disabled { color:#9aa4b2; border-color:var(--line); cursor:not-allowed; }
     .list { display:grid; gap:14px; margin-top:12px; }
     .group { display:grid; gap:8px; }
-    .group-title { margin:8px 0 0; padding-bottom:6px; border-bottom:1px solid var(--line); font-size:13px; color:var(--muted); font-weight:700; }
+    .group-title { margin:8px 0 0; padding-bottom:6px; border-bottom:1px solid var(--line); font-size:13px; color:var(--muted); font-weight:700; cursor:pointer; display:flex; align-items:center; gap:6px; user-select:none; }
+    .group-title::before { content:"▼"; font-size:10px; transition:transform .2s; }
+    .group.collapsed .group-title::before { transform:rotate(-90deg); }
+    .group.collapsed .item { display:none; }
     .item { display:grid; grid-template-columns:24px minmax(0,1fr); gap:8px; align-items:start; text-align:left; padding:10px; border:1px solid var(--line); border-radius:6px; background:#fff; }
     .item input { width:auto; margin-top:3px; }
     .item strong { display:block; }
@@ -80,30 +94,62 @@ ADMIN_HTML = """<!doctype html>
     textarea { min-height:54vh; resize:vertical; font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; line-height:1.55; }
     .toolbar { display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin-bottom:12px; }
     .status { color:var(--muted); font-size:13px; }
-    @media (max-width: 920px) { main { grid-template-columns:1fr; } .grid { grid-template-columns:1fr; } aside { min-height:auto; } }
+    .analytics { min-height:calc(100vh - 118px); }
+    .analytics-head { display:flex; justify-content:space-between; align-items:center; gap:12px; margin-bottom:14px; }
+    .analytics-head h2 { margin:0; font-size:24px; }
+    .metric-grid { display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); gap:10px; }
+    .metric { padding:14px; border:1px solid var(--line); border-radius:8px; background:#fff; }
+    .metric span { display:block; color:var(--muted); font-size:12px; }
+    .metric strong { display:block; margin-top:8px; font-size:26px; line-height:1; }
+    .analytics-grid { display:grid; grid-template-columns:1.2fr .8fr; gap:14px; margin-top:14px; }
+    .analytics-card { padding:14px; border:1px solid var(--line); border-radius:8px; background:#fff; }
+    .analytics-card h3 { margin:0 0 10px; font-size:14px; }
+    .analytics-table { width:100%; border-collapse:collapse; font-size:13px; }
+    .analytics-table th, .analytics-table td { padding:8px 6px; border-bottom:1px solid #edf0f5; text-align:left; vertical-align:top; }
+    .analytics-table th { color:var(--muted); font-weight:700; }
+    .analytics-path { max-width:460px; overflow-wrap:anywhere; }
+    @media (max-width: 920px) { header { align-items:flex-start; flex-direction:column; } .admin-nav { justify-content:flex-start; } .content-view { grid-template-columns:1fr; } .grid { grid-template-columns:1fr; } aside { min-height:auto; } }
+    @media (max-width: 920px) { .metric-grid, .analytics-grid { grid-template-columns:1fr; } }
   </style>
 </head>
 <body>
-  <header><h1>Garvyn Labs Admin</h1><a href="/" target="_blank">打开网站</a></header>
+  <header>
+    <h1>Garvyn Labs Admin</h1>
+    <div class="admin-nav">
+      <button id="contentTab" class="active" type="button">内容管理</button>
+      <button id="analyticsTab" type="button">流量分析</button>
+      <a href="/" target="_blank">打开网站</a>
+    </div>
+  </header>
   <main>
-    <aside>
-      <div class="toolbar"><button class="primary" id="newBtn">新建笔记</button><button id="uploadBtn" style="color:var(--teal);border-color:var(--teal)">上传 MD/PDF</button><button class="danger" id="deleteSelectedBtn" disabled>删除选中</button><button id="refreshBtn">刷新</button></div>
-      <input type="file" id="uploadInput" accept=".md,.pdf,application/pdf,text/markdown,text/plain" style="display:none">
-      <div class="list" id="articles"></div>
-    </aside>
-    <section>
-      <div class="grid">
-        <div><label>标题</label><input id="title"></div>
-        <div><label>栏目</label><select id="category"><option value="ai-news">AI动态</option><option value="ai-thinking">AI产品思考</option><option value="ai-technology">AI产品技术</option><option value="jarvis">Jarvis</option></select></div>
-        <div><label>日期</label><input id="date" type="date"></div>
+    <div class="view content-view" id="contentView">
+      <aside>
+        <div class="toolbar"><button class="primary" id="newBtn">新建笔记</button><button id="uploadBtn" style="color:var(--teal);border-color:var(--teal)">上传 MD/PDF</button><button class="danger" id="deleteSelectedBtn" disabled>删除选中</button><button id="refreshBtn">刷新</button></div>
+        <input type="file" id="uploadInput" accept=".md,.pdf,application/pdf,text/markdown,text/plain" style="display:none">
+        <div class="list" id="articles"></div>
+      </aside>
+      <section>
+        <div class="grid">
+          <div><label>标题</label><input id="title"></div>
+          <div><label>栏目</label><select id="category"><option value="ai-news">AI动态</option><option value="ai-thinking">AI产品思考</option><option value="ai-technology">AI产品技术</option><option value="jarvis">Jarvis</option></select></div>
+          <div><label>日期</label><input id="date" type="date"></div>
+        </div>
+        <label>Slug</label><input id="slug" placeholder="article-slug">
+        <div class="subgrid hidden" id="subcategoryRow">
+          <div><label>Jarvis 二级栏目</label><select id="subcategory"><option value="fix-updates">修复更新</option><option value="product-iteration">产品迭代</option><option value="product-analysis">产品分析</option></select></div>
+        </div>
+        <label>摘要</label><input id="summary" placeholder="列表页显示的简介">
+        <label id="bodyLabel">Markdown</label><textarea id="body" spellcheck="false"></textarea>
+        <div class="toolbar"><button class="primary" id="saveBtn">保存</button><button id="imageBtn" type="button">插入图片</button><input type="file" id="imageInput" accept="image/png,image/jpeg,image/gif,image/webp" style="display:none"><span class="status" id="status"></span></div>
+      </section>
+    </div>
+    <section class="view analytics hidden" id="analyticsView">
+      <div class="analytics-head"><h2>网站流量分析</h2><button id="analyticsRefreshBtn">刷新统计</button></div>
+      <div class="metric-grid" id="analyticsMetrics"></div>
+      <div class="analytics-grid">
+        <div class="analytics-card"><h3>近 14 天访问趋势</h3><div id="analyticsDays"></div></div>
+        <div class="analytics-card"><h3>热门页面（近 30 天）</h3><div id="analyticsTopPaths"></div></div>
       </div>
-      <label>Slug</label><input id="slug" placeholder="article-slug">
-      <div class="subgrid hidden" id="subcategoryRow">
-        <div><label>Jarvis 二级栏目</label><select id="subcategory"><option value="fix-updates">修复更新</option><option value="product-iteration">产品迭代</option><option value="product-analysis">产品分析</option></select></div>
-      </div>
-      <label>摘要</label><input id="summary" placeholder="列表页显示的简介">
-      <label id="bodyLabel">Markdown</label><textarea id="body" spellcheck="false"></textarea>
-      <div class="toolbar"><button class="primary" id="saveBtn">保存</button><button id="imageBtn" type="button">插入图片</button><input type="file" id="imageInput" accept="image/png,image/jpeg,image/gif,image/webp" style="display:none"><span class="status" id="status"></span></div>
     </section>
   </main>
   <script src="https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.min.js"></script>
@@ -234,6 +280,50 @@ ADMIN_HTML = """<!doctype html>
       if (message.includes("Request Entity Too Large") || message.includes("413")) return "保存失败：文件太大，服务器拒绝上传。";
       return `保存失败：${message}`;
     }
+    function renderTable(rows, columns, emptyText) {
+      if (!rows.length) return `<div class="status">${emptyText}</div>`;
+      return `<table class="analytics-table">
+        <thead><tr>${columns.map((column) => `<th>${column.label}</th>`).join("")}</tr></thead>
+        <tbody>${rows.map((row) => `<tr>${columns.map((column) => `<td class="${column.className || ""}">${column.render(row)}</td>`).join("")}</tr>`).join("")}</tbody>
+      </table>`;
+    }
+    function metric(label, value) {
+      return `<div class="metric"><span>${label}</span><strong>${value}</strong></div>`;
+    }
+    function showView(name) {
+      const isAnalytics = name === "analytics";
+      $("contentView").classList.toggle("hidden", isAnalytics);
+      $("analyticsView").classList.toggle("hidden", !isAnalytics);
+      $("contentTab").classList.toggle("active", !isAnalytics);
+      $("analyticsTab").classList.toggle("active", isAnalytics);
+      location.hash = isAnalytics ? "analytics" : "content";
+      if (isAnalytics) loadAnalytics();
+    }
+    async function loadAnalytics() {
+      try {
+        const data = await api("/api/analytics");
+        const summary = data.summary || {};
+        $("analyticsMetrics").innerHTML = [
+          metric("总浏览量", summary.totalViews || 0),
+          metric("今日浏览", summary.todayViews || 0),
+          metric("总访客", summary.totalVisitors || 0),
+          metric("近 7 天访客", summary.visitors7d || 0),
+          metric("近 30 天浏览", summary.views30d || 0)
+        ].join("");
+        $("analyticsDays").innerHTML = renderTable(data.days || [], [
+          { label: "日期", render: (row) => escapeHtml(row.date) },
+          { label: "浏览", render: (row) => row.views },
+          { label: "访客", render: (row) => row.visitors }
+        ], "暂无访问数据。");
+        $("analyticsTopPaths").innerHTML = renderTable(data.topPaths || [], [
+          { label: "页面", className: "analytics-path", render: (row) => escapeHtml(row.path) },
+          { label: "浏览", render: (row) => row.views },
+          { label: "访客", render: (row) => row.visitors }
+        ], "暂无热门页面。");
+      } catch (error) {
+        $("analyticsMetrics").innerHTML = `<div class="status">${escapeHtml(error.message || "统计加载失败")}</div>`;
+      }
+    }
     async function load() {
       manifest = await api("/api/articles");
       const groups = CATS.map((category) => {
@@ -257,6 +347,7 @@ ADMIN_HTML = """<!doctype html>
       $("articles").innerHTML = groups || `<div class="empty">还没有 Markdown 文档。</div>`;
       document.querySelectorAll("[data-open]").forEach((item) => item.onclick = () => openArticle(item.dataset.open));
       document.querySelectorAll(".article-check").forEach((item) => item.onchange = updateDeleteSelectedState);
+      document.querySelectorAll(".group-title").forEach((title) => title.onclick = () => title.parentElement.classList.toggle("collapsed"));
       updateDeleteSelectedState();
     }
     async function openArticle(slug) {
@@ -291,6 +382,9 @@ ADMIN_HTML = """<!doctype html>
       $("status").textContent = "新建中";
     };
     $("refreshBtn").onclick = load;
+    $("analyticsRefreshBtn").onclick = loadAnalytics;
+    $("contentTab").onclick = () => showView("content");
+    $("analyticsTab").onclick = () => showView("analytics");
     $("category").addEventListener("change", syncSubcategoryVisibility);
     $("title").addEventListener("input", () => { if (!current && !$("slug").value) $("slug").value = slugify($("title").value); });
     $("saveBtn").onclick = async () => {
@@ -431,6 +525,7 @@ ADMIN_HTML = """<!doctype html>
     };
     syncSubcategoryVisibility();
     load().catch((error) => $("status").textContent = error.message);
+    showView(location.hash === "#analytics" ? "analytics" : "content");
   </script>
 </body>
 </html>"""
@@ -438,12 +533,16 @@ ADMIN_HTML = """<!doctype html>
 
 class Handler(BaseHTTPRequestHandler):
     def do_HEAD(self) -> None:
+        parsed = urlparse(self.path)
+        if parsed.path == "/api/track":
+            self.send_response(HTTPStatus.NO_CONTENT)
+            self.end_headers()
+            return
         if not self._authenticated():
             self.send_response(HTTPStatus.UNAUTHORIZED)
             self.send_header("WWW-Authenticate", 'Basic realm="Garvyn Labs Admin"')
             self.end_headers()
             return
-        parsed = urlparse(self.path)
         if parsed.path in {"/admin", "/admin/", "/api/articles"}:
             self.send_response(HTTPStatus.OK)
             self.end_headers()
@@ -459,6 +558,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_html(ADMIN_HTML)
         if parsed.path == "/api/articles":
             return self._send_json(_load_manifest())
+        if parsed.path == "/api/analytics":
+            return self._send_json(_analytics_summary())
         if parsed.path == "/api/article":
             slug = parse_qs(parsed.query).get("slug", [""])[0]
             article = _find_article(slug)
@@ -471,9 +572,11 @@ class Handler(BaseHTTPRequestHandler):
         return self._send_error(HTTPStatus.NOT_FOUND, "not found")
 
     def do_POST(self) -> None:
+        path = urlparse(self.path).path
+        if path == "/api/track":
+            return self._handle_track()
         if not self._authenticated():
             return self._auth_required()
-        path = urlparse(self.path).path
         if path not in {"/api/article", "/api/pdf", "/api/asset"}:
             return self._send_error(HTTPStatus.NOT_FOUND, "not found")
         length = int(self.headers.get("content-length", "0"))
@@ -483,6 +586,17 @@ class Handler(BaseHTTPRequestHandler):
         else:
             saved = _save_pdf(payload) if path == "/api/pdf" else _save_article(payload)
         return self._send_json(saved)
+
+    def _handle_track(self) -> None:
+        length = min(int(self.headers.get("content-length", "0")), 8192)
+        try:
+            payload = json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
+        except json.JSONDecodeError:
+            payload = {}
+        _record_pageview(payload, self.headers)
+        self.send_response(HTTPStatus.NO_CONTENT)
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
 
     def do_DELETE(self) -> None:
         if not self._authenticated():
@@ -551,6 +665,142 @@ def _write_manifest(data: dict) -> None:
     CONTENT_ROOT.mkdir(parents=True, exist_ok=True)
     data["updatedAt"] = int(time.time() * 1000)
     MANIFEST_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def _record_pageview(payload: dict, headers) -> None:
+    path = _clean_path(payload.get("path") or "/")
+    if path.startswith("/admin") or path.startswith("/api"):
+        return
+    now = int(time.time())
+    visitor_seed = str(payload.get("visitorId") or "")
+    session_seed = str(payload.get("sessionId") or "")
+    ip = _client_ip(headers)
+    event = {
+        "ts": now,
+        "day": time.strftime("%Y-%m-%d", time.localtime(now)),
+        "path": path,
+        "title": _trim(payload.get("title"), 160),
+        "referrer": _clean_referrer(payload.get("referrer")),
+        "visitor": _hash_value(visitor_seed or ip or str(headers.get("user-agent", ""))),
+        "session": _hash_value(session_seed or f"{ip}:{headers.get('user-agent', '')}:{now // 1800}"),
+        "ua": _trim(headers.get("user-agent", ""), 240),
+        "ipHash": _hash_value(ip),
+    }
+    with ANALYTICS_LOCK:
+        ANALYTICS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with ANALYTICS_PATH.open("a", encoding="utf-8") as file:
+            file.write(json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n")
+        _compact_analytics_if_needed()
+
+
+def _analytics_summary() -> dict:
+    events = _read_analytics_events()
+    now = int(time.time())
+    today = time.strftime("%Y-%m-%d", time.localtime(now))
+    cutoff_7d = now - 7 * 24 * 60 * 60
+    cutoff_30d = now - 30 * 24 * 60 * 60
+    events_7d = [event for event in events if int(event.get("ts", 0)) >= cutoff_7d]
+    events_30d = [event for event in events if int(event.get("ts", 0)) >= cutoff_30d]
+    today_events = [event for event in events if event.get("day") == today]
+    days = []
+    for offset in range(13, -1, -1):
+        day_ts = now - offset * 24 * 60 * 60
+        day = time.strftime("%Y-%m-%d", time.localtime(day_ts))
+        day_events = [event for event in events if event.get("day") == day]
+        days.append({
+            "date": day,
+            "views": len(day_events),
+            "visitors": _unique_count(day_events, "visitor"),
+        })
+    return {
+        "summary": {
+            "totalViews": len(events),
+            "todayViews": len(today_events),
+            "totalVisitors": _unique_count(events, "visitor"),
+            "visitors7d": _unique_count(events_7d, "visitor"),
+            "views30d": len(events_30d),
+        },
+        "days": days,
+        "topPaths": _top_paths(events_30d),
+        "updatedAt": int(time.time() * 1000),
+    }
+
+
+def _read_analytics_events() -> list[dict]:
+    if not ANALYTICS_PATH.exists():
+        return []
+    events = []
+    with ANALYTICS_LOCK:
+        lines = ANALYTICS_PATH.read_text(encoding="utf-8", errors="replace").splitlines()
+    for line in lines[-ANALYTICS_MAX_EVENTS:]:
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(event, dict) and event.get("path") and event.get("ts"):
+            events.append(event)
+    return events
+
+
+def _compact_analytics_if_needed() -> None:
+    try:
+        lines = ANALYTICS_PATH.read_text(encoding="utf-8", errors="replace").splitlines()
+    except FileNotFoundError:
+        return
+    if len(lines) <= ANALYTICS_MAX_EVENTS * 1.2:
+        return
+    ANALYTICS_PATH.write_text("\n".join(lines[-ANALYTICS_MAX_EVENTS:]) + "\n", encoding="utf-8")
+
+
+def _top_paths(events: list[dict], limit: int = 10) -> list[dict]:
+    grouped: dict[str, dict] = {}
+    for event in events:
+        path = str(event.get("path") or "/")
+        item = grouped.setdefault(path, {"path": path, "views": 0, "visitors": set()})
+        item["views"] += 1
+        if event.get("visitor"):
+            item["visitors"].add(event["visitor"])
+    rows = [
+        {"path": item["path"], "views": item["views"], "visitors": len(item["visitors"])}
+        for item in grouped.values()
+    ]
+    return sorted(rows, key=lambda row: (-row["views"], row["path"]))[:limit]
+
+
+def _unique_count(events: list[dict], key: str) -> int:
+    return len({event.get(key) for event in events if event.get(key)})
+
+
+def _client_ip(headers) -> str:
+    forwarded = str(headers.get("x-forwarded-for", ""))
+    if forwarded:
+        return forwarded.split(",", 1)[0].strip()
+    return str(headers.get("x-real-ip", "")).strip()
+
+
+def _hash_value(value: str) -> str:
+    if not value:
+        return ""
+    secret = (PASSWORD or "garvynlabs").encode("utf-8")
+    return hmac.new(secret, str(value).encode("utf-8"), hashlib.sha256).hexdigest()[:24]
+
+
+def _clean_path(value: str) -> str:
+    path = str(value or "/").strip()[:240]
+    if not path.startswith("/"):
+        path = "/" + path
+    return path
+
+
+def _clean_referrer(value: str) -> str:
+    referrer = _trim(value, 240)
+    if "garvynlabs.com" in referrer:
+        return ""
+    return referrer
+
+
+def _trim(value: object, limit: int) -> str:
+    return str(value or "").replace("\n", " ").strip()[:limit]
 
 
 def _find_article(slug: str) -> dict | None:
