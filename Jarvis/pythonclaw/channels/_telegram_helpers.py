@@ -632,13 +632,53 @@ _FEEDBACK_TYPE_LABELS: dict[str, str] = {
 }
 
 
-def _make_feedback_keyboard(source: str) -> InlineKeyboardMarkup:
-    """Return a one-row inline keyboard with three feedback buttons."""
+def _make_feedback_keyboard(source: str, topic: str = "") -> InlineKeyboardMarkup:
+    """Return a one-row inline keyboard with three feedback buttons.
+
+    callback_data format: ``fb:<event_type>:<source>[:<topic>]``
+    Telegram limits callback_data to 64 bytes, so topic is truncated.
+    """
+    suffix = f"{source}:{topic[:20]}" if topic else source
     return InlineKeyboardMarkup([[
-        InlineKeyboardButton("👍 有用",    callback_data=f"{_FB_PREFIX}useful:{source}"),
-        InlineKeyboardButton("👎 无用",    callback_data=f"{_FB_PREFIX}not_useful:{source}"),
-        InlineKeyboardButton("🚫 不感兴趣", callback_data=f"{_FB_PREFIX}not_interested:{source}"),
+        InlineKeyboardButton("👍 有用",    callback_data=f"{_FB_PREFIX}useful:{suffix}"),
+        InlineKeyboardButton("👎 无用",    callback_data=f"{_FB_PREFIX}not_useful:{suffix}"),
+        InlineKeyboardButton("🚫 不感兴趣", callback_data=f"{_FB_PREFIX}not_interested:{suffix}"),
     ]])
+
+
+_KEYWORD_TOPIC_MAP: list[tuple[str, str]] = [
+    ("rba",         "RBA"),
+    ("iran",        "中东局势"),
+    ("hormuz",      "中东局势"),
+    ("middle east", "中东局势"),
+    ("nuclear",     "中东局势"),
+    ("oil",         "oil"),
+    ("inflation",   "inflation"),
+    ("trade",       "trade"),
+    ("china",       "China"),
+    ("australia",   "Australia"),
+    ("aud",         "AUD"),
+    ("interest",    "interest_rate"),
+    ("rate",        "interest_rate"),
+]
+
+
+def _extract_news_topic(articles: list[dict]) -> str:
+    """Extract a dominant topic tag from news articles for feedback tracking.
+
+    Uses first-match priority: each article maps to the first matching pattern
+    in _KEYWORD_TOPIC_MAP, so more specific patterns listed first win.
+    """
+    counts: dict[str, int] = {}
+    for art in articles:
+        kw = (art.get("keyword") or "").lower()
+        for pattern, topic in _KEYWORD_TOPIC_MAP:
+            if pattern in kw:
+                counts[topic] = counts.get(topic, 0) + 1
+                break
+    if not counts:
+        return "market_news"
+    return max(counts, key=counts.get)  # type: ignore[arg-type]
 
 
 # ── Profile update parsers ────────────────────────────────────────────────────
@@ -836,16 +876,41 @@ def _format_brief_points(text: str, *, max_points: int = 10) -> str:
     return "\n".join(rendered)
 
 
+_CHUNK_ID_RE = re.compile(r"\[chunk-[0-9a-f-]{36}\]")
+
+
 def _format_research_brief(brief: Any, latency_s: float) -> str:
     """
     Render a ResearchBrief as a plain-text Telegram message.
     No LLM involved — pure string assembly from ResearchBrief fields.
     """
+    # ── Build chunk_id → 证据 N mapping ──────────────────────────────────────
+    chunk_id_map: dict[str, str] = {}
+    counter = 0
+    for sec in brief.sections:
+        for cid in getattr(sec, "chunk_ids", []):
+            if cid not in chunk_id_map:
+                counter += 1
+                chunk_id_map[cid] = f"证据 {counter}"
+
+    def _replace_chunk_refs(text: str) -> str:
+        def _sub(m: re.Match) -> str:
+            raw = m.group(0)[1:-1]  # strip [ ]
+            return f"[{chunk_id_map.get(raw, '证据')}]"
+        return _CHUNK_ID_RE.sub(_sub, text)
+
+    if chunk_id_map:
+        mapping_lines = [f"  {label} = {cid}" for cid, label in chunk_id_map.items()]
+        logger.info(
+            "[ResearchBrief] task_id=%s 证据编号映射:\n%s",
+            brief.task_id[:8], "\n".join(mapping_lines),
+        )
+
     lines: list[str] = [
         "📊 CNY/AUD 研究简报",
         "",
         "🔍 结论摘要",
-        brief.conclusion or "（暂无结论）",
+        _replace_chunk_refs(brief.conclusion or "（暂无结论）"),
         "",
     ]
 
@@ -855,7 +920,7 @@ def _format_research_brief(brief: Any, latency_s: float) -> str:
         if sec.has_data_gap:
             header += "  ⚠️ 数据不完整"
         lines.append(header)
-        lines.append(_format_brief_points(sec.content, max_points=12))
+        lines.append(_format_brief_points(_replace_chunk_refs(sec.content), max_points=12))
         lines.append("")
 
     if brief.data_gaps:
@@ -866,6 +931,21 @@ def _format_research_brief(brief: Any, latency_s: float) -> str:
 
     if brief.sources_summary:
         lines += ["📎 数据来源", brief.sources_summary, ""]
+
+    # ── Evidence trace summary (Phase 9.1 Step 7) ──────────────────────────
+    retrieved_total = 0
+    used_ids: set[str] = set()
+    for trace in getattr(brief, "retrieval_traces", []):
+        retrieved_total += getattr(trace, "retrieved_count", 0)
+    for sec in brief.sections:
+        for cid in getattr(sec, "chunk_ids", []):
+            used_ids.add(cid)
+    if retrieved_total > 0 or used_ids:
+        lines.append(
+            f"🔗 证据追踪：本次检索并筛选了 {retrieved_total} 个证据片段，"
+            f"最终使用了 {len(used_ids)} 个。完整证据 ID 已记录在系统日志中。"
+        )
+        lines.append("")
 
     c = brief.cost_estimate
     cost_str = f"~${c.estimated_cost_usd:.4f}" if c.estimated_cost_usd > 0 else "~$0.0000"

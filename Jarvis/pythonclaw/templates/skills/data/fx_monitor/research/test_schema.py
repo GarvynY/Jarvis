@@ -37,7 +37,12 @@ if str(_HERE) not in sys.path:
 
 from schema import (  # noqa: E402
     AgentOutput,
+    CitationRef,
+    ContextPack,
+    ContextPackItem,
     CostEstimate,
+    EvidenceChunk,
+    EvidenceFinding,
     Finding,
     FX_CNYAUD_PRESET,
     PRESET_REGISTRY,
@@ -45,6 +50,7 @@ from schema import (  # noqa: E402
     ResearchPreset,
     ResearchSection,
     ResearchTask,
+    RetrievalTrace,
     SafeUserContext,
     SourceRef,
     _FIXED_DISCLAIMER,
@@ -53,6 +59,7 @@ from schema import (  # noqa: E402
     to_json,
     validate_confidence,
     validate_status,
+    validate_ttl_policy,
 )
 
 
@@ -395,29 +402,369 @@ def test_no_datetime_objects_in_defaults() -> None:
     print("  no datetime in defaults  OK")
 
 
+# ── Phase 9.1 evidence dataclass tests ───────────────────────────────────────
+
+def test_evidence_chunk() -> None:
+    chunk = EvidenceChunk(
+        task_id="task-123",
+        preset_name="fx_cnyaud",
+        agent_name="fx_agent",
+        content="1 AUD = 4.78 CNY, 90日波动率 0.003",
+        source="https://open.er-api.com/v6/latest/CNY",
+        category="fx_price",
+        importance=0.8,
+        confidence=0.65,
+        entities=["AUD", "CNY", "RBA"],
+        used_in_brief=True,
+        ttl_policy="task",
+        token_estimate=25,
+    )
+    d = _json_round_trip(chunk, "EvidenceChunk")
+    assert d["agent_name"] == "fx_agent"
+    assert d["task_id"] == "task-123"
+    assert d["preset_name"] == "fx_cnyaud"
+    assert d["importance"] == 0.8
+    assert d["confidence"] == 0.65
+    assert d["entities"] == ["AUD", "CNY", "RBA"]
+    assert d["used_in_brief"] is True
+    assert d["ttl_policy"] == "task"
+    assert d["chunk_id"].startswith("chunk-")
+    assert isinstance(d["created_at"], str)
+
+    chunk2 = EvidenceChunk.from_dict(d)
+    assert chunk2.content == chunk.content
+    assert chunk2.source == chunk.source
+    assert chunk2.task_id == "task-123"
+    assert chunk2.entities == ["AUD", "CNY", "RBA"]
+    assert chunk2.used_in_brief is True
+    assert chunk.to_dict() == d
+
+    # 向后兼容：缺失新字段时使用默认值
+    chunk3 = EvidenceChunk.from_dict({"agent_name": "a"})
+    assert chunk3.task_id == ""
+    assert chunk3.preset_name == ""
+    assert chunk3.confidence == 0.0
+    assert chunk3.entities == []
+    assert chunk3.used_in_brief is False
+    print("  EvidenceChunk            OK")
+
+
+def test_evidence_chunk_validation() -> None:
+    _expect_error(
+        lambda: EvidenceChunk(importance=1.5),
+        ValueError, "EvidenceChunk(importance=1.5)",
+    )
+    _expect_error(
+        lambda: EvidenceChunk(confidence=-0.1),
+        ValueError, "EvidenceChunk(confidence=-0.1)",
+    )
+    _expect_error(
+        lambda: EvidenceChunk(ttl_policy="forever"),
+        ValueError, "EvidenceChunk(ttl_policy='forever')",
+    )
+    # 边界值
+    c0 = EvidenceChunk(importance=0.0, confidence=0.0)
+    assert c0.importance == 0.0
+    c1 = EvidenceChunk(importance=1.0, confidence=1.0)
+    assert c1.confidence == 1.0
+    print("  EvidenceChunk validation OK")
+
+
+def test_evidence_finding() -> None:
+    ef = EvidenceFinding(
+        agent_name="news_agent",
+        key="rba_hold",
+        summary="RBA 维持利率不变",
+        direction="bearish_aud",
+        chunk_ids=["chunk-abc", "chunk-def"],
+        evidence_score=0.75,
+        category="macro",
+        importance=0.6,
+    )
+    d = _json_round_trip(ef, "EvidenceFinding")
+    assert d["finding_id"].startswith("find-")
+    assert d["chunk_ids"] == ["chunk-abc", "chunk-def"]
+    assert d["evidence_score"] == 0.75
+
+    ef2 = EvidenceFinding.from_dict(d)
+    assert ef2.key == "rba_hold"
+    assert ef2.chunk_ids == ef.chunk_ids
+    assert ef.to_dict() == d
+    print("  EvidenceFinding          OK")
+
+
+def test_evidence_finding_validation() -> None:
+    _expect_error(
+        lambda: EvidenceFinding(evidence_score=2.0),
+        ValueError, "EvidenceFinding(evidence_score=2.0)",
+    )
+    _expect_error(
+        lambda: EvidenceFinding(importance=-0.1),
+        ValueError, "EvidenceFinding(importance=-0.1)",
+    )
+    # None 始终有效
+    ef = EvidenceFinding(evidence_score=None)
+    assert ef.evidence_score is None
+    # 边界值 0.0 和 1.0
+    ef0 = EvidenceFinding(evidence_score=0.0, importance=0.0)
+    assert ef0.evidence_score == 0.0
+    ef1 = EvidenceFinding(evidence_score=1.0, importance=1.0)
+    assert ef1.evidence_score == 1.0
+    print("  EvidenceFinding valid.   OK")
+
+
+def test_citation_ref() -> None:
+    cr = CitationRef(
+        chunk_id="chunk-abc",
+        finding_id="find-xyz",
+        section_title="汇率事实",
+        relevance_score=0.9,
+    )
+    d = _json_round_trip(cr, "CitationRef")
+    assert d["citation_id"].startswith("cite-")
+    assert d["chunk_id"] == "chunk-abc"
+    assert d["relevance_score"] == 0.9
+
+    cr2 = CitationRef.from_dict(d)
+    assert cr2.section_title == "汇率事实"
+    assert cr.to_dict() == d
+    print("  CitationRef              OK")
+
+
+def test_citation_ref_validation() -> None:
+    _expect_error(
+        lambda: CitationRef(relevance_score=1.5),
+        ValueError, "CitationRef(relevance_score=1.5)",
+    )
+    print("  CitationRef validation   OK")
+
+
+def test_context_pack_item() -> None:
+    item = ContextPackItem(
+        chunk_id="chunk-abc",
+        agent_name="macro_agent",
+        text="RBA 利率信号: neutral",
+        relevance_score=0.85,
+        token_estimate=12,
+    )
+    d = _json_round_trip(item, "ContextPackItem")
+    assert d["relevance_score"] == 0.85
+
+    item2 = ContextPackItem.from_dict(d)
+    assert item2.chunk_id == "chunk-abc"
+    assert item.to_dict() == d
+    print("  ContextPackItem          OK")
+
+
+def test_context_pack() -> None:
+    pack = ContextPack(
+        items=[
+            ContextPackItem(chunk_id="c1", agent_name="fx_agent", text="rate data", relevance_score=0.9, token_estimate=10),
+            ContextPackItem(chunk_id="c2", agent_name="news_agent", text="news data", relevance_score=0.7, token_estimate=15),
+        ],
+        total_tokens=25,
+        budget_tokens=2048,
+        coverage={"fx_agent": 1, "news_agent": 1},
+    )
+    d = _json_round_trip(pack, "ContextPack")
+    assert len(d["items"]) == 2
+    assert d["total_tokens"] == 25
+    assert d["coverage"]["fx_agent"] == 1
+
+    pack2 = ContextPack.from_dict(d)
+    assert len(pack2.items) == 2
+    assert pack2.items[0].chunk_id == "c1"
+    assert pack.to_dict() == d
+    print("  ContextPack              OK")
+
+
+def test_retrieval_trace() -> None:
+    trace = RetrievalTrace(
+        query="CNY/AUD 汇率事实",
+        retrieved_count=5,
+        total_chunks=20,
+        top_scores=[0.95, 0.88, 0.72, 0.65, 0.51],
+        latency_ms=42,
+    )
+    d = _json_round_trip(trace, "RetrievalTrace")
+    assert d["trace_id"].startswith("trace-")
+    assert d["retrieved_count"] == 5
+    assert len(d["top_scores"]) == 5
+    assert isinstance(d["timestamp"], str)
+
+    trace2 = RetrievalTrace.from_dict(d)
+    assert trace2.query == "CNY/AUD 汇率事实"
+    assert trace.to_dict() == d
+    print("  RetrievalTrace           OK")
+
+
+def test_retrieval_trace_score_validation() -> None:
+    """P2: top_scores 每个元素必须在 [0,1] 范围内。"""
+    _expect_error(
+        lambda: RetrievalTrace(top_scores=[0.9, 1.5]),
+        ValueError, "RetrievalTrace(top_scores=[0.9, 1.5])",
+    )
+    _expect_error(
+        lambda: RetrievalTrace(top_scores=[-0.1]),
+        ValueError, "RetrievalTrace(top_scores=[-0.1])",
+    )
+    # 边界值有效
+    t = RetrievalTrace(top_scores=[0.0, 0.5, 1.0])
+    assert t.top_scores == [0.0, 0.5, 1.0]
+    print("  RetrievalTrace scores    OK")
+
+
+def test_context_pack_coverage_int() -> None:
+    """P2: coverage 的 from_dict 应将 float 值强制转换为 int。"""
+    raw = {"coverage": {"fx_agent": 1.0, "news_agent": 2.0}, "total_tokens": 100}
+    pack = ContextPack.from_dict(raw)
+    assert pack.coverage["fx_agent"] == 1
+    assert isinstance(pack.coverage["fx_agent"], int)
+    assert pack.coverage["news_agent"] == 2
+    assert isinstance(pack.coverage["news_agent"], int)
+    print("  ContextPack coverage int OK")
+
+
+def test_validate_ttl_policy() -> None:
+    assert validate_ttl_policy("session") == "session"
+    assert validate_ttl_policy("task") == "task"
+    assert validate_ttl_policy("persistent") == "persistent"
+    _expect_error(lambda: validate_ttl_policy("forever"), ValueError, "validate_ttl_policy('forever')")
+    _expect_error(lambda: validate_ttl_policy(""), ValueError, "validate_ttl_policy('')")
+    print("  validate_ttl_policy      OK")
+
+
+def test_agent_output_evidence_fields() -> None:
+    """Phase 9.1: AgentOutput gains chunk_ids, finding_ids, evidence_count."""
+    out = AgentOutput(
+        agent_name="fx_agent",
+        status="ok",
+        chunk_ids=["chunk-1", "chunk-2"],
+        finding_ids=["find-1"],
+        evidence_count=2,
+    )
+    d = _json_round_trip(out, "AgentOutput+evidence")
+    assert d["chunk_ids"] == ["chunk-1", "chunk-2"]
+    assert d["finding_ids"] == ["find-1"]
+    assert d["evidence_count"] == 2
+
+    out2 = AgentOutput.from_dict(d)
+    assert out2.chunk_ids == ["chunk-1", "chunk-2"]
+    assert out2.evidence_count == 2
+
+    # Backward compat: old dict without new fields
+    out3 = AgentOutput.from_dict({"agent_name": "a", "status": "ok"})
+    assert out3.chunk_ids == []
+    assert out3.finding_ids == []
+    assert out3.evidence_count == 0
+    print("  AgentOutput evidence     OK")
+
+
+def test_research_section_evidence_fields() -> None:
+    """Phase 9.1: ResearchSection gains chunk_ids, citation_ids."""
+    sec = ResearchSection(
+        title="汇率事实",
+        content="1 AUD = 4.78 CNY",
+        source_agents=["fx_agent"],
+        chunk_ids=["chunk-a"],
+        citation_ids=["cite-x"],
+    )
+    d = _json_round_trip(sec, "ResearchSection+evidence")
+    assert d["chunk_ids"] == ["chunk-a"]
+    assert d["citation_ids"] == ["cite-x"]
+
+    sec2 = ResearchSection.from_dict(d)
+    assert sec2.chunk_ids == ["chunk-a"]
+
+    # Backward compat
+    sec3 = ResearchSection.from_dict({"title": "t", "content": "c"})
+    assert sec3.chunk_ids == []
+    assert sec3.citation_ids == []
+    print("  ResearchSection evidence OK")
+
+
+def test_research_brief_retrieval_traces() -> None:
+    """Phase 9.1: ResearchBrief gains retrieval_traces."""
+    trace = RetrievalTrace(query="test", retrieved_count=3, total_chunks=10)
+    brief = ResearchBrief(
+        task_id="t1",
+        preset_name="fx_cnyaud",
+        retrieval_traces=[trace],
+    )
+    d = _json_round_trip(brief, "ResearchBrief+traces")
+    assert len(d["retrieval_traces"]) == 1
+    assert d["retrieval_traces"][0]["query"] == "test"
+
+    brief2 = ResearchBrief.from_dict(d)
+    assert len(brief2.retrieval_traces) == 1
+    assert brief2.retrieval_traces[0].retrieved_count == 3
+
+    # Backward compat
+    brief3 = ResearchBrief.from_dict({"task_id": "t2", "preset_name": "fx_cnyaud"})
+    assert brief3.retrieval_traces == []
+    assert brief3.disclaimer == _FIXED_DISCLAIMER
+    print("  ResearchBrief traces     OK")
+
+
+def test_evidence_defaults_no_datetime() -> None:
+    """All Phase 9.1 default factories produce strings, not datetime objects."""
+    for obj, label in [
+        (EvidenceChunk(), "EvidenceChunk"),
+        (EvidenceFinding(), "EvidenceFinding"),
+        (CitationRef(), "CitationRef"),
+        (ContextPackItem(), "ContextPackItem"),
+        (ContextPack(), "ContextPack"),
+        (RetrievalTrace(), "RetrievalTrace"),
+    ]:
+        _no_datetime_in(to_dict(obj), label)
+    print("  evidence no-datetime     OK")
+
+
 # ── Runner ────────────────────────────────────────────────────────────────────
 
 def run_all() -> None:
-    print("Phase 9 Step 1 — Schema tests")
+    tests = [
+        # ── Original Phase 9 tests ───────────────────────────────────────
+        test_safe_user_context,
+        test_research_preset_p1_fields,
+        test_research_task,
+        test_source_ref,
+        test_finding,
+        test_finding_score_validation,
+        test_agent_output,
+        test_agent_output_validation_p0,
+        test_agent_output_make_error,
+        test_research_brief_disclaimer_p0,
+        test_research_brief_nested,
+        test_to_dict_datetime_guard_p0,
+        test_preset_registry,
+        test_agent_registry_not_in_schema,
+        test_validators,
+        test_no_datetime_objects_in_defaults,
+        # ── Phase 9.1 evidence layer tests ───────────────────────────────
+        test_evidence_chunk,
+        test_evidence_chunk_validation,
+        test_evidence_finding,
+        test_evidence_finding_validation,
+        test_citation_ref,
+        test_citation_ref_validation,
+        test_context_pack_item,
+        test_context_pack,
+        test_retrieval_trace,
+        test_retrieval_trace_score_validation,
+        test_context_pack_coverage_int,
+        test_validate_ttl_policy,
+        test_agent_output_evidence_fields,
+        test_research_section_evidence_fields,
+        test_research_brief_retrieval_traces,
+        test_evidence_defaults_no_datetime,
+    ]
+    print("Phase 9 + 9.1 — Schema tests")
     print("=" * 50)
-    test_safe_user_context()
-    test_research_preset_p1_fields()
-    test_research_task()
-    test_source_ref()
-    test_finding()
-    test_finding_score_validation()
-    test_agent_output()
-    test_agent_output_validation_p0()
-    test_agent_output_make_error()
-    test_research_brief_disclaimer_p0()
-    test_research_brief_nested()
-    test_to_dict_datetime_guard_p0()
-    test_preset_registry()
-    test_agent_registry_not_in_schema()
-    test_validators()
-    test_no_datetime_objects_in_defaults()
+    for test_fn in tests:
+        test_fn()
     print("=" * 50)
-    print(f"All {16} tests passed.")
+    print(f"All {len(tests)} tests passed.")
 
 
 if __name__ == "__main__":

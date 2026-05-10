@@ -54,6 +54,8 @@ ALLOWED_FEEDBACK_TOPICS: frozenset[str] = frozenset({
     "bank_rates", "银行牌价", "market_news", "市场新闻",
     "通用市场新闻", "major_news", "重大新闻",
     "volatility", "波动", "daily_report", "晨报",
+    # ── Research presets ──
+    "fx_cnyaud", "research",
 })
 
 EXPLICIT_PREFERENCE_KEYS = {

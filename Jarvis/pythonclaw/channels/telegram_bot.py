@@ -101,6 +101,7 @@ from ._telegram_helpers import (
     _delete_profile_requires_confirmation,
     # Feedback UI
     _make_feedback_keyboard,
+    _extract_news_topic,
     _parse_feedback_args,
     _format_feedback_confirmation,
     # Profile update / onboarding
@@ -281,7 +282,7 @@ class TelegramBot:
     async def _cmd_my_profile(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._check_access(update, context):
             return
-        from ..core.personalization import get_or_create_user, get_user_profile
+        from ..core.personalization import get_or_create_user, get_user_profile, mark_onboarding_completed
 
         if update.effective_user is None or update.message is None:
             return
@@ -290,6 +291,7 @@ class TelegramBot:
         created = not bool(profile)
         if created:
             get_or_create_user(telegram_user_id)
+            mark_onboarding_completed(telegram_user_id)
             profile = get_user_profile(telegram_user_id)
 
         await update.message.reply_text(_format_user_profile(profile, created=created))
@@ -383,11 +385,12 @@ class TelegramBot:
         if not data.startswith(_FB_PREFIX):
             return
 
-        # Parse "fb:useful:research" → event_type="useful", source="research"
+        # Parse "fb:useful:news:RBA" → event_type="useful", source="news", topic="RBA"
         tail = data[len(_FB_PREFIX):]
-        parts = tail.split(":", 1)
+        parts = tail.split(":", 2)
         event_type = parts[0]
         source = parts[1] if len(parts) > 1 else "unknown"
+        topic = parts[2] if len(parts) > 2 else None
 
         if event_type not in _FEEDBACK_TYPE_LABELS:
             await query.answer("未知反馈类型。")
@@ -399,7 +402,7 @@ class TelegramBot:
             log_feedback_event(
                 query.from_user.id,
                 event_type,
-                topic=None,   # source goes into metadata; avoids topic whitelist
+                topic=topic,
                 message_id=str(query.message.message_id) if query.message else None,
                 metadata={"source": f"inline_button:{source}"},
             )
@@ -418,11 +421,12 @@ class TelegramBot:
 
         label = _FEEDBACK_TYPE_LABELS[event_type]
         source_label = _FB_SOURCE_LABELS.get(source, source)
-        await query.answer(f"已记录：{label}（{source_label}），谢谢！")
+        topic_suffix = f"/{topic}" if topic else ""
+        await query.answer(f"已记录：{label}（{source_label}{topic_suffix}），谢谢！")
 
         logger.info(
-            "[Telegram] Inline feedback logged: user_id=%s event=%s source=%s msg_id=%s",
-            query.from_user.id, event_type, source,
+            "[Telegram] Inline feedback logged: user_id=%s event=%s source=%s topic=%s msg_id=%s",
+            query.from_user.id, event_type, source, topic or "(none)",
             query.message.message_id if query.message else "?",
         )
 
@@ -857,16 +861,18 @@ class TelegramBot:
     async def _shortcut_latest_news(self, update: Update) -> None:
         """Fetch latest news directly without LLM and send formatted result."""
         await update.message.reply_text("📡 正在拉取最新新闻，请稍候…")
+        topic = ""
         try:
             nm = _load_cnyaud("news_monitor")
             result = nm.check_news()
             text = nm._format_text(result)
+            topic = _extract_news_topic(result.get("new_articles") or [])
         except Exception as exc:
             logger.exception("[Telegram] 最新新闻 fetch failed")
             text = f"⚠️ 获取新闻失败: {exc}"
         chunks = _split_message(text)
         for i, chunk in enumerate(chunks):
-            kb = _make_feedback_keyboard("news") if i == len(chunks) - 1 else None
+            kb = _make_feedback_keyboard("news", topic) if i == len(chunks) - 1 else None
             await update.message.reply_text(chunk, reply_markup=kb)
 
     async def _shortcut_latest_rate(self, update: Update) -> None:
@@ -1025,8 +1031,9 @@ class TelegramBot:
                 pass
 
             chunks = _split_message(text)
+            research_topic = brief.preset_name if brief else "research"
             for i, chunk in enumerate(chunks):
-                kb = _make_feedback_keyboard("research") if i == len(chunks) - 1 else None
+                kb = _make_feedback_keyboard("research", research_topic) if i == len(chunks) - 1 else None
                 await update.message.reply_text(chunk, reply_markup=kb)
 
         except Exception as exc:
@@ -1107,6 +1114,9 @@ class TelegramBot:
             _recent = _get_recent_news_text()
             if _recent:
                 await update.message.reply_text(_recent)
+            if await self._maybe_start_onboarding(update, context):
+                return
+            return
 
         if await self._maybe_start_onboarding(update, context):
             return

@@ -479,6 +479,19 @@ body {
   line-height: 1.7;
 }
 
+a.project-card-link {
+  text-decoration: none;
+  color: inherit;
+  display: block;
+  transition: transform 0.2s, border-color 0.2s, background 0.2s;
+}
+
+a.project-card-link:hover {
+  transform: translateY(-5px);
+  border-color: rgba(15, 118, 110, 0.26);
+  background: var(--glass-strong);
+}
+
 .article-card:hover {
   transform: translateY(-5px);
   border-color: rgba(15, 118, 110, 0.26);

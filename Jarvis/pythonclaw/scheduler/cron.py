@@ -53,9 +53,9 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 def _morning_feedback_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[
-        InlineKeyboardButton("👍 有用",    callback_data="fb:useful:morning"),
-        InlineKeyboardButton("👎 无用",    callback_data="fb:not_useful:morning"),
-        InlineKeyboardButton("🚫 不感兴趣", callback_data="fb:not_interested:morning"),
+        InlineKeyboardButton("👍 有用",    callback_data="fb:useful:morning:daily_report"),
+        InlineKeyboardButton("👎 无用",    callback_data="fb:not_useful:morning:daily_report"),
+        InlineKeyboardButton("🚫 不感兴趣", callback_data="fb:not_interested:morning:daily_report"),
     ]])
 
 if TYPE_CHECKING:

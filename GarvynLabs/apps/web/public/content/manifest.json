@@ -1,36 +1,325 @@
 {
   "articles": [
     {
-      "slug": "ai-news-first-signal",
+      "slug": "1-4-1-11",
+      "kind": "md",
       "category": "ai-news",
-      "title": "AI 动态追踪的第一条记录",
-      "summary": "建立 AI 动态追踪栏目，用来记录模型、产品和行业变化。",
-      "date": "2026-05-07",
-      "file": "/content/ai-news/ai-news-first-signal.md"
+      "subcategory": "",
+      "title": "1.4 - 1.11： 2026开年巨头博弈：Gemini 3登顶与多模态底层的专业化分化",
+      "summary": "",
+      "date": "2026-01-11",
+      "file": "/content/ai-news/1-4-1-11.md"
     },
     {
-      "slug": "agent-product-thinking",
-      "category": "ai-thinking",
-      "title": "为什么 Agent 产品需要长期记忆",
-      "summary": "从 Jarvis 的实践出发，记录 Agent 产品中上下文、信任和可控性的关系。",
-      "date": "2026-05-07",
-      "file": "/content/ai-thinking/agent-product-thinking.md"
+      "slug": "1-11-1-18",
+      "kind": "md",
+      "category": "ai-news",
+      "subcategory": "",
+      "title": "1.11 - 1.18： 战略重构与具身破局：OpenAI 转向 Agent 工作流与全电 Atlas 量产进厂",
+      "summary": "",
+      "date": "2026-01-18",
+      "file": "/content/ai-news/1-11-1-18.md"
     },
     {
-      "slug": "rate-limit-architecture",
+      "slug": "1-18-1-25",
+      "kind": "md",
+      "category": "ai-news",
+      "subcategory": "",
+      "title": "1.18 - 1.25： 硅谷的权力游戏：核心“人才回流”博弈与 3D/视频资产生成的“地板价”时代",
+      "summary": "",
+      "date": "2026-01-25",
+      "file": "/content/ai-news/1-18-1-25.md"
+    },
+    {
+      "slug": "1-25-2-1",
+      "kind": "md",
+      "category": "ai-news",
+      "subcategory": "",
+      "title": "1.25 - 2.1： 生产力奇点逼近：从“设计即代码”落地到具备自我进化的本地“龙虾”",
+      "summary": "",
+      "date": "2026-02-01",
+      "file": "/content/ai-news/1-25-2-1.md"
+    },
+    {
+      "slug": "2-1-2-8",
+      "kind": "md",
+      "category": "ai-news",
+      "subcategory": "",
+      "title": "2.1 - 2.8： 资本狂飙与生态圈地：OpenAI 千亿级融资与“个人上下文”重塑数字外脑",
+      "summary": "",
+      "date": "2026-02-08",
+      "file": "/content/ai-news/2-1-2-8.md"
+    },
+    {
+      "slug": "2-8-2-15",
+      "kind": "md",
+      "category": "ai-news",
+      "subcategory": "",
+      "title": "2.8 - 2.15： “Agent 经济学”元年：AI 逆向雇佣人类跑腿与科研数字基建的全面接管",
+      "summary": "",
+      "date": "2026-02-15",
+      "file": "/content/ai-news/2-8-2-15.md"
+    },
+    {
+      "slug": "2-15-2-22",
+      "kind": "md",
+      "category": "ai-news",
+      "subcategory": "",
+      "title": "2.15 - 2.22： 视频主权争夺战：原生音画同步模型震撼好莱坞与内容出海大爆发",
+      "summary": "",
+      "date": "2026-02-22",
+      "file": "/content/ai-news/2-15-2-22.md"
+    },
+    {
+      "slug": "2-22-3-1",
+      "kind": "md",
+      "category": "ai-news",
+      "subcategory": "",
+      "title": "2.22 - 3.1： 数字达尔文主义：自负盈亏的 AI 代理人经济与职场全天候监控伦理",
+      "summary": "",
+      "date": "2026-03-01",
+      "file": "/content/ai-news/2-22-3-1.md"
+    },
+    {
+      "slug": "3-1-3-8",
+      "kind": "md",
+      "category": "ai-news",
+      "subcategory": "",
+      "title": "3.1 - 3.8： “龙虾摩尔定律”生效：Ouroboros 协议下的 AI 自主进化与视觉资产代码化",
+      "summary": "",
+      "date": "2026-03-08",
+      "file": "/content/ai-news/3-1-3-8.md"
+    },
+    {
+      "slug": "3-8-3-15",
+      "kind": "md",
+      "category": "ai-news",
+      "subcategory": "",
+      "title": "3.8 - 3.15： “零人类公司”的商业闭环验证：全能 AI CEO 创收与多模态全自动内容编排",
+      "summary": "",
+      "date": "2026-03-15",
+      "file": "/content/ai-news/3-8-3-15.md"
+    },
+    {
+      "slug": "3-15-3-22",
+      "kind": "md",
+      "category": "ai-news",
+      "subcategory": "",
+      "title": "3.15 - 3.22： 社交奇点与检索重构：OpenClaw 的“职场觉醒”与跨模态搜索的“全感官”时代",
+      "summary": "",
+      "date": "2026-03-22",
+      "file": "/content/ai-news/3-15-3-22.md"
+    },
+    {
+      "slug": "3-22-3-29",
+      "kind": "md",
+      "category": "ai-news",
+      "subcategory": "",
+      "title": "3.22 - 3.29： 系统入口争夺战：OpenAI 的桌面级渗透与 Google Stitch 带来的“设计即代码”终局",
+      "summary": "",
+      "date": "2026-03-29",
+      "file": "/content/ai-news/3-22-3-29.md"
+    },
+    {
+      "slug": "3-29-4-5",
+      "kind": "md",
+      "category": "ai-news",
+      "subcategory": "",
+      "title": "3.29 - 4.5： 失控的前夜：Anthropic “水豚”模型的主动系统级攻防与双向脑机接口的物理破局",
+      "summary": "",
+      "date": "2026-04-05",
+      "file": "/content/ai-news/3-29-4-5.md"
+    },
+    {
+      "slug": "4-5-4-12",
+      "kind": "md",
+      "category": "ai-news",
+      "subcategory": "",
+      "title": "4.5 - 4.12： 安全噩梦与端侧生命：Mythos 的完美“沙盒逃逸”与米哈游超低延迟数字人降临",
+      "summary": "",
+      "date": "2026-04-12",
+      "file": "/content/ai-news/4-5-4-12.md"
+    },
+    {
+      "slug": "4-12-4-19",
+      "kind": "md",
+      "category": "ai-news",
+      "subcategory": "",
+      "title": "4.12 - 4.19： 职业护城河的瓦解：Claude 接管全栈设计流与 AI “资本家”重塑人类雇佣伦理",
+      "summary": "",
+      "date": "2026-04-19",
+      "file": "/content/ai-news/4-12-4-19.md"
+    },
+    {
+      "slug": "4-19-4-26",
+      "kind": "md",
+      "category": "ai-news",
+      "subcategory": "",
+      "title": "4.19 - 4.26： 算力美学与现实数字孪生：Codex 的“去油腻”反击与工业级 3D 物理仿真资产爆发",
+      "summary": "",
+      "date": "2026-04-26",
+      "file": "/content/ai-news/4-19-4-26.md"
+    },
+    {
+      "slug": "4-26-5-3",
+      "kind": "md",
+      "category": "ai-news",
+      "subcategory": "",
+      "title": "4.26 - 5.3： 联盟解绑与 4D 视觉革命：OpenAI 挣脱云厂商锁死与 Netflix 开源物理感知视频引擎",
+      "summary": "",
+      "date": "2026-05-03",
+      "file": "/content/ai-news/4-26-5-3.md"
+    },
+    {
+      "slug": "jarvis-telegram-消息交互底层解析",
+      "kind": "md",
       "category": "ai-technology",
-      "title": "外部接口并发墙与 Provider 级限流",
-      "summary": "记录 Jarvis 从单机 Semaphore 到未来 Redis 分布式 limiter 的架构预埋。",
+      "subcategory": "",
+      "title": "Jarvis Telegram 消息交互底层解析",
+      "summary": "",
       "date": "2026-05-07",
-      "file": "/content/ai-technology/rate-limit-architecture.md"
+      "file": "/content/ai-technology/jarvis-telegram-消息交互底层解析.md"
     },
     {
-      "slug": "jarvis",
-      "category": "jarvis",
-      "title": "Jarvis初始部署记录",
-      "summary": "记录 Jarvis 初始开发部署、技术选型、核心监控脚本和部署过程。",
+      "slug": "jarvis-是如何变聪明的",
+      "kind": "md",
+      "category": "ai-technology",
+      "subcategory": "",
+      "title": "Jarvis 是如何变聪明的",
+      "summary": "",
       "date": "2026-05-07",
-      "file": "/content/jarvis/jarvis.md"
+      "file": "/content/ai-technology/jarvis-是如何变聪明的.md"
+    },
+    {
+      "slug": "jarvis-阶段-8-安全分层机制",
+      "kind": "md",
+      "category": "ai-technology",
+      "subcategory": "",
+      "title": "Jarvis 阶段 8 安全分层机制",
+      "summary": "",
+      "date": "2026-05-07",
+      "file": "/content/ai-technology/jarvis-阶段-8-安全分层机制.md"
+    },
+    {
+      "slug": "当补贴不再线性有效-一个基于经济学与博弈论的-loss-设计推演",
+      "kind": "md",
+      "category": "ai-thinking",
+      "subcategory": "",
+      "title": "当补贴不再线性有效：一个基于经济学与博弈论的 Loss 设计推演复盘",
+      "summary": "",
+      "date": "2026-04-30",
+      "file": "/content/ai-thinking/当补贴不再线性有效-一个基于经济学与博弈论的-loss-设计推演.md"
+    },
+    {
+      "slug": "折叠的巴西与柔性系统-用历史透镜重构出海-ai-产品的战略蓝图",
+      "kind": "md",
+      "category": "ai-thinking",
+      "subcategory": "",
+      "title": "折叠的巴西与柔性系统：用历史透镜重构出海 AI 产品的战略蓝图复盘",
+      "summary": "",
+      "date": "2026-05-01",
+      "file": "/content/ai-thinking/折叠的巴西与柔性系统-用历史透镜重构出海-ai-产品的战略蓝图.md"
+    },
+    {
+      "slug": "jarvis-面向金融行业研究的多-agent-信息聚合与监管风险分析方案",
+      "kind": "md",
+      "category": "ai-thinking",
+      "subcategory": "",
+      "title": "Jarvis：面向金融行业研究的多 Agent 信息聚合与监管风险分析方案",
+      "summary": "",
+      "date": "2026-05-07",
+      "file": "/content/ai-thinking/jarvis-面向金融行业研究的多-agent-信息聚合与监管风险分析方案.md"
+    },
+    {
+      "slug": "jarvis初始部署",
+      "kind": "md",
+      "category": "jarvis",
+      "subcategory": "product-iteration",
+      "title": "Jarvis初始部署记录",
+      "summary": "",
+      "date": "2026-04-07",
+      "file": "/content/jarvis/jarvis初始部署.md"
+    },
+    {
+      "slug": "jarvis-初始阶段演进",
+      "kind": "md",
+      "category": "jarvis",
+      "subcategory": "product-iteration",
+      "title": "Phase 1 - Phase 7 Jarvis 初始阶段演进概述",
+      "summary": "",
+      "date": "2026-04-08",
+      "file": "/content/jarvis/jarvis-初始阶段演进.md"
+    },
+    {
+      "slug": "数据隐私增强-8阶段预备阶段",
+      "kind": "md",
+      "category": "jarvis",
+      "subcategory": "product-iteration",
+      "title": "Phase 8 预备阶段- 数据隐私增强",
+      "summary": "",
+      "date": "2026-04-09",
+      "file": "/content/jarvis/数据隐私增强-8阶段预备阶段.md"
+    },
+    {
+      "slug": "用户个性化与数据飞轮-phase-8",
+      "kind": "md",
+      "category": "jarvis",
+      "subcategory": "product-iteration",
+      "title": "Phase 8 用户个性化与数据飞轮",
+      "summary": "",
+      "date": "2026-04-10",
+      "file": "/content/jarvis/用户个性化与数据飞轮-phase-8.md"
+    },
+    {
+      "slug": "并行agent-架构-phase-9",
+      "kind": "md",
+      "category": "jarvis",
+      "subcategory": "product-iteration",
+      "title": "Phase 9 并行 Agent 架构",
+      "summary": "",
+      "date": "2026-04-11",
+      "file": "/content/jarvis/并行agent-架构-phase-9.md"
+    },
+    {
+      "slug": "phase-9-robust-复盘加强",
+      "kind": "md",
+      "category": "jarvis",
+      "subcategory": "product-iteration",
+      "title": "Phase 9 未来架构埋点鲁棒性加强策略",
+      "summary": "",
+      "date": "2026-04-12",
+      "file": "/content/jarvis/phase-9-robust-复盘加强.md"
+    },
+    {
+      "slug": "上下文折损拟解决方案-运行时微型-rag-架构",
+      "kind": "md",
+      "category": "jarvis",
+      "subcategory": "product-iteration",
+      "title": "Phase 9 上下文折损拟解决方案：运行时微型 RAG 架构",
+      "summary": "",
+      "date": "2026-05-05",
+      "file": "/content/jarvis/上下文折损拟解决方案-运行时微型-rag-架构.md"
+    },
+    {
+      "slug": "技术反馈",
+      "kind": "md",
+      "category": "jarvis",
+      "subcategory": "fix-updates",
+      "title": "技术反馈更新",
+      "summary": "",
+      "date": "2026-05-07",
+      "file": "/content/jarvis/技术反馈.md"
+    },
+    {
+      "slug": "用户反馈",
+      "kind": "md",
+      "category": "jarvis",
+      "subcategory": "fix-updates",
+      "title": "用户反馈更新",
+      "summary": "",
+      "date": "2026-05-07",
+      "file": "/content/jarvis/用户反馈.md"
     }
-  ]
+  ],
+  "updatedAt": 1778244245578
 }

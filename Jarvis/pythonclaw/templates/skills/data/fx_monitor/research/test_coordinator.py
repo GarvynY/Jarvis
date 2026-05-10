@@ -38,11 +38,12 @@ if str(_RESEARCH_DIR) not in sys.path:
     sys.path.insert(0, str(_RESEARCH_DIR))
 
 from schema import (  # noqa: E402
-    AgentOutput, CostEstimate, ResearchTask, SafeUserContext,
+    AgentOutput, CostEstimate, Finding, ResearchTask, SafeUserContext,
     PRESET_REGISTRY,
 )
 from runner import OkMockAgent, ErrorMockAgent  # noqa: E402
 import coordinator as _coord                    # noqa: E402
+from evidence_store import EvidenceStore        # noqa: E402
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -393,6 +394,177 @@ async def test_risk_agent_exception() -> None:
     print("   PASS")
 
 
+async def test_evidence_store_ingest() -> None:
+    """Evidence store ingestion populates chunk_ids/finding_ids on outputs."""
+
+    class _FindingAgent:
+        agent_name = "fx_agent"
+        async def run(self, task: ResearchTask) -> AgentOutput:
+            return AgentOutput(
+                agent_name=self.agent_name,
+                status="ok",
+                confidence=0.8,
+                findings=[
+                    Finding(key="rate_up", summary="汇率上涨", category="fx_price", importance=0.7),
+                    Finding(key="rba_hold", summary="RBA 维持利率", category="macro", importance=0.6),
+                ],
+            )
+
+    mock_agents = {
+        "fx_agent":    _FindingAgent,
+        "news_agent":  type("_News",  (OkMockAgent,), {"agent_name": "news_agent"}),
+        "macro_agent": type("_Macro", (OkMockAgent,), {"agent_name": "macro_agent"}),
+    }
+
+    with _patch_profile(), _patch_agents(mock_agents), \
+         unittest.mock.patch.object(_coord, "EvidenceStore",
+                                    lambda: EvidenceStore(":memory:")):
+        _, outputs, _ = await _coord.run_research("fx_cnyaud", user_id=1)
+
+    fx_out = next(o for o in outputs if o.agent_name == "fx_agent")
+    assert len(fx_out.chunk_ids) == 2, f"Expected 2 chunk_ids, got {fx_out.chunk_ids}"
+    assert len(fx_out.finding_ids) == 2, f"Expected 2 finding_ids, got {fx_out.finding_ids}"
+    assert fx_out.evidence_count == 2
+
+    print("\n-- test_evidence_store_ingest")
+    print(f"   fx_agent: chunks={len(fx_out.chunk_ids)}  findings={len(fx_out.finding_ids)}")
+    print("   PASS")
+
+
+async def test_evidence_store_returns_outputs_on_success() -> None:
+    """run_research still returns (task, outputs, cost) with evidence fields."""
+    mock_agents = {
+        "fx_agent":    type("_FX",    (OkMockAgent,), {"agent_name": "fx_agent"}),
+        "news_agent":  type("_News",  (OkMockAgent,), {"agent_name": "news_agent"}),
+        "macro_agent": type("_Macro", (OkMockAgent,), {"agent_name": "macro_agent"}),
+    }
+
+    with _patch_profile(), _patch_agents(mock_agents), \
+         unittest.mock.patch.object(_coord, "EvidenceStore",
+                                    lambda: EvidenceStore(":memory:")):
+        task, outputs, cost = await _coord.run_research("fx_cnyaud", user_id=1)
+
+    assert isinstance(task, ResearchTask)
+    assert isinstance(cost, CostEstimate)
+    assert len(outputs) == 4
+    assert outputs[-1].agent_name == "risk_agent"
+
+    print("\n-- test_evidence_store_returns_outputs_on_success")
+    print(f"   outputs={len(outputs)}  task_id={task.task_id[:8]}")
+    print("   PASS")
+
+
+async def test_evidence_store_failure_graceful() -> None:
+    """EvidenceStore failure does not break run_research — original outputs returned."""
+    mock_agents = {
+        "fx_agent":    type("_FX",    (OkMockAgent,), {"agent_name": "fx_agent"}),
+        "news_agent":  type("_News",  (OkMockAgent,), {"agent_name": "news_agent"}),
+        "macro_agent": type("_Macro", (OkMockAgent,), {"agent_name": "macro_agent"}),
+    }
+
+    class _BrokenStore:
+        def __enter__(self):
+            return self
+        def __exit__(self, *_):
+            pass
+        def ingest_outputs(self, *_args, **_kwargs):
+            raise RuntimeError("SQLite disk full")
+
+    with _patch_profile(), _patch_agents(mock_agents), \
+         unittest.mock.patch.object(_coord, "EvidenceStore", _BrokenStore):
+        task, outputs, cost = await _coord.run_research("fx_cnyaud", user_id=1)
+
+    assert len(outputs) == 4
+    assert outputs[-1].agent_name == "risk_agent"
+    for o in outputs[:-1]:
+        assert o.status == "ok"
+    # evidence_count should be 0 (original, un-enriched outputs)
+    for o in outputs:
+        assert o.evidence_count == 0
+
+    print("\n-- test_evidence_store_failure_graceful")
+    print(f"   outputs={len(outputs)}, all evidence_count=0 (fallback)")
+    print("   PASS")
+
+
+async def test_evidence_store_constructor_oserror() -> None:
+    """EvidenceStore constructor raising OSError (unwritable path) → fallback."""
+    mock_agents = {
+        "fx_agent":    type("_FX",    (OkMockAgent,), {"agent_name": "fx_agent"}),
+        "news_agent":  type("_News",  (OkMockAgent,), {"agent_name": "news_agent"}),
+        "macro_agent": type("_Macro", (OkMockAgent,), {"agent_name": "macro_agent"}),
+    }
+
+    def _raise_os(*_a, **_kw):
+        raise OSError("read-only filesystem")
+
+    with _patch_profile(), _patch_agents(mock_agents), \
+         unittest.mock.patch.object(_coord, "EvidenceStore", _raise_os):
+        task, outputs, cost = await _coord.run_research("fx_cnyaud", user_id=1)
+
+    assert len(outputs) == 4
+    for o in outputs:
+        assert o.evidence_count == 0
+
+    print("\n-- test_evidence_store_constructor_oserror")
+    print("   OSError at construction → fallback OK")
+    print("   PASS")
+
+
+async def test_evidence_store_sqlite_locked() -> None:
+    """Simulated OperationalError (database is locked) → fallback."""
+    import sqlite3 as _sqlite3
+    mock_agents = {
+        "fx_agent":    type("_FX",    (OkMockAgent,), {"agent_name": "fx_agent"}),
+        "news_agent":  type("_News",  (OkMockAgent,), {"agent_name": "news_agent"}),
+        "macro_agent": type("_Macro", (OkMockAgent,), {"agent_name": "macro_agent"}),
+    }
+
+    class _LockedStore:
+        def __enter__(self):
+            return self
+        def __exit__(self, *_):
+            pass
+        def ingest_outputs(self, *_a, **_kw):
+            raise _sqlite3.OperationalError("database is locked")
+
+    with _patch_profile(), _patch_agents(mock_agents), \
+         unittest.mock.patch.object(_coord, "EvidenceStore", _LockedStore):
+        task, outputs, cost = await _coord.run_research("fx_cnyaud", user_id=1)
+
+    assert len(outputs) == 4
+    for o in outputs:
+        assert o.evidence_count == 0
+
+    print("\n-- test_evidence_store_sqlite_locked")
+    print("   OperationalError (locked) → fallback OK")
+    print("   PASS")
+
+
+async def test_evidence_store_permission_error() -> None:
+    """PermissionError during DB open → fallback."""
+    mock_agents = {
+        "fx_agent":    type("_FX",    (OkMockAgent,), {"agent_name": "fx_agent"}),
+        "news_agent":  type("_News",  (OkMockAgent,), {"agent_name": "news_agent"}),
+        "macro_agent": type("_Macro", (OkMockAgent,), {"agent_name": "macro_agent"}),
+    }
+
+    def _raise_perm(*_a, **_kw):
+        raise PermissionError("evidence.sqlite3: permission denied")
+
+    with _patch_profile(), _patch_agents(mock_agents), \
+         unittest.mock.patch.object(_coord, "EvidenceStore", _raise_perm):
+        task, outputs, cost = await _coord.run_research("fx_cnyaud", user_id=1)
+
+    assert len(outputs) == 4
+    for o in outputs:
+        assert o.evidence_count == 0
+
+    print("\n-- test_evidence_store_permission_error")
+    print("   PermissionError → fallback OK")
+    print("   PASS")
+
+
 # ── Runner ────────────────────────────────────────────────────────────────────
 
 async def main() -> None:
@@ -410,9 +582,15 @@ async def main() -> None:
     await test_all_outputs_json_safe()
     await test_custom_overrides()
     await test_risk_agent_exception()
+    await test_evidence_store_ingest()
+    await test_evidence_store_returns_outputs_on_success()
+    await test_evidence_store_failure_graceful()
+    await test_evidence_store_constructor_oserror()
+    await test_evidence_store_sqlite_locked()
+    await test_evidence_store_permission_error()
 
     print("\n" + "=" * 60)
-    print("All 11 tests passed.")
+    print("All 17 tests passed.")
 
 
 if __name__ == "__main__":

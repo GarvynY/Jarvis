@@ -35,11 +35,13 @@ if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
 from schema import (  # noqa: E402
-    AgentOutput, CostEstimate, Finding, FX_CNYAUD_PRESET,
+    AgentOutput, ContextPack, ContextPackItem, CostEstimate,
+    Finding, FX_CNYAUD_PRESET,
     ResearchBrief, ResearchTask, SafeUserContext, SourceRef,
 )
 import supervisor as _sup  # noqa: E402
 from supervisor import SupervisorReportWriter, _DISCLAIMER  # noqa: E402
+from evidence_store import EvidenceStore  # noqa: E402
 
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
@@ -536,6 +538,275 @@ async def test_provenance_note_on_unattributed_section() -> None:
     print("   PASS")
 
 
+# ── Phase 9.1 Step 6 — ContextPack integration tests ─────────────────────────
+
+def _make_context_pack() -> ContextPack:
+    """Build a small ContextPack with known chunk_ids for testing."""
+    return ContextPack(
+        items=[
+            ContextPackItem(
+                chunk_id="chunk-fx-1",
+                agent_name="fx_agent",
+                text="[Context]\nCNY/AUD 汇率 4.52\n[/Context]\n汇率上涨",
+                relevance_score=0.9,
+                token_estimate=30,
+            ),
+            ContextPackItem(
+                chunk_id="chunk-news-1",
+                agent_name="news_agent",
+                text="[Context]\nRBA 鹰派\n[/Context]\nRBA 维持利率",
+                relevance_score=0.8,
+                token_estimate=25,
+            ),
+            ContextPackItem(
+                chunk_id="chunk-macro-1",
+                agent_name="macro_agent",
+                text="[Context]\nPBoC 稳定\n[/Context]\n宏观信号平稳",
+                relevance_score=0.7,
+                token_estimate=20,
+            ),
+        ],
+        total_tokens=75,
+        budget_tokens=4000,
+        coverage={"fx_agent": 1, "news_agent": 1, "macro_agent": 1},
+    )
+
+
+def _make_llm_json_with_chunks() -> str:
+    """LLM response that references chunk_ids from the context pack."""
+    return json.dumps({
+        "conclusion": "综合来看，AUD 短期走势存在不确定性。",
+        "sections": [
+            {
+                "title": "汇率事实",
+                "content": "CNY/AUD 今日参考汇率为 4.52 [chunk-fx-1]。",
+                "source_agents": ["fx_agent"],
+                "chunk_ids": ["chunk-fx-1"],
+            },
+            {
+                "title": "新闻驱动",
+                "content": "RBA 鹰派信号持续 [chunk-news-1]。",
+                "source_agents": ["news_agent"],
+                "chunk_ids": ["chunk-news-1"],
+            },
+            {
+                "title": "宏观信号",
+                "content": "PBoC 维持利率稳定 [chunk-macro-1]。",
+                "source_agents": ["macro_agent"],
+                "chunk_ids": ["chunk-macro-1"],
+            },
+            {
+                "title": "风险与矛盾",
+                "content": "多空信号方向不一致。",
+                "source_agents": ["risk_agent"],
+                "chunk_ids": [],
+            },
+        ],
+    }, ensure_ascii=False)
+
+
+async def test_context_pack_used() -> None:
+    """When ContextPack is available, supervisor uses evidence-based prompt."""
+    outputs = [_ok_agent(a) for a in ("fx_agent", "news_agent", "macro_agent", "risk_agent")]
+    pack = _make_context_pack()
+
+    with _mock_llm_text(_make_llm_json_with_chunks()), \
+         unittest.mock.patch.object(
+             _sup, "EvidenceStore",
+             lambda: _StubStore(pack),
+         ):
+        brief = await SupervisorReportWriter().run(_make_task(), _PRESET, outputs, _make_cost())
+
+    assert isinstance(brief, ResearchBrief)
+    fx_sec = next(s for s in brief.sections if s.title == "汇率事实")
+    assert "chunk-fx-1" in fx_sec.chunk_ids
+    assert "chunk-fx-1" in fx_sec.content
+
+    print("\n-- test_context_pack_used")
+    print(f"   fx_sec.chunk_ids={fx_sec.chunk_ids}")
+    print("   PASS")
+
+
+class _StubStore:
+    """Minimal EvidenceStore stub for supervisor tests."""
+    def __init__(self, pack: ContextPack | None = None):
+        self._pack = pack or ContextPack()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        pass
+
+    def build_context_pack(self, *_args, **_kwargs) -> ContextPack:
+        return self._pack
+
+    def list_traces(self, _task_id: str):
+        return []
+
+
+async def test_context_pack_store_failure() -> None:
+    """EvidenceStore failure falls back to old agent-based prompt behavior."""
+    outputs = [_ok_agent(a) for a in ("fx_agent", "news_agent", "macro_agent", "risk_agent")]
+
+    class _BrokenStore:
+        def __enter__(self):
+            return self
+        def __exit__(self, *_):
+            pass
+        def build_context_pack(self, *_a, **_kw):
+            raise RuntimeError("disk full")
+
+    with _mock_llm_ok(), \
+         unittest.mock.patch.object(_sup, "EvidenceStore", _BrokenStore):
+        brief = await SupervisorReportWriter().run(_make_task(), _PRESET, outputs, _make_cost())
+
+    assert isinstance(brief, ResearchBrief)
+    assert len(brief.sections) == len(_SECTIONS)
+    assert brief.conclusion
+
+    print("\n-- test_context_pack_store_failure")
+    print(f"   sections={len(brief.sections)}  conclusion present=True")
+    print("   PASS")
+
+
+async def test_empty_context_pack_data_gap() -> None:
+    """Empty ContextPack should not cause hallucination — falls back to agent prompt."""
+    outputs = [_ok_agent(a) for a in ("fx_agent", "news_agent", "macro_agent", "risk_agent")]
+    empty_pack = ContextPack(items=[], total_tokens=0, budget_tokens=4000, coverage={})
+
+    with _mock_llm_ok(), \
+         unittest.mock.patch.object(_sup, "EvidenceStore", lambda: _StubStore(empty_pack)):
+        brief = await SupervisorReportWriter().run(_make_task(), _PRESET, outputs, _make_cost())
+
+    assert isinstance(brief, ResearchBrief)
+    assert len(brief.sections) == len(_SECTIONS)
+
+    print("\n-- test_empty_context_pack_data_gap")
+    print(f"   sections={len(brief.sections)}  (used agent fallback prompt)")
+    print("   PASS")
+
+
+async def test_banned_filter_with_context_pack() -> None:
+    """Banned-term filter still works when ContextPack is used."""
+    outputs = [_ok_agent(a) for a in ("fx_agent", "news_agent", "macro_agent", "risk_agent")]
+    pack = _make_context_pack()
+
+    banned_term = _PRESET.banned_terms[0]
+    dirty_json = json.dumps({
+        "conclusion": f"综合来看{banned_term}，信号较混杂。",
+        "sections": [
+            {"title": s, "content": f"内容{banned_term}", "source_agents": ["fx_agent"], "chunk_ids": []}
+            for s in _SECTIONS
+        ],
+    }, ensure_ascii=False)
+
+    with _mock_llm_text(dirty_json), \
+         unittest.mock.patch.object(_sup, "EvidenceStore", lambda: _StubStore(pack)):
+        brief = await SupervisorReportWriter().run(_make_task(), _PRESET, outputs, _make_cost())
+
+    all_text = brief.conclusion + "".join(s.content for s in brief.sections)
+    for term in _PRESET.banned_terms:
+        assert term not in all_text, f"Banned term {term!r} found with ContextPack"
+
+    print("\n-- test_banned_filter_with_context_pack")
+    print(f"   banned term '{banned_term}' filtered out")
+    print("   PASS")
+
+
+async def test_context_pack_constructor_oserror() -> None:
+    """EvidenceStore raises OSError at construction → falls back to agent prompt."""
+    outputs = [_ok_agent(a) for a in ("fx_agent", "news_agent", "macro_agent", "risk_agent")]
+
+    def _raise_os(*_a, **_kw):
+        raise OSError("read-only filesystem")
+
+    with _mock_llm_ok(), \
+         unittest.mock.patch.object(_sup, "EvidenceStore", _raise_os):
+        brief = await SupervisorReportWriter().run(_make_task(), _PRESET, outputs, _make_cost())
+
+    assert isinstance(brief, ResearchBrief)
+    assert len(brief.sections) == len(_SECTIONS)
+    assert brief.conclusion
+
+    print("\n-- test_context_pack_constructor_oserror")
+    print("   OSError → agent prompt fallback OK")
+    print("   PASS")
+
+
+async def test_context_pack_sqlite_locked() -> None:
+    """OperationalError (database locked) during build_context_pack → fallback."""
+    import sqlite3 as _sqlite3
+    outputs = [_ok_agent(a) for a in ("fx_agent", "news_agent", "macro_agent", "risk_agent")]
+
+    class _LockedStore:
+        def __enter__(self):
+            return self
+        def __exit__(self, *_):
+            pass
+        def build_context_pack(self, *_a, **_kw):
+            raise _sqlite3.OperationalError("database is locked")
+
+    with _mock_llm_ok(), \
+         unittest.mock.patch.object(_sup, "EvidenceStore", _LockedStore):
+        brief = await SupervisorReportWriter().run(_make_task(), _PRESET, outputs, _make_cost())
+
+    assert isinstance(brief, ResearchBrief)
+    assert len(brief.sections) == len(_SECTIONS)
+
+    print("\n-- test_context_pack_sqlite_locked")
+    print("   OperationalError (locked) → fallback OK")
+    print("   PASS")
+
+
+async def test_context_pack_permission_error() -> None:
+    """PermissionError during EvidenceStore open → fallback."""
+    outputs = [_ok_agent(a) for a in ("fx_agent", "news_agent", "macro_agent", "risk_agent")]
+
+    def _raise_perm(*_a, **_kw):
+        raise PermissionError("evidence.sqlite3: permission denied")
+
+    with _mock_llm_ok(), \
+         unittest.mock.patch.object(_sup, "EvidenceStore", _raise_perm):
+        brief = await SupervisorReportWriter().run(_make_task(), _PRESET, outputs, _make_cost())
+
+    assert isinstance(brief, ResearchBrief)
+    assert len(brief.sections) == len(_SECTIONS)
+
+    print("\n-- test_context_pack_permission_error")
+    print("   PermissionError → fallback OK")
+    print("   PASS")
+
+
+async def test_trace_retrieval_failure_non_fatal() -> None:
+    """list_traces failure → brief still produced, retrieval_traces is empty."""
+    outputs = [_ok_agent(a) for a in ("fx_agent", "news_agent", "macro_agent", "risk_agent")]
+    pack = _make_context_pack()
+
+    class _TraceFailStore:
+        def __init__(self):
+            self._pack = pack
+        def __enter__(self):
+            return self
+        def __exit__(self, *_):
+            pass
+        def build_context_pack(self, *_a, **_kw):
+            return self._pack
+        def list_traces(self, _task_id):
+            raise RuntimeError("trace table corrupted")
+
+    with _mock_llm_text(_make_llm_json_with_chunks()), \
+         unittest.mock.patch.object(_sup, "EvidenceStore", _TraceFailStore):
+        brief = await SupervisorReportWriter().run(_make_task(), _PRESET, outputs, _make_cost())
+
+    assert isinstance(brief, ResearchBrief)
+    assert brief.retrieval_traces == []
+
+    print("\n-- test_trace_retrieval_failure_non_fatal")
+    print("   list_traces failure → empty traces, brief OK")
+    print("   PASS")
+
+
 # ── Runner ────────────────────────────────────────────────────────────────────
 
 async def main() -> None:
@@ -555,9 +826,19 @@ async def main() -> None:
     await test_json_safe()
     await test_user_notes_from_safe_ctx()
     await test_provenance_note_on_unattributed_section()
+    # Phase 9.1 Step 6 — ContextPack integration
+    await test_context_pack_used()
+    await test_context_pack_store_failure()
+    await test_empty_context_pack_data_gap()
+    await test_banned_filter_with_context_pack()
+    # Phase 9.1 — EvidenceStore failure resilience
+    await test_context_pack_constructor_oserror()
+    await test_context_pack_sqlite_locked()
+    await test_context_pack_permission_error()
+    await test_trace_retrieval_failure_non_fatal()
 
     print("\n" + "=" * 60)
-    print("All 13 tests passed.")
+    print("All 21 tests passed.")
 
 
 if __name__ == "__main__":

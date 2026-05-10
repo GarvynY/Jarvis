@@ -34,20 +34,28 @@ _RESEARCH_DIR = Path(__file__).parent
 if str(_RESEARCH_DIR) not in sys.path:
     sys.path.insert(0, str(_RESEARCH_DIR))
 
+import logging
+
 try:
     from .schema import (
-        AgentOutput, CostEstimate, ResearchBrief,
+        AgentOutput, ContextPack, ContextPackItem, CostEstimate,
+        RetrievalTrace, ResearchBrief,
         ResearchPreset, ResearchSection, ResearchTask, now_iso,
     )
     from .llm_bridge import call_llm as _call_llm_bridge
     from .structured_llm import call_json_with_repair
+    from .evidence_store import EvidenceStore
 except ImportError:
     from schema import (  # type: ignore[no-redef]
-        AgentOutput, CostEstimate, ResearchBrief,
+        AgentOutput, ContextPack, ContextPackItem, CostEstimate,
+        RetrievalTrace, ResearchBrief,
         ResearchPreset, ResearchSection, ResearchTask, now_iso,
     )
     from llm_bridge import call_llm as _call_llm_bridge  # type: ignore[no-redef]
     from structured_llm import call_json_with_repair  # type: ignore[no-redef]
+    from evidence_store import EvidenceStore  # type: ignore[no-redef]
+
+_log = logging.getLogger(__name__)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -169,6 +177,67 @@ def _build_prompt(
     return system, user
 
 
+def _build_prompt_from_context_pack(
+    task: ResearchTask,
+    preset: ResearchPreset,
+    context_pack: ContextPack,
+) -> tuple[str, str]:
+    """Build (system, user) prompt from ContextPack evidence instead of raw AgentOutput."""
+    banned_str = "、".join(preset.banned_terms) if preset.banned_terms else "（无）"
+
+    system = (
+        "你是研究简报撰写助理。\n"
+        "严格规则：\n"
+        "1. 仅使用下方 [Evidence] 块中提供的证据，绝对禁止添加模型先验知识或外部信息。\n"
+        "2. 不给任何投资建议、换汇建议或操作建议；使用研究助理的中立描述措辞。\n"
+        f"3. 禁止用词（出现须替换为'（数据已过滤）'）：{banned_str}。\n"
+        "4. 尽可能为主要论点引用证据片段 ID（chunk_id），格式为 [chunk_id]。\n"
+        "5. 若某章节缺少对应证据，如实报告数据缺口，不推测不补充。\n"
+        "6. 输出必须是合法 JSON，不包含任何 JSON 以外的文字或 markdown 代码块。\n"
+        f"7. 输出语言：{preset.output_language}。"
+    )
+
+    evidence_blocks: list[str] = []
+    for item in context_pack.items:
+        evidence_blocks.append(
+            f"--- chunk_id={item.chunk_id} agent={item.agent_name} ---\n"
+            f"{item.text}"
+        )
+    evidence_text = "\n\n".join(evidence_blocks) if evidence_blocks else "（无可用证据）"
+
+    sections_numbered = "\n".join(
+        f"  {i + 1}. {s}" for i, s in enumerate(preset.report_sections)
+    )
+    purpose_hint = task.safe_user_context.purpose or "通用"
+    chunk_id_list = [it.chunk_id for it in context_pack.items]
+
+    user = (
+        f"研究主题：{task.research_topic}\n"
+        f"关注货币对：{task.focus_pair or '未指定'}\n"
+        f"用途场景：{purpose_hint}\n\n"
+        "━━━ 证据数据（来源：EvidenceStore 检索）━━━\n"
+        f"{evidence_text}\n\n"
+        f"可引用的 chunk_ids：{chunk_id_list}\n\n"
+        "━━━ 生成任务 ━━━\n"
+        f"请为以下 {len(preset.report_sections)} 个章节生成内容，顺序与列表一致：\n"
+        f"{sections_numbered}\n\n"
+        "输出格式（严格 JSON，无额外文字）：\n"
+        "{\n"
+        '  "conclusion": "一句话总结，不含操作建议",\n'
+        '  "sections": [\n'
+        '    {\n'
+        '      "title": "<与上方章节列表完全匹配的标题>",\n'
+        '      "content": "<章节内容，仅基于上方证据，关键论点用 [chunk_id] 引用>",\n'
+        '      "source_agents": ["<贡献证据的代理名>", ...],\n'
+        '      "chunk_ids": ["<本节引用的 chunk_id>", ...]\n'
+        '    }\n'
+        "  ]\n"
+        "}"
+    )
+
+    return system, user
+
+
 def _validate_supervisor_json(data: dict[str, Any]) -> None:
     sections = data.get("sections")
     if not isinstance(sections, list):
@@ -190,6 +259,8 @@ def _parse_llm_payload(
     outputs: list[AgentOutput],
     cost_estimate: CostEstimate,
     token_usage: dict[str, int],
+    context_pack: ContextPack | None = None,
+    retrieval_traces: list[RetrievalTrace] | None = None,
 ) -> ResearchBrief:
     """
     Parse the LLM JSON and build a ResearchBrief.
@@ -210,27 +281,31 @@ def _parse_llm_payload(
     agent_status_map = {o.agent_name: o.status for o in outputs}
     valid_agents     = set(agent_status_map)
 
+    valid_chunk_ids = (
+        {it.chunk_id for it in context_pack.items} if context_pack else set()
+    )
+
     sections: list[ResearchSection] = []
     for title in preset.report_sections:
         raw_sec = by_title.get(title.strip().lower())
         if raw_sec is None:
-            # LLM missed this section — safe placeholder
             content      = "（本章节数据暂缺，请参考其他章节）"
             source_agents: list[str] = []
             has_gap       = True
+            chunk_ids: list[str] = []
         else:
             content = str(raw_sec.get("content", "")).strip() or "（无内容）"
-            # only accept agent names that actually exist in outputs
             source_agents = [
                 a for a in (raw_sec.get("source_agents") or [])
                 if a in valid_agents
             ]
+            chunk_ids = [
+                cid for cid in (raw_sec.get("chunk_ids") or [])
+                if cid in valid_chunk_ids
+            ]
             has_gap = any(
                 agent_status_map.get(a, "ok") != "ok" for a in source_agents
             ) or not source_agents
-            # P0 provenance guard: if LLM cited no verifiable agents, flag it.
-            # We cannot semantically verify content against agent data, so we
-            # append a visible note and mark has_gap so downstream can warn users.
             if not source_agents:
                 content = content + "\n" + _UNVERIFIABLE_NOTE
                 has_gap = True
@@ -240,6 +315,7 @@ def _parse_llm_payload(
             content      = content,
             source_agents= source_agents,
             has_data_gap = has_gap,
+            chunk_ids    = chunk_ids,
         ))
 
     # data_gaps: aggregate missing_data from error/partial agents
@@ -271,6 +347,7 @@ def _parse_llm_payload(
         disclaimer     = _DISCLAIMER,              # hardcoded — never from LLM
         agent_statuses = agent_status_map,
         cost_estimate  = cost_with_llm,
+        retrieval_traces = retrieval_traces or [],
     )
 
 
@@ -279,9 +356,13 @@ async def _run_llm_with_json_retries(
     preset: ResearchPreset,
     outputs: list[AgentOutput],
     cost_estimate: CostEstimate,
+    context_pack: ContextPack | None = None,
 ) -> ResearchBrief | None:
     """Call the supervisor LLM and retry JSON repair up to two times."""
-    system, user = _build_prompt(task, preset, outputs)
+    if context_pack is not None and context_pack.items:
+        system, user = _build_prompt_from_context_pack(task, preset, context_pack)
+    else:
+        system, user = _build_prompt(task, preset, outputs)
     schema_hint = (
         "{\n"
         '  "conclusion": "...",\n'
@@ -316,6 +397,14 @@ async def _run_llm_with_json_retries(
         estimated_cost_usd=cost_estimate.estimated_cost_usd,
         total_latency_ms=cost_estimate.total_latency_ms,
     )
+    retrieval_traces: list[RetrievalTrace] = []
+    if context_pack is not None:
+        try:
+            with EvidenceStore() as store:
+                retrieval_traces = store.list_traces(task.task_id)
+        except Exception:  # noqa: BLE001
+            pass
+
     return _parse_llm_payload(
         result.data,
         task,
@@ -323,6 +412,8 @@ async def _run_llm_with_json_retries(
         outputs,
         adjusted_cost,
         result.token_usage,
+        context_pack=context_pack,
+        retrieval_traces=retrieval_traces,
     )
 
 
@@ -511,10 +602,25 @@ class SupervisorReportWriter:
         """
         brief: ResearchBrief | None = None
 
+        # ── ContextPack path (non-fatal) ─────────────────────────────────────
+        context_pack: ContextPack | None = None
+        try:
+            with EvidenceStore() as store:
+                context_pack = store.build_context_pack(
+                    task, preset, outputs,
+                )
+            if not context_pack.items:
+                context_pack = None
+        except Exception:  # noqa: BLE001
+            _log.warning("ContextPack build failed; falling back to agent prompts",
+                         exc_info=True)
+            context_pack = None
+
         # ── LLM path ─────────────────────────────────────────────────────────
         try:
             brief = await _run_llm_with_json_retries(
-                task, preset, outputs, cost_estimate
+                task, preset, outputs, cost_estimate,
+                context_pack=context_pack,
             )
         except Exception:  # noqa: BLE001
             brief = None

@@ -19,10 +19,13 @@ No imports of: Telegram, memory, raw DB, Tavily, or external APIs.
 from __future__ import annotations
 
 import asyncio
+import logging
 import sys
 import time
 from pathlib import Path
 from typing import Any
+
+_log = logging.getLogger(__name__)
 
 # ── sys.path bootstrap (coordinator lives 6 levels below Jarvis root) ─────────
 # coordinator.py → research/ → fx_monitor/ → data/ → skills/ → templates/
@@ -38,6 +41,7 @@ try:
     )
     from .runner import LocalAsyncRunner
     from .agents import FXAgent, MacroAgent, NewsAgent, RiskAgent
+    from .evidence_store import EvidenceStore
 except ImportError:
     from schema import (  # type: ignore[no-redef]
         AgentOutput, CostEstimate, PRESET_REGISTRY,
@@ -45,6 +49,7 @@ except ImportError:
     )
     from runner import LocalAsyncRunner  # type: ignore[no-redef]
     from agents import FXAgent, MacroAgent, NewsAgent, RiskAgent  # type: ignore[no-redef]
+    from evidence_store import EvidenceStore  # type: ignore[no-redef]
 
 # Module-level import so tests can patch coordinator.build_safe_user_context.
 # Falls back to a no-op that returns {} when pythonclaw is not on sys.path.
@@ -223,8 +228,21 @@ async def run_research(
         )
     risk_latency = int((time.monotonic() - t_risk) * 1000)
 
-    # ── 7. Compute CostEstimate ───────────────────────────────────────────────
+    # ── 7. Assemble all outputs ──────────────────────────────────────────────
     all_outputs = phase1_outputs + [risk_output]
+
+    # ── 8. Ingest into EvidenceStore (non-fatal) ─────────────────────────────
+    try:
+        _log.debug("ingesting evidence task_id=%s agents=%d", task.task_id, len(all_outputs))
+        with EvidenceStore() as store:
+            all_outputs = store.ingest_outputs(task, all_outputs)
+        total_ev = sum(o.evidence_count for o in all_outputs)
+        _log.debug("evidence ingest done task_id=%s total_chunks=%d", task.task_id, total_ev)
+    except Exception:  # noqa: BLE001
+        _log.warning("EvidenceStore ingest failed; continuing with original outputs",
+                     exc_info=True)
+
+    # ── 9. Compute CostEstimate ───────────────────────────────────────────────
     phase1_latencies = [o.latency_ms for o in phase1_outputs]
     cost = _compute_cost(all_outputs, phase1_latencies, risk_latency)
 

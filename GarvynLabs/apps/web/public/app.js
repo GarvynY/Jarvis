@@ -38,9 +38,11 @@ const PROJECT_ITEMS = [
     description: "项目介绍正在整理中。"
   },
   {
+    slug: "cloud-platform",
     title: "云服务数据平台",
     label: "Platform",
-    description: "项目介绍正在整理中。"
+    description: "基于 Kubernetes、Fission、Redis + RQ、Elasticsearch 构建的云原生社交媒体情绪分析平台，用于采集、处理和可视化澳大利亚大选相关公开数据。",
+    file: "/content/projects/cloud-platform.md"
   }
 ];
 
@@ -125,6 +127,9 @@ function currentRoute() {
   }
   if (path === "/about") return { type: "about" };
   if (path === "/projects") return { type: "projects" };
+  if (path.startsWith("/projects/")) {
+    return { type: "project-detail", slug: path.split("/")[2] };
+  }
   const key = path.slice(1);
   if (CATEGORY_META[key]) return { type: key === "jarvis" ? "jarvis" : "category", category: key };
   return { type: "home" };
@@ -315,7 +320,13 @@ function renderProjects() {
     <section class="section">
       <div class="section-inner">
         <div class="project-grid">
-          ${PROJECT_ITEMS.map((project) => `
+          ${PROJECT_ITEMS.map((project) => project.slug ? `
+            <a class="project-card project-card-link" href="/projects/${project.slug}/">
+              <span>${project.label}</span>
+              <h2>${project.title}</h2>
+              <p>${project.description}</p>
+            </a>
+          ` : `
             <article class="project-card">
               <span>${project.label}</span>
               <h2>${project.title}</h2>
@@ -326,6 +337,43 @@ function renderProjects() {
       </div>
     </section>
   `;
+}
+
+async function renderProjectDetail(slug) {
+  const project = PROJECT_ITEMS.find((p) => p.slug === slug);
+  if (!project || !project.file) {
+    app.innerHTML = `<section class="article-shell"><article class="article"><h1>项目不存在</h1><p>没有找到这个项目。</p></article></section>`;
+    return;
+  }
+  try {
+    const res = await fetch(`${project.file}?v=${Date.now()}`, { cache: "no-store" });
+    const raw = res.ok ? await res.text() : "# 加载失败\n\n项目内容暂时无法读取。";
+    const body = renderMarkdown(raw);
+    app.innerHTML = `
+      <section class="article-shell">
+        <aside class="article-toc" id="articleToc" aria-label="文章目录"></aside>
+        <article class="article">
+          <span class="article-meta">${project.label} · 其他项目作品</span>
+          <h1>${escapeHtml(project.title)}</h1>
+          <div class="article-body">${body}</div>
+        </article>
+      </section>
+    `;
+    buildArticleToc();
+    const highlighter = window.hljs;
+    if (highlighter?.highlightElement) {
+      document.querySelectorAll("pre code").forEach((block) => highlighter.highlightElement(block));
+    }
+  } catch (err) {
+    app.innerHTML = `
+      <section class="article-shell">
+        <article class="article">
+          <h1>渲染出错</h1>
+          <pre style="white-space:pre-wrap;color:#dc2626">${escapeHtml(err.message)}</pre>
+        </article>
+      </section>
+    `;
+  }
 }
 
 function renderJarvis() {
@@ -587,6 +635,7 @@ async function route(options = {}) {
   if (next.type === "home") renderHome();
   if (next.type === "about") renderAbout();
   if (next.type === "projects") renderProjects();
+  if (next.type === "project-detail") await renderProjectDetail(next.slug);
   if (next.type === "category") renderCategory(next.category);
   if (next.type === "jarvis") renderJarvis();
   if (next.type === "article") await renderArticle(next.slug);

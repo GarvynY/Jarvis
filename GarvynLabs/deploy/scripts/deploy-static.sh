@@ -43,8 +43,12 @@ tar -C "$ROOT_DIR/apps/api" -czf "$API_ARCHIVE" .
 "${SSH_RUN[@]}" "$USER@$HOST" "set -e
 mkdir -p '$WEB_ROOT'
 tar xzf /tmp/garvynlabs-web.tar.gz -C '$WEB_ROOT'
-if [ ! -f '$WEB_ROOT/content/manifest.json' ]; then
-  tar xzf /tmp/garvynlabs-content-seed.tar.gz -C '$WEB_ROOT'
+if [ -f '$WEB_ROOT/content/manifest.json' ]; then
+  cp '$WEB_ROOT/content/manifest.json' /tmp/garvynlabs-manifest-backup.json
+fi
+tar xzf /tmp/garvynlabs-content-seed.tar.gz -C '$WEB_ROOT' --skip-old-files
+if [ -f /tmp/garvynlabs-manifest-backup.json ]; then
+  cp /tmp/garvynlabs-manifest-backup.json '$WEB_ROOT/content/manifest.json'
 fi
 mkdir -p /opt/GarvynLabs/api
 tar xzf /tmp/garvynlabs-api.tar.gz -C /opt/GarvynLabs/api
@@ -80,6 +84,8 @@ EOF
 systemctl daemon-reload
 systemctl enable garvynlabs-admin
 systemctl restart garvynlabs-admin
+sleep 2
+GARVYNLABS_SITE_ROOT='$WEB_ROOT' python3 -c 'import sys; sys.path.insert(0,\"/opt/GarvynLabs/api\"); from server import _load_manifest, _write_manifest; d=_load_manifest(); _write_manifest(d); print(\"Manifest rebuilt: \" + str(len(d.get(\"articles\",[]))) + \" articles\")' || echo 'Manifest rebuild skipped'
 install -m 0644 /tmp/garvynlabs.conf /etc/nginx/sites-available/garvynlabs
 rm -f /etc/nginx/sites-enabled/default
 ln -sf /etc/nginx/sites-available/garvynlabs /etc/nginx/sites-enabled/garvynlabs

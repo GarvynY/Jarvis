@@ -24,6 +24,17 @@ Phase 10 additions (backward-compatible埋点):
   - Finding gains    — category, importance, source_ids, time_sensitivity
   - AgentOutput gains — risk_factors, depth_hints, depth_level, parent_agent
 
+Phase 9.1 additions (Runtime Micro-RAG evidence layer):
+  - EvidenceChunk    — one chunk of text in the evidence store
+  - EvidenceFinding  — a finding linked to evidence chunks
+  - CitationRef      — links a brief section to evidence
+  - ContextPackItem  — one ranked item in supervisor context window
+  - ContextPack      — token-budgeted context for supervisor LLM
+  - RetrievalTrace   — observability record for retrieval operations
+  - AgentOutput gains — chunk_ids, finding_ids, evidence_count
+  - ResearchSection gains — chunk_ids, citation_ids
+  - ResearchBrief gains — retrieval_traces
+
   All new fields carry safe defaults so every existing agent and test
   continues to work without modification.
 """
@@ -99,6 +110,16 @@ _FIXED_DISCLAIMER = (
 _VALID_SEVERITIES = {"low", "medium", "high", "critical"}
 _VALID_RISK_CATEGORIES = {"market", "regulatory", "operational", "liquidity"}
 _VALID_TIME_SENSITIVITIES = {"realtime", "quarterly", "annual"}
+_VALID_TTL_POLICIES = {"session", "task", "persistent"}
+
+
+def validate_ttl_policy(policy: str) -> str:
+    """Raise ValueError if policy is not 'session' / 'task' / 'persistent'."""
+    if policy not in _VALID_TTL_POLICIES:
+        raise ValueError(
+            f"Invalid ttl_policy {policy!r}. Must be one of {_VALID_TTL_POLICIES}"
+        )
+    return policy
 
 
 def validate_status(status: str) -> str:
@@ -148,12 +169,11 @@ class FindingCategory(str, Enum):
       MACRO_SENSITIVITY, SECTOR_DYNAMICS, REGULATORY
       CATALYST, SENTIMENT, ESG
     """
-    # ── FX / Phase 9 (backward-compat) ───────────────────────────────────────
-    FX_RATE             = "fx_rate"           # spot / historical rate data
-    FX_TREND            = "fx_trend"          # direction & momentum
-    MACRO_INDICATOR     = "macro_indicator"   # CPI, rates, GDP etc.
-    NEWS_EVENT          = "news_event"        # news-driven signal
-    RISK_FACTOR         = "risk_factor"       # generic risk signal
+    # ── Core taxonomy (Phase 9+) ────────────────────────────────────────────
+    FX_PRICE            = "fx_price"           # spot / historical / trend
+    MACRO               = "macro"              # CPI, rates, GDP, central bank
+    NEWS_EVENT          = "news_event"         # news-driven signal
+    RISK                = "risk"               # generic risk / contradiction
 
     # ── Equity fundamentals (Phase 10) ───────────────────────────────────────
     REVENUE_QUALITY     = "revenue_quality"   # revenue growth & quality
@@ -530,6 +550,247 @@ class DepthHint:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Phase 9.1 — Runtime Micro-RAG evidence dataclasses
+#
+# EvidenceChunk   — one chunk of text stored in the evidence store
+# EvidenceFinding — a finding linked to evidence chunks
+# CitationRef     — links a brief section back to evidence
+# ContextPackItem — one ranked item in the supervisor's context window
+# ContextPack     — the full token-budgeted context for supervisor LLM
+# RetrievalTrace  — observability record for one retrieval operation
+#
+# All fields carry safe defaults so existing code is unaffected.
+# No imports of coordinator, supervisor, agents, or external APIs.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _new_chunk_id() -> str:
+    return f"chunk-{uuid.uuid4()}"
+
+
+def _new_finding_id() -> str:
+    return f"find-{uuid.uuid4()}"
+
+
+def _new_citation_id() -> str:
+    return f"cite-{uuid.uuid4()}"
+
+
+def _new_trace_id() -> str:
+    return f"trace-{uuid.uuid4()}"
+
+
+@dataclass
+class EvidenceChunk:
+    """证据存储中的一个文本块。
+
+    由 EvidenceStore.ingest() 对 agent 输出（摘要、发现、原始片段）分块后生成。
+    Supervisor 通过检索这些块来构建 token 预算内的 ContextPack。
+    """
+    chunk_id: str = field(default_factory=_new_chunk_id)
+    task_id: str = ""                    # 所属研究任务 ID，用于追溯
+    preset_name: str = ""                # 所属 preset，用于按研究类型隔离证据
+    agent_name: str = ""
+    content: str = ""                    # 块文本内容
+    source: str | None = None            # SourceRef.url 或数据来源标识
+    category: str = ""                   # FindingCategory 值
+    importance: float = 0.0              # [0,1] — 继承自 Finding 或 agent confidence
+    confidence: float = 0.0              # [0,1] — agent 数据质量评估（独立于 importance）
+    entities: list[str] = field(default_factory=list)   # 命名实体标签，Phase 10 知识图谱索引依赖
+    used_in_brief: bool = False          # Supervisor 标记：此块是否已被引用进最终简报
+    created_at: str = field(default_factory=now_iso)
+    ttl_policy: str = "task"             # "session" / "task" / "persistent"
+    token_estimate: int = 0              # 近似 token 数，用于预算跟踪
+
+    def __post_init__(self) -> None:
+        validate_confidence(self.importance)
+        validate_confidence(self.confidence)
+        validate_ttl_policy(self.ttl_policy)
+
+    def to_dict(self) -> dict[str, Any]:
+        return to_dict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "EvidenceChunk":
+        return cls(
+            chunk_id=d.get("chunk_id", _new_chunk_id()),
+            task_id=d.get("task_id", ""),
+            preset_name=d.get("preset_name", ""),
+            agent_name=d.get("agent_name", ""),
+            content=d.get("content", ""),
+            source=d.get("source"),
+            category=d.get("category", ""),
+            importance=float(d.get("importance", 0.0)),
+            confidence=float(d.get("confidence", 0.0)),
+            entities=list(d.get("entities") or []),
+            used_in_brief=bool(d.get("used_in_brief", False)),
+            created_at=d.get("created_at", now_iso()),
+            ttl_policy=d.get("ttl_policy", "task"),
+            token_estimate=int(d.get("token_estimate", 0)),
+        )
+
+
+@dataclass
+class EvidenceFinding:
+    """A finding linked to one or more evidence chunks.
+
+    Maps an agent's Finding to the chunk_ids that support it,
+    enabling the supervisor to trace conclusions back to evidence.
+    """
+    finding_id: str = field(default_factory=_new_finding_id)
+    agent_name: str = ""
+    key: str = ""                        # Finding.key
+    summary: str = ""                    # Finding.summary
+    direction: str | None = None         # Finding.direction
+    chunk_ids: list[str] = field(default_factory=list)   # EvidenceChunk references
+    evidence_score: float | None = None  # [0,1] quality score
+    category: str = ""                   # FindingCategory value
+    importance: float = 0.0              # [0,1]
+
+    def __post_init__(self) -> None:
+        if self.evidence_score is not None:
+            validate_confidence(self.evidence_score)
+        validate_confidence(self.importance)
+
+    def to_dict(self) -> dict[str, Any]:
+        return to_dict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "EvidenceFinding":
+        return cls(
+            finding_id=d.get("finding_id", _new_finding_id()),
+            agent_name=d.get("agent_name", ""),
+            key=d.get("key", ""),
+            summary=d.get("summary", ""),
+            direction=d.get("direction"),
+            chunk_ids=list(d.get("chunk_ids") or []),
+            evidence_score=d.get("evidence_score"),
+            category=d.get("category", ""),
+            importance=float(d.get("importance", 0.0)),
+        )
+
+
+@dataclass
+class CitationRef:
+    """Links a brief section back to a specific evidence chunk.
+
+    Supervisor attaches these when generating sections so that every
+    claim in the final brief is traceable to its supporting evidence.
+    """
+    citation_id: str = field(default_factory=_new_citation_id)
+    chunk_id: str = ""                   # EvidenceChunk reference
+    finding_id: str | None = None        # EvidenceFinding reference (optional)
+    section_title: str = ""              # ResearchSection.title
+    relevance_score: float = 0.0         # [0,1] how relevant this chunk was
+
+    def __post_init__(self) -> None:
+        validate_confidence(self.relevance_score)
+
+    def to_dict(self) -> dict[str, Any]:
+        return to_dict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "CitationRef":
+        return cls(
+            citation_id=d.get("citation_id", _new_citation_id()),
+            chunk_id=d.get("chunk_id", ""),
+            finding_id=d.get("finding_id"),
+            section_title=d.get("section_title", ""),
+            relevance_score=float(d.get("relevance_score", 0.0)),
+        )
+
+
+@dataclass
+class ContextPackItem:
+    """One ranked item in the supervisor's context window.
+
+    Built by the evidence store's retrieval pipeline: rank chunks by
+    relevance, trim to token budget, and package for the LLM prompt.
+    """
+    chunk_id: str = ""
+    agent_name: str = ""
+    text: str = ""
+    relevance_score: float = 0.0         # [0,1]
+    token_estimate: int = 0
+
+    def __post_init__(self) -> None:
+        validate_confidence(self.relevance_score)
+
+    def to_dict(self) -> dict[str, Any]:
+        return to_dict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "ContextPackItem":
+        return cls(
+            chunk_id=d.get("chunk_id", ""),
+            agent_name=d.get("agent_name", ""),
+            text=d.get("text", ""),
+            relevance_score=float(d.get("relevance_score", 0.0)),
+            token_estimate=int(d.get("token_estimate", 0)),
+        )
+
+
+@dataclass
+class ContextPack:
+    """Token-budgeted context for supervisor LLM prompt.
+
+    The evidence store builds this by retrieving, ranking, and trimming
+    chunks to fit within the token budget.
+    """
+    items: list[ContextPackItem] = field(default_factory=list)
+    total_tokens: int = 0
+    budget_tokens: int = 0
+    coverage: dict[str, int] = field(default_factory=dict)  # agent_name -> chunk count
+
+    def to_dict(self) -> dict[str, Any]:
+        return to_dict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "ContextPack":
+        return cls(
+            items=[ContextPackItem.from_dict(i) for i in d.get("items") or []],
+            total_tokens=int(d.get("total_tokens", 0)),
+            budget_tokens=int(d.get("budget_tokens", 0)),
+            coverage={k: int(v) for k, v in (d.get("coverage") or {}).items()},
+        )
+
+
+@dataclass
+class RetrievalTrace:
+    """Observability record for one retrieval operation.
+
+    Attached to ResearchBrief so we can audit how evidence was selected
+    and diagnose retrieval quality issues.
+    """
+    trace_id: str = field(default_factory=_new_trace_id)
+    query: str = ""
+    retrieved_count: int = 0
+    total_chunks: int = 0
+    top_scores: list[float] = field(default_factory=list)   # 每个元素 [0,1]
+    latency_ms: int = 0
+    timestamp: str = field(default_factory=now_iso)
+
+    def __post_init__(self) -> None:
+        for i, score in enumerate(self.top_scores):
+            validate_confidence(score)
+
+    def to_dict(self) -> dict[str, Any]:
+        return to_dict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "RetrievalTrace":
+        return cls(
+            trace_id=d.get("trace_id", _new_trace_id()),
+            query=d.get("query", ""),
+            retrieved_count=int(d.get("retrieved_count", 0)),
+            total_chunks=int(d.get("total_chunks", 0)),
+            top_scores=list(d.get("top_scores") or []),
+            latency_ms=int(d.get("latency_ms", 0)),
+            timestamp=d.get("timestamp", now_iso()),
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 7. Finding
 #    One atomic research finding from an agent.
 #
@@ -672,6 +933,18 @@ class AgentOutput:
     # Enables full lineage tracing: which signal → which deep-dive chain.
     # Also used by AttentionLayer to avoid duplicate expansion of the same hint.
 
+    # ── Phase 9.1 evidence store additions ────────────────────────────────────
+
+    chunk_ids: list[str] = field(default_factory=list)
+    # EvidenceChunk references produced when this output is ingested into
+    # the evidence store.  Populated by EvidenceStore.ingest(), not by agents.
+
+    finding_ids: list[str] = field(default_factory=list)
+    # EvidenceFinding references linking this output's findings to chunks.
+
+    evidence_count: int = 0
+    # Total number of evidence chunks ingested from this output.
+
     def __post_init__(self) -> None:
         validate_status(self.status)
         validate_confidence(self.confidence)
@@ -729,6 +1002,10 @@ class AgentOutput:
             depth_hints=[DepthHint.from_dict(h) for h in d.get("depth_hints") or []],
             depth_level=int(d.get("depth_level", 0)),
             parent_agent=d.get("parent_agent"),
+            # Phase 9.1 fields — gracefully absent in old serialised data
+            chunk_ids=list(d.get("chunk_ids") or []),
+            finding_ids=list(d.get("finding_ids") or []),
+            evidence_count=int(d.get("evidence_count", 0)),
         )
 
 
@@ -745,6 +1022,10 @@ class ResearchSection:
     source_agents: list[str] = field(default_factory=list)   # contributing agent names
     has_data_gap: bool = False           # True if any contributing agent had status != "ok"
 
+    # ── Phase 9.1 evidence traceability ───────────────────────────────────────
+    chunk_ids: list[str] = field(default_factory=list)     # EvidenceChunk refs used for this section
+    citation_ids: list[str] = field(default_factory=list)  # CitationRef refs attached by supervisor
+
     def to_dict(self) -> dict[str, Any]:
         return to_dict(self)
 
@@ -755,6 +1036,8 @@ class ResearchSection:
             content=d.get("content", ""),
             source_agents=list(d.get("source_agents") or []),
             has_data_gap=bool(d.get("has_data_gap", False)),
+            chunk_ids=list(d.get("chunk_ids") or []),
+            citation_ids=list(d.get("citation_ids") or []),
         )
 
 
@@ -807,6 +1090,9 @@ class ResearchBrief:
     agent_statuses: dict[str, str] = field(default_factory=dict)   # {"fx_agent": "ok", …}
     cost_estimate: CostEstimate = field(default_factory=CostEstimate)
 
+    # ── Phase 9.1 retrieval observability ─────────────────────────────────────
+    retrieval_traces: list[RetrievalTrace] = field(default_factory=list)
+
     def to_dict(self) -> dict[str, Any]:
         return to_dict(self)
 
@@ -824,4 +1110,5 @@ class ResearchBrief:
             # disclaimer is always the fixed compliance text — ignored from dict
             agent_statuses=dict(d.get("agent_statuses") or {}),
             cost_estimate=CostEstimate.from_dict(d.get("cost_estimate") or {}),
+            retrieval_traces=[RetrievalTrace.from_dict(t) for t in d.get("retrieval_traces") or []],
         )
