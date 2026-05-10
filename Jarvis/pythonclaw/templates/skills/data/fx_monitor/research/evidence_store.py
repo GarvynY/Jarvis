@@ -19,14 +19,19 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sqlite3
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import time
 
 _log = logging.getLogger(__name__)
+
+_PROVIDER_ONLY_SOURCE_LABELS = {"google_news_rss", "tavily", "web_search"}
+_CONFLICT_SELECTION_BOOST = 0.10
 
 from schema import (
     AgentOutput,
@@ -39,10 +44,23 @@ from schema import (
     ResearchPreset,
     ResearchTask,
     RetrievalTrace,
+    SafeUserContext,
     now_iso,
 )
 
-_SCHEMA_VERSION = 1
+try:
+    from evidence_scorer import compute_evidence_score, fallback_score
+except ImportError:
+    compute_evidence_score = None  # type: ignore[assignment]
+    fallback_score = None  # type: ignore[assignment]
+
+try:
+    from conflict_detector import detect_conflicts, apply_conflict_boost
+except ImportError:
+    detect_conflicts = None  # type: ignore[assignment]
+    apply_conflict_boost = None  # type: ignore[assignment]
+
+_SCHEMA_VERSION = 3
 
 _DDL = """\
 CREATE TABLE IF NOT EXISTS evidence_chunks (
@@ -59,7 +77,9 @@ CREATE TABLE IF NOT EXISTS evidence_chunks (
     used_in_brief  INTEGER NOT NULL DEFAULT 0,
     created_at     TEXT NOT NULL DEFAULT '',
     ttl_policy     TEXT NOT NULL DEFAULT 'task',
-    token_estimate INTEGER NOT NULL DEFAULT 0
+    token_estimate INTEGER NOT NULL DEFAULT 0,
+    attention_score REAL NOT NULL DEFAULT 0.0,
+    composite_score REAL NOT NULL DEFAULT 0.0
 );
 
 CREATE INDEX IF NOT EXISTS idx_chunks_task     ON evidence_chunks(task_id);
@@ -100,7 +120,15 @@ CREATE TABLE IF NOT EXISTS retrieval_traces (
     total_chunks    INTEGER NOT NULL DEFAULT 0,
     top_scores_json TEXT NOT NULL DEFAULT '[]',
     latency_ms      INTEGER NOT NULL DEFAULT 0,
-    timestamp       TEXT NOT NULL DEFAULT ''
+    timestamp       TEXT NOT NULL DEFAULT '',
+    section_title   TEXT NOT NULL DEFAULT '',
+    selected_chunk_ids_json TEXT NOT NULL DEFAULT '[]',
+    section_covered INTEGER NOT NULL DEFAULT 0,
+    score_distribution_json TEXT NOT NULL DEFAULT '{}',
+    conflict_count INTEGER NOT NULL DEFAULT 0,
+    conflict_pairs_json TEXT NOT NULL DEFAULT '[]',
+    boosted_chunk_ids_json TEXT NOT NULL DEFAULT '[]',
+    scoring_method  TEXT NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS idx_traces_task ON retrieval_traces(task_id);
@@ -146,12 +174,59 @@ class EvidenceStore:
         row = cur.execute(
             "SELECT version FROM schema_version ORDER BY version DESC LIMIT 1"
         ).fetchone()
+        current_version = row[0] if row else 0
+        if current_version < 2:
+            self._migrate_to_v2(cur)
+        if current_version < 3:
+            self._migrate_to_v3(cur)
         if row is None:
             cur.execute(
                 "INSERT INTO schema_version (version) VALUES (?)",
                 (_SCHEMA_VERSION,),
             )
+        elif current_version < _SCHEMA_VERSION:
+            cur.execute(
+                "UPDATE schema_version SET version = ?",
+                (_SCHEMA_VERSION,),
+            )
         self._conn.commit()
+
+    def _migrate_to_v2(self, cur: Any) -> None:
+        """Add Phase 10 columns if missing (safe on fresh DBs too)."""
+        for col, typedef in (
+            ("attention_score", "REAL NOT NULL DEFAULT 0.0"),
+            ("composite_score", "REAL NOT NULL DEFAULT 0.0"),
+        ):
+            try:
+                cur.execute(
+                    f"ALTER TABLE evidence_chunks ADD COLUMN {col} {typedef}"
+                )
+            except Exception:
+                pass
+        try:
+            cur.execute(
+                "ALTER TABLE retrieval_traces ADD COLUMN scoring_method TEXT NOT NULL DEFAULT ''"
+            )
+        except Exception:
+            pass
+
+    def _migrate_to_v3(self, cur: Any) -> None:
+        """Add structured RetrievalTrace columns if missing."""
+        for col, typedef in (
+            ("section_title", "TEXT NOT NULL DEFAULT ''"),
+            ("selected_chunk_ids_json", "TEXT NOT NULL DEFAULT '[]'"),
+            ("section_covered", "INTEGER NOT NULL DEFAULT 0"),
+            ("score_distribution_json", "TEXT NOT NULL DEFAULT '{}'"),
+            ("conflict_count", "INTEGER NOT NULL DEFAULT 0"),
+            ("conflict_pairs_json", "TEXT NOT NULL DEFAULT '[]'"),
+            ("boosted_chunk_ids_json", "TEXT NOT NULL DEFAULT '[]'"),
+        ):
+            try:
+                cur.execute(
+                    f"ALTER TABLE retrieval_traces ADD COLUMN {col} {typedef}"
+                )
+            except Exception:
+                pass
 
     def close(self) -> None:
         self._conn.close()
@@ -169,8 +244,9 @@ class EvidenceStore:
             """INSERT OR REPLACE INTO evidence_chunks
                (chunk_id, task_id, preset_name, agent_name, content, source,
                 category, importance, confidence, entities_json,
-                used_in_brief, created_at, ttl_policy, token_estimate)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                used_in_brief, created_at, ttl_policy, token_estimate,
+                attention_score, composite_score)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 chunk.chunk_id,
                 chunk.task_id,
@@ -186,6 +262,8 @@ class EvidenceStore:
                 chunk.created_at,
                 chunk.ttl_policy,
                 chunk.token_estimate,
+                chunk.attention_score,
+                chunk.composite_score,
             ),
         )
         self._conn.commit()
@@ -231,8 +309,11 @@ class EvidenceStore:
         self._conn.execute(
             """INSERT OR REPLACE INTO retrieval_traces
                (trace_id, task_id, query, retrieved_count, total_chunks,
-                top_scores_json, latency_ms, timestamp)
-               VALUES (?,?,?,?,?,?,?,?)""",
+                top_scores_json, latency_ms, timestamp, section_title,
+                selected_chunk_ids_json, section_covered, score_distribution_json,
+                conflict_count, conflict_pairs_json, boosted_chunk_ids_json,
+                scoring_method)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 trace.trace_id,
                 task_id,
@@ -242,6 +323,14 @@ class EvidenceStore:
                 json.dumps(trace.top_scores),
                 trace.latency_ms,
                 trace.timestamp,
+                trace.section_title,
+                json.dumps(trace.selected_chunk_ids, ensure_ascii=False),
+                int(trace.section_covered),
+                json.dumps(trace.score_distribution, ensure_ascii=False),
+                trace.conflict_count,
+                json.dumps(trace.conflict_pairs, ensure_ascii=False),
+                json.dumps(trace.boosted_chunk_ids, ensure_ascii=False),
+                trace.scoring_method,
             ),
         )
         self._conn.commit()
@@ -376,10 +465,10 @@ class EvidenceStore:
         返回带有 chunk_ids / finding_ids / evidence_count 的 AgentOutput 副本，
         不修改原始输入对象。
         """
-        source_map: dict[str, str] = {}
+        source_map: dict[str, Any] = {}
         for out in outputs:
             for src in out.sources:
-                source_map[src.url] = src.source
+                source_map[src.url] = src
 
         enriched: list[AgentOutput] = []
 
@@ -448,18 +537,31 @@ class EvidenceStore:
     def _resolve_source(
         source_ids: list[str],
         sources: list,
-        source_map: dict[str, str],
+        source_map: dict[str, Any],
     ) -> str:
+        def _format_source(src: Any) -> str:
+            title = getattr(src, "title", "") or ""
+            url = getattr(src, "url", "") or ""
+            provider = getattr(src, "source", "") or ""
+            parts = []
+            if url:
+                parts.append(f"url={url}")
+            if title:
+                parts.append(f"title={title}")
+            if provider:
+                parts.append(f"provider={provider}")
+            return " | ".join(parts)
+
         if source_ids:
             labels = []
             for sid in source_ids:
                 if sid in source_map:
-                    labels.append(source_map[sid])
+                    labels.append(_format_source(source_map[sid]))
                 else:
                     labels.append(sid)
             return ", ".join(labels)
         if sources:
-            return sources[0].source
+            return _format_source(sources[0])
         return ""
 
     @staticmethod
@@ -517,6 +619,59 @@ class EvidenceStore:
                         cats.append(cat)
         return cats
 
+    @staticmethod
+    def _normalise_url(url: str) -> str:
+        text = (url or "").strip()
+        if not text:
+            return ""
+        parsed = urlparse(text if re.match(r"^https?://", text, re.I) else f"https://{text}")
+        host = parsed.netloc.lower()
+        if host.startswith("www."):
+            host = host[4:]
+        path = re.sub(r"/+$", "", parsed.path or "")
+        return f"{host}{path}".lower()
+
+    @staticmethod
+    def _source_identity(source: str | None) -> tuple[str, str, str]:
+        """Return (url_key, title_domain_key, provider_label) for deduping.
+
+        Provider-only labels such as google_news_rss are deliberately not used
+        as evidence identity keys.
+        """
+        text = (source or "").strip()
+        if not text:
+            return "", "", ""
+
+        url = ""
+        m_url_field = re.search(r"\burl=([^|,;\s]+)", text, flags=re.IGNORECASE)
+        if m_url_field:
+            url = m_url_field.group(1).strip()
+        else:
+            m_url = re.search(r"https?://[^\s,;|)]+", text)
+            if m_url:
+                url = m_url.group(0).rstrip("。.,;")
+
+        url_key = EvidenceStore._normalise_url(url)
+        domain = urlparse(url if re.match(r"^https?://", url or "", re.I) else f"https://{url}").netloc.lower() if url else ""
+        if domain.startswith("www."):
+            domain = domain[4:]
+
+        title = ""
+        m_title = re.search(r"\btitle=([^|]+)", text, flags=re.IGNORECASE)
+        if m_title:
+            title = m_title.group(1)
+        title_key = re.sub(r"\s+", " ", title).strip().lower()
+        title_domain_key = f"{domain}|{title_key}" if domain and title_key else ""
+
+        provider = ""
+        m_provider = re.search(r"\bprovider=([^|,;\s]+)", text, flags=re.IGNORECASE)
+        if m_provider:
+            provider = m_provider.group(1).strip().lower()
+        elif text.lower() in _PROVIDER_ONLY_SOURCE_LABELS:
+            provider = text.lower()
+
+        return url_key, title_domain_key, provider
+
     def build_context_pack(
         self,
         task: ResearchTask,
@@ -524,14 +679,19 @@ class EvidenceStore:
         outputs: list[AgentOutput],  # MVP 未使用；预留给后续嵌入向量/agent 权重扩展
         *,
         max_chunks_per_section: int = 5,
-        token_budget: int = 4000,
+        token_budget: int = 6000,
+        safe_user_context: SafeUserContext | None = None,
     ) -> ContextPack:
         total_chunks_in_db = self.count_chunks(task.task_id)
         all_items: list[ContextPackItem] = []
         seen_chunk_ids: set[str] = set()
-        seen_sources: set[str] = set()
+        seen_urls: set[str] = set()
         traces: list[RetrievalTrace] = []
         tokens_used = 0
+
+        use_scorer = compute_evidence_score is not None
+        scoring_method = "composite" if use_scorer else "legacy"
+        total_conflict_count = 0
 
         for section_title in preset.report_sections:
             if tokens_used >= token_budget:
@@ -566,54 +726,145 @@ class EvidenceStore:
                 pre_dedup_count = len(candidates)
 
             deduped: list[EvidenceChunk] = []
-            local_sources: set[str] = set()
+            local_keys: set[str] = set()
             for c in candidates:
                 if c.chunk_id in seen_chunk_ids:
                     continue
-                source_key = c.source or ""
-                if source_key and (source_key in seen_sources or source_key in local_sources):
+                url_key, title_domain_key, _provider = self._source_identity(c.source)
+                if url_key and url_key in seen_urls:
                     continue
-                deduped.append(c)
-                if source_key:
-                    local_sources.add(source_key)
+                local_key = url_key or title_domain_key
+                if local_key and local_key in local_keys:
+                    continue
 
-            deduped.sort(
-                key=lambda c: (c.importance, c.confidence, c.created_at),
-                reverse=True,
-            )
+                deduped.append(c)
+                if local_key:
+                    local_keys.add(local_key)
+
+            score_map: dict[str, float] = {}
+            section_conflict_count = 0
+            section_conflict_pairs: list[dict[str, Any]] = []
+            boosted_chunk_ids: list[str] = []
+            if use_scorer:
+                try:
+                    for c in deduped:
+                        es = compute_evidence_score(c, safe_user_context)
+                        score_map[c.chunk_id] = es.composite_score
+                        c.composite_score = es.composite_score
+                        c.attention_score = es.attention_score
+
+                    if detect_conflicts is not None and len(deduped) >= 2:
+                        try:
+                            candidate_chunk_ids = [c.chunk_id for c in deduped]
+                            findings = self._query_findings_by_chunks(
+                                candidate_chunk_ids, task.task_id,
+                            )
+                            if len(findings) >= 2:
+                                chunk_entities: dict[str, list[str]] = {
+                                    c.chunk_id: c.entities
+                                    for c in deduped
+                                    if c.entities
+                                }
+                                summary = detect_conflicts(
+                                    findings, chunk_entities=chunk_entities,
+                                )
+                                section_conflict_count = summary.conflict_count
+                                total_conflict_count += section_conflict_count
+                                if section_conflict_count > 0:
+                                    before_scores = dict(score_map)
+                                    apply_conflict_boost(
+                                        score_map, summary,
+                                        boost=_CONFLICT_SELECTION_BOOST,
+                                    )
+                                    boosted_chunk_ids = sorted(
+                                        cid for cid in summary.conflicting_chunk_ids
+                                        if score_map.get(cid, 0.0) > before_scores.get(cid, 0.0)
+                                    )
+                                    for c in deduped:
+                                        if c.chunk_id in score_map:
+                                            c.composite_score = score_map[c.chunk_id]
+                                            c.attention_score = score_map[c.chunk_id]
+                                    section_conflict_pairs = [cp.to_dict() for cp in summary.conflicts]
+                        except Exception:
+                            _log.warning(
+                                "conflict_detector failed; using scored sort",
+                                exc_info=True,
+                            )
+
+                    deduped.sort(
+                        key=lambda c: score_map.get(c.chunk_id, 0.0),
+                        reverse=True,
+                    )
+                except Exception:
+                    _log.warning("evidence_scorer failed; using legacy sort", exc_info=True)
+                    scoring_method = "legacy"
+                    score_map.clear()
+                    for c in deduped:
+                        c.composite_score = 0.0
+                        c.attention_score = 0.0
+                    deduped.sort(
+                        key=lambda c: (c.importance, c.confidence, c.created_at),
+                        reverse=True,
+                    )
+            else:
+                deduped.sort(
+                    key=lambda c: (c.importance, c.confidence, c.created_at),
+                    reverse=True,
+                )
 
             section_items: list[ContextPackItem] = []
-            for c in deduped[:max_chunks_per_section]:
-                if tokens_used + c.token_estimate > token_budget:
+            skipped_over_budget = 0
+            for c in deduped:
+                if len(section_items) >= max_chunks_per_section:
                     break
+                if tokens_used + c.token_estimate > token_budget:
+                    skipped_over_budget += 1
+                    continue
+                cs = score_map.get(c.chunk_id, c.importance)
                 item = ContextPackItem(
                     chunk_id=c.chunk_id,
                     agent_name=c.agent_name,
                     text=c.content,
-                    relevance_score=c.importance,
+                    relevance_score=cs,
                     token_estimate=c.token_estimate,
+                    composite_score=c.composite_score,
+                    attention_score=c.attention_score,
                 )
                 section_items.append(item)
                 seen_chunk_ids.add(c.chunk_id)
-                if c.source:
-                    seen_sources.add(c.source)
+                url_key, _title_domain_key, _provider = self._source_identity(c.source)
+                if url_key:
+                    seen_urls.add(url_key)
                 tokens_used += c.token_estimate
 
             all_items.extend(section_items)
 
             latency = int((time.monotonic() - t0) * 1000)
-            top_scores = [round(c.importance, 4) for c in deduped[:max_chunks_per_section]]
+            top_scores = [
+                round(item.relevance_score, 4)
+                for item in section_items
+            ]
             noise_rate = round(
                 1.0 - len(section_items) / pre_dedup_count, 4,
             ) if pre_dedup_count > 0 else 0.0
 
             selected_ids = [it.chunk_id for it in section_items]
+            score_values = [score_map.get(c.chunk_id, c.importance) for c in deduped]
+            score_distribution = {
+                "count": len(score_values),
+                "min": round(min(score_values), 4) if score_values else 0.0,
+                "max": round(max(score_values), 4) if score_values else 0.0,
+                "avg": round(sum(score_values) / len(score_values), 4) if score_values else 0.0,
+            }
             query_desc = (
                 f"section={section_title} "
                 f"filters=[{', '.join(filter_desc_parts)}] "
                 f"pre_dedup={pre_dedup_count} post_dedup={len(deduped)} "
                 f"selected={len(section_items)} noise_rate={noise_rate} "
-                f"chunk_ids={selected_ids}"
+                f"skipped_over_budget={skipped_over_budget} "
+                f"scoring={scoring_method} "
+                f"conflicts={section_conflict_count} "
+                f"boosted={len(boosted_chunk_ids)}"
             )
             trace = RetrievalTrace(
                 query=query_desc,
@@ -621,6 +872,14 @@ class EvidenceStore:
                 total_chunks=total_chunks_in_db,
                 top_scores=[s for s in top_scores if 0.0 <= s <= 1.0],
                 latency_ms=latency,
+                section_title=section_title,
+                selected_chunk_ids=selected_ids,
+                section_covered=bool(section_items),
+                score_distribution=score_distribution,
+                conflict_count=section_conflict_count,
+                conflict_pairs=section_conflict_pairs,
+                boosted_chunk_ids=boosted_chunk_ids,
+                scoring_method=scoring_method,
             )
             self.insert_trace(trace, task_id=task.task_id)
             traces.append(trace)
@@ -629,11 +888,26 @@ class EvidenceStore:
         for item in all_items:
             coverage[item.agent_name] = coverage.get(item.agent_name, 0) + 1
 
+        if scoring_method == "composite" and all_items:
+            try:
+                for item in all_items:
+                    self._conn.execute(
+                        "UPDATE evidence_chunks "
+                        "SET composite_score = ?, attention_score = ? "
+                        "WHERE chunk_id = ?",
+                        (item.composite_score, item.attention_score, item.chunk_id),
+                    )
+                self._conn.commit()
+            except Exception:
+                _log.warning("score persist failed; scores are pack-local only",
+                             exc_info=True)
+
         sections_total = len(preset.report_sections)
         sections_covered = sum(1 for t in traces if t.retrieved_count > 0)
         _log.debug(
-            "context_pack_summary: retrieved_total=%d selected=%d "
-            "used=%d section_coverage=%d/%d tokens=%d/%d",
+            "context_pack_summary: scoring=%s retrieved_total=%d selected=%d "
+            "used=%d section_coverage=%d/%d tokens=%d/%d conflicts=%d",
+            scoring_method,
             total_chunks_in_db,
             len(all_items),
             sum(1 for it in all_items if it.token_estimate > 0),
@@ -641,6 +915,7 @@ class EvidenceStore:
             sections_total,
             tokens_used,
             token_budget,
+            total_conflict_count,
         )
 
         return ContextPack(
@@ -649,6 +924,25 @@ class EvidenceStore:
             budget_tokens=token_budget,
             coverage=coverage,
         )
+
+    def _query_findings_by_chunks(
+        self, chunk_ids: list[str], task_id: str,
+    ) -> list[EvidenceFinding]:
+        """Return findings whose chunk_ids overlap with the given list."""
+        if not chunk_ids:
+            return []
+        target = set(chunk_ids)
+        rows = self._conn.execute(
+            "SELECT * FROM evidence_findings "
+            "WHERE task_id = ? AND direction IS NOT NULL",
+            (task_id,),
+        ).fetchall()
+        results: list[EvidenceFinding] = []
+        for r in rows:
+            f = self._row_to_finding(r)
+            if target & set(f.chunk_ids):
+                results.append(f)
+        return results
 
     # ── 清理 ─────────────────────────────────────────────────────────────────
 
@@ -689,6 +983,8 @@ class EvidenceStore:
             created_at=row["created_at"],
             ttl_policy=row["ttl_policy"],
             token_estimate=int(row["token_estimate"]),
+            attention_score=float(row["attention_score"]),
+            composite_score=float(row["composite_score"]),
         )
 
     @staticmethod
@@ -717,6 +1013,24 @@ class EvidenceStore:
 
     @staticmethod
     def _row_to_trace(row: sqlite3.Row) -> RetrievalTrace:
+        def _json_col(name: str, default: Any) -> Any:
+            try:
+                raw = row[name]
+            except (KeyError, IndexError):
+                return default
+            if raw in (None, ""):
+                return default
+            try:
+                return json.loads(raw)
+            except Exception:
+                return default
+
+        def _col(name: str, default: Any) -> Any:
+            try:
+                return row[name]
+            except (KeyError, IndexError):
+                return default
+
         return RetrievalTrace(
             trace_id=row["trace_id"],
             query=row["query"],
@@ -725,4 +1039,12 @@ class EvidenceStore:
             top_scores=json.loads(row["top_scores_json"]),
             latency_ms=int(row["latency_ms"]),
             timestamp=row["timestamp"],
+            section_title=_col("section_title", ""),
+            selected_chunk_ids=list(_json_col("selected_chunk_ids_json", [])),
+            section_covered=bool(_col("section_covered", 0)),
+            score_distribution=dict(_json_col("score_distribution_json", {})),
+            conflict_count=int(_col("conflict_count", 0)),
+            conflict_pairs=list(_json_col("conflict_pairs_json", [])),
+            boosted_chunk_ids=list(_json_col("boosted_chunk_ids_json", [])),
+            scoring_method=_col("scoring_method", ""),
         )

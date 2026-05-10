@@ -332,6 +332,22 @@ async def test_signal_directions() -> None:
     print("   PASS")
 
 
+async def test_signal_source_ids_are_compact() -> None:
+    """Macro signal findings should not attach every retrieved source."""
+    with _mock_search_ok(), _mock_llm_ok():
+        output = await MacroAgent().run(_make_task())
+
+    findings_by_key = {f.key: f for f in output.findings}
+    assert findings_by_key["macro_rba"].source_ids == ["https://example.com/macro/1"]
+    assert findings_by_key["macro_pboc"].source_ids == ["https://example.com/macro/2"]
+    assert findings_by_key["macro_usd"].source_ids == ["https://example.com/macro/3"]
+
+    print("\n-- test_signal_source_ids_are_compact")
+    for key in ("macro_rba", "macro_pboc", "macro_usd"):
+        print(f"   [{key}] sources={findings_by_key[key].source_ids}")
+    print("   PASS")
+
+
 async def test_json_safe() -> None:
     """Output serialises to valid JSON in all paths."""
     with _mock_search_all_fail():
@@ -395,11 +411,12 @@ async def main() -> None:
     await test_queries_preserved()
     await test_sourceref_fields()
     await test_signal_directions()
+    await test_signal_source_ids_are_compact()
     await test_json_safe()
     await test_banned_terms_and_fabricated_findings_sanitized()
 
     print("\n" + "=" * 60)
-    print("All 9 tests passed.")
+    print("All 10 tests passed.")
 
 
 if __name__ == "__main__":

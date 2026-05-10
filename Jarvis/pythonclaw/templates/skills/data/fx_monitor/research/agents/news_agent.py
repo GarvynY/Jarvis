@@ -284,6 +284,7 @@ def _parse_llm_response(
                             key=f"news_{idx}",
                             summary=title,
                             direction=direction,
+                            source_ids=[art.get("url", "")] if art.get("url") else [],
                         ))
                 return findings[:_MAX_FINDINGS], risks, summary, unsafe_removed
         except Exception:
@@ -299,6 +300,7 @@ def _parse_llm_response(
             key=f"news_{i}",
             summary=title,
             direction=_heuristic_direction(title),
+            source_ids=[art.get("url", "")] if art.get("url") else [],
         ))
     return findings, [], f"基于 {len(findings)} 条新闻（LLM分析不可用，使用关键词启发式）", False
 

@@ -632,18 +632,99 @@ _FEEDBACK_TYPE_LABELS: dict[str, str] = {
 }
 
 
-def _make_feedback_keyboard(source: str, topic: str = "") -> InlineKeyboardMarkup:
+def _safe_callback_part(value: str, max_len: int) -> str:
+    value = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value or "").strip())
+    return value[:max_len]
+
+
+def _make_feedback_keyboard(
+    source: str,
+    topic: str = "",
+    *,
+    brief_id: str = "",
+    task_id: str = "",
+    section_title: str = "",
+    category: str = "",
+) -> InlineKeyboardMarkup:
     """Return a one-row inline keyboard with three feedback buttons.
 
-    callback_data format: ``fb:<event_type>:<source>[:<topic>]``
-    Telegram limits callback_data to 64 bytes, so topic is truncated.
+    callback_data format:
+    ``fb:<event_type>:<source>[:<topic>][:b=<brief_id>|t=<task_id>][:c=<category>]``
+    Telegram limits callback_data to 64 bytes, so each field is short.
     """
-    suffix = f"{source}:{topic[:20]}" if topic else source
+    safe_source = _safe_callback_part(source, 14) or "unknown"
+    safe_topic = _safe_callback_part(topic, 18)
+    safe_brief = _safe_callback_part(brief_id, 12)
+    safe_task = _safe_callback_part(task_id, 12)
+    safe_category = _safe_callback_part(category, 14)
+    safe_section = _safe_callback_part(section_title, 10)
+
+    parts = [safe_source]
+    if safe_topic:
+        parts.append(safe_topic)
+    if safe_brief:
+        parts.append(f"b={safe_brief}")
+    elif safe_task:
+        parts.append(f"t={safe_task}")
+    if safe_category:
+        parts.append(f"c={safe_category}")
+    if safe_section:
+        parts.append(f"s={safe_section}")
+    suffix = ":".join(parts)
+    event_types = ("useful", "not_useful", "not_interested")
+    while parts and any(
+        len(f"{_FB_PREFIX}{event_type}:{':'.join(parts)}".encode("utf-8")) > 64
+        for event_type in event_types
+    ):
+        if parts[-1].startswith("s=") or parts[-1].startswith("c="):
+            parts.pop()
+        elif len(parts) > 2 and parts[2].startswith(("b=", "t=")):
+            parts[2] = parts[2][:10]
+            break
+        elif len(parts) > 1:
+            parts[1] = parts[1][:10]
+            break
+        else:
+            parts[0] = parts[0][:8]
+            break
+    suffix = ":".join(parts)
     return InlineKeyboardMarkup([[
         InlineKeyboardButton("👍 有用",    callback_data=f"{_FB_PREFIX}useful:{suffix}"),
         InlineKeyboardButton("👎 无用",    callback_data=f"{_FB_PREFIX}not_useful:{suffix}"),
         InlineKeyboardButton("🚫 不感兴趣", callback_data=f"{_FB_PREFIX}not_interested:{suffix}"),
     ]])
+
+
+def _parse_feedback_callback_data(data: str) -> dict[str, str | None]:
+    """Parse new and legacy feedback callback_data without raw content."""
+    if not data.startswith(_FB_PREFIX):
+        return {}
+    parts = data[len(_FB_PREFIX):].split(":")
+    if not parts:
+        return {}
+    parsed: dict[str, str | None] = {
+        "event_type": parts[0] or None,
+        "source": parts[1] if len(parts) > 1 and parts[1] else "unknown",
+        "topic": None,
+        "brief_id": None,
+        "task_id": None,
+        "section_title": None,
+        "category": None,
+    }
+    for token in parts[2:]:
+        if token.startswith("b="):
+            parsed["brief_id"] = token[2:] or None
+        elif token.startswith("t="):
+            parsed["task_id"] = token[2:] or None
+        elif token.startswith("s="):
+            parsed["section_title"] = token[2:] or None
+        elif token.startswith("c="):
+            parsed["category"] = token[2:] or None
+        elif parsed["topic"] is None:
+            parsed["topic"] = token or None
+    if parsed["category"] is None:
+        parsed["category"] = parsed["topic"]
+    return parsed
 
 
 _KEYWORD_TOPIC_MAP: list[tuple[str, str]] = [
@@ -932,18 +1013,34 @@ def _format_research_brief(brief: Any, latency_s: float) -> str:
     if brief.sources_summary:
         lines += ["📎 数据来源", brief.sources_summary, ""]
 
-    # ── Evidence trace summary (Phase 9.1 Step 7) ──────────────────────────
-    retrieved_total = 0
+    # ── Evidence trace summary ────────────────────────────────────────────
+    traces = list(getattr(brief, "retrieval_traces", []) or [])
+    total_available = max((int(getattr(t, "total_chunks", 0) or 0) for t in traces), default=0)
+    selected_ids: set[str] = set()
+    covered_sections = 0
+    conflict_total = 0
     used_ids: set[str] = set()
-    for trace in getattr(brief, "retrieval_traces", []):
-        retrieved_total += getattr(trace, "retrieved_count", 0)
+    for trace in traces:
+        trace_selected = list(getattr(trace, "selected_chunk_ids", []) or [])
+        selected_ids.update(trace_selected)
+        if getattr(trace, "section_covered", False) or int(getattr(trace, "retrieved_count", 0) or 0) > 0:
+            covered_sections += 1
+        conflict_total += int(getattr(trace, "conflict_count", 0) or 0)
+
     for sec in brief.sections:
         for cid in getattr(sec, "chunk_ids", []):
             used_ids.add(cid)
-    if retrieved_total > 0 or used_ids:
+
+    if not selected_ids:
+        selected_ids = set(used_ids)
+    total_sections = len(traces) if traces else len(getattr(brief, "sections", []) or [])
+    if not traces:
+        covered_sections = sum(1 for sec in brief.sections if getattr(sec, "chunk_ids", []))
+
+    if total_available > 0 or selected_ids:
         lines.append(
-            f"🔗 证据追踪：本次检索并筛选了 {retrieved_total} 个证据片段，"
-            f"最终使用了 {len(used_ids)} 个。完整证据 ID 已记录在系统日志中。"
+            f"🔗 证据追踪：本次从 {total_available} 个证据片段中筛选出 {len(selected_ids)} 个，"
+            f"覆盖 {covered_sections}/{total_sections} 个章节，识别出 {conflict_total} 组方向冲突。"
         )
         lines.append("")
 

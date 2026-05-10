@@ -52,8 +52,13 @@ def summarize_retrieval_traces(
     if not traces:
         return {"total_retrieved": 0, "total_available": 0, "avg_noise_reduction": 0.0}
 
-    total_retrieved = sum(t.retrieved_count for t in traces)
+    total_retrieved = sum(
+        len(getattr(t, "selected_chunk_ids", []) or []) or t.retrieved_count
+        for t in traces
+    )
     total_available = sum(t.total_chunks for t in traces)
+    sections_covered = sum(1 for t in traces if getattr(t, "section_covered", False) or t.retrieved_count > 0)
+    conflict_count = sum(getattr(t, "conflict_count", 0) for t in traces)
 
     ratios: list[float] = []
     for t in traces:
@@ -65,6 +70,8 @@ def summarize_retrieval_traces(
     return {
         "total_retrieved": total_retrieved,
         "total_available": total_available,
+        "sections_covered": sections_covered,
+        "conflict_count": conflict_count,
         "avg_noise_reduction": avg_noise,
     }
 

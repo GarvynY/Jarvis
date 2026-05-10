@@ -54,9 +54,15 @@ except ImportError:
 # Module-level import so tests can patch coordinator.build_safe_user_context.
 # Falls back to a no-op that returns {} when pythonclaw is not on sys.path.
 try:
-    from pythonclaw.core.personalization import build_safe_user_context
+    from pythonclaw.core.personalization import (
+        build_safe_user_context,
+        get_user_category_feedback_summary,
+    )
 except Exception:  # noqa: BLE001
     def build_safe_user_context(*_args: object, **_kwargs: object) -> dict:  # type: ignore[misc]
+        return {}
+
+    def get_user_category_feedback_summary(*_args: object, **_kwargs: object) -> dict:  # type: ignore[misc]
         return {}
 
 
@@ -174,6 +180,14 @@ async def run_research(
         pass
 
     safe_ctx = SafeUserContext.from_dict(raw_ctx)
+    try:
+        summary = get_user_category_feedback_summary(user_id)
+        if summary:
+            # Runtime-only scorer hint. SafeUserContext.to_dict()/from_dict()
+            # intentionally exclude it so feedback history is never prompted.
+            setattr(safe_ctx, "category_feedback_summary", summary)
+    except Exception:  # noqa: BLE001
+        pass
 
     # ── 3. Build ResearchTask ─────────────────────────────────────────────────
     task_overrides: dict[str, Any] = {}

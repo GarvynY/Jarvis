@@ -456,6 +456,12 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
     inferred_columns = _column_names(conn, "inferred_preferences")
     if inferred_columns and "confidence" not in inferred_columns:
         conn.execute("ALTER TABLE inferred_preferences ADD COLUMN confidence REAL")
+
+    feedback_columns = _column_names(conn, "feedback_events")
+    if feedback_columns:
+        for column in ("task_id", "brief_id", "section_title", "category"):
+            if column not in feedback_columns:
+                conn.execute(f"ALTER TABLE feedback_events ADD COLUMN {column} TEXT")
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
 
@@ -513,6 +519,10 @@ def init_db(db_path: str | Path | None = None) -> Path:
                 user_id INTEGER NOT NULL,
                 event_type TEXT NOT NULL,
                 topic TEXT,
+                task_id TEXT,
+                brief_id TEXT,
+                section_title TEXT,
+                category TEXT,
                 message_id TEXT,
                 metadata_json TEXT,
                 created_at TEXT NOT NULL,
@@ -888,6 +898,10 @@ def log_feedback_event(
     event_type: str,
     *,
     topic: str | None = None,
+    task_id: str | None = None,
+    brief_id: str | None = None,
+    section_title: str | None = None,
+    category: str | None = None,
     message_id: str | None = None,
     metadata: dict[str, Any] | None = None,
     db_path: str | Path | None = None,
@@ -899,6 +913,12 @@ def log_feedback_event(
     topic = _validate_event_text(topic, path="topic")
     if topic is not None and topic not in ALLOWED_FEEDBACK_TOPICS:
         raise ValueError(f"topic_not_allowed:{topic}")
+    task_id = _validate_event_text(task_id, path="task_id")
+    brief_id = _validate_event_text(brief_id, path="brief_id")
+    section_title = _validate_event_text(section_title, path="section_title")
+    category = _validate_event_text(category, path="category") or topic
+    if category:
+        category = category.lower()
     message_id = _validate_event_text(message_id, path="message_id")
     _reject_sensitive_payload(metadata or {}, path="metadata")
     init_db(db_path)
@@ -907,20 +927,72 @@ def log_feedback_event(
         cur = conn.execute(
             """
             INSERT INTO feedback_events (
-                user_id, event_type, topic, message_id, metadata_json, created_at
+                user_id, event_type, topic, task_id, brief_id, section_title,
+                category, message_id, metadata_json, created_at
             )
-            VALUES (?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 user["id"],
                 event_type,
                 topic,
+                task_id,
+                brief_id,
+                section_title,
+                category,
                 message_id,
                 _json_dumps(metadata or {}),
                 _now(),
             ),
         )
         return int(cur.lastrowid)
+
+
+def get_user_category_feedback_summary(
+    telegram_user_id: int | str,
+    db_path: str | Path | None = None,
+) -> dict[str, float]:
+    """Return category-level feedback scores without raw content/history.
+
+    Scores are deterministic and normalised to [-1.0, 1.0]:
+    useful = +1, not_useful/useless = -1, not_interested = -2.
+    """
+    init_db(db_path)
+    with _connect(db_path) as conn:
+        user = _user_row(conn, telegram_user_id)
+        if user is None:
+            return {}
+        rows = conn.execute(
+            """
+            SELECT category, event_type, COUNT(*) AS cnt
+            FROM feedback_events
+            WHERE user_id = ?
+              AND category IS NOT NULL AND category != ''
+            GROUP BY category, event_type
+            """,
+            (user["id"],),
+        ).fetchall()
+
+    weights = {
+        "useful": 1,
+        "not_useful": -1,
+        "useless": -1,
+        "not_interested": -2,
+    }
+    counts_by_category: dict[str, dict[str, int]] = {}
+    for row in rows:
+        category = str(row["category"])
+        event_type = str(row["event_type"])
+        counts_by_category.setdefault(category, {})[event_type] = int(row["cnt"])
+
+    summary: dict[str, float] = {}
+    for category, counts in counts_by_category.items():
+        total = sum(counts.values())
+        if total <= 0:
+            continue
+        weighted = sum(weights.get(event, 0) * count for event, count in counts.items())
+        summary[category] = round(max(-1.0, min(1.0, weighted / total)), 4)
+    return summary
 
 
 def log_raw_event(

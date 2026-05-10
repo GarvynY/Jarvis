@@ -101,6 +101,7 @@ from ._telegram_helpers import (
     _delete_profile_requires_confirmation,
     # Feedback UI
     _make_feedback_keyboard,
+    _parse_feedback_callback_data,
     _extract_news_topic,
     _parse_feedback_args,
     _format_feedback_confirmation,
@@ -322,6 +323,7 @@ class TelegramBot:
                 update.effective_user.id,
                 event_type,
                 topic=topic,
+                category=topic,
                 message_id=str(update.message.message_id),
                 metadata={"source": "telegram_command"},
             )
@@ -385,12 +387,14 @@ class TelegramBot:
         if not data.startswith(_FB_PREFIX):
             return
 
-        # Parse "fb:useful:news:RBA" → event_type="useful", source="news", topic="RBA"
-        tail = data[len(_FB_PREFIX):]
-        parts = tail.split(":", 2)
-        event_type = parts[0]
-        source = parts[1] if len(parts) > 1 else "unknown"
-        topic = parts[2] if len(parts) > 2 else None
+        parsed = _parse_feedback_callback_data(data)
+        event_type = str(parsed.get("event_type") or "")
+        source = str(parsed.get("source") or "unknown")
+        topic = parsed.get("topic")
+        task_id = parsed.get("task_id")
+        brief_id = parsed.get("brief_id")
+        section_title = parsed.get("section_title")
+        category = parsed.get("category")
 
         if event_type not in _FEEDBACK_TYPE_LABELS:
             await query.answer("未知反馈类型。")
@@ -403,6 +407,10 @@ class TelegramBot:
                 query.from_user.id,
                 event_type,
                 topic=topic,
+                task_id=task_id,
+                brief_id=brief_id,
+                section_title=section_title,
+                category=category,
                 message_id=str(query.message.message_id) if query.message else None,
                 metadata={"source": f"inline_button:{source}"},
             )
@@ -425,8 +433,10 @@ class TelegramBot:
         await query.answer(f"已记录：{label}（{source_label}{topic_suffix}），谢谢！")
 
         logger.info(
-            "[Telegram] Inline feedback logged: user_id=%s event=%s source=%s topic=%s msg_id=%s",
+            "[Telegram] Inline feedback logged: user_id=%s event=%s source=%s "
+            "topic=%s category=%s brief_id=%s task_id=%s msg_id=%s",
             query.from_user.id, event_type, source, topic or "(none)",
+            category or "(none)", brief_id or "(none)", task_id or "(none)",
             query.message.message_id if query.message else "?",
         )
 
@@ -872,7 +882,11 @@ class TelegramBot:
             text = f"⚠️ 获取新闻失败: {exc}"
         chunks = _split_message(text)
         for i, chunk in enumerate(chunks):
-            kb = _make_feedback_keyboard("news", topic) if i == len(chunks) - 1 else None
+            kb = (
+                _make_feedback_keyboard("news", topic, category=topic)
+                if i == len(chunks) - 1
+                else None
+            )
             await update.message.reply_text(chunk, reply_markup=kb)
 
     async def _shortcut_latest_rate(self, update: Update) -> None:
@@ -1032,8 +1046,18 @@ class TelegramBot:
 
             chunks = _split_message(text)
             research_topic = brief.preset_name if brief else "research"
+            brief_id = (getattr(brief, "task_id", "") or "")[:8]
             for i, chunk in enumerate(chunks):
-                kb = _make_feedback_keyboard("research", research_topic) if i == len(chunks) - 1 else None
+                kb = (
+                    _make_feedback_keyboard(
+                        "research",
+                        research_topic,
+                        brief_id=brief_id,
+                        category=research_topic,
+                    )
+                    if i == len(chunks) - 1
+                    else None
+                )
                 await update.message.reply_text(chunk, reply_markup=kb)
 
         except Exception as exc:

@@ -66,6 +66,23 @@ _CACHE_TTL_SECONDS: float = 180.0
 _FETCH_CACHE: dict[tuple[str, int], tuple[float, dict[str, Any]]] = {}
 
 
+def _aud_cny_direction_from_cny_per_aud_change(
+    change_pct: float,
+    threshold_pct: float = 0.5,
+) -> tuple[str, str]:
+    """
+    Interpret changes in the user-facing quote convention: 1 AUD = X CNY.
+
+    If X rises, one AUD buys more CNY, so AUD strengthens versus CNY.
+    If X falls, one AUD buys less CNY, so AUD weakens versus CNY.
+    """
+    if change_pct > threshold_pct:
+        return "bullish_aud", "AUD 相对 CNY 走强，CNY 相对 AUD 走弱"
+    if change_pct < -threshold_pct:
+        return "bearish_aud", "AUD 相对 CNY 走弱，CNY 相对 AUD 走强"
+    return "neutral", "AUD/CNY 相对横盘"
+
+
 def _fetch_rate_cached(period: str = "90d") -> dict[str, Any]:
     """Fetch FX data with a short in-memory TTL to avoid duplicate HTTP bursts."""
     now = time.monotonic()
@@ -254,45 +271,55 @@ def _build_output(
 
     # ── 3. Historical stats ───────────────────────────────────────────────────
     #
-    # fetch_rate stats use yfinance CNYAUD=X (= AUD per CNY):
-    #   period_change_pct  = (end_AUDperCNY / start_AUDperCNY - 1) * 100
-    #     positive → AUD/CNY up → CNY gained vs AUD → AUD weakened (bearish_aud)
-    #     negative → AUD/CNY down → AUD gained vs CNY            (bullish_aud)
-    #   high_cny_aud = max(AUD/CNY) = cheapest AUD in CNY terms  (lowest CNY/AUD)
-    #   low_cny_aud  = min(AUD/CNY) = most expensive AUD in CNY (highest CNY/AUD)
-    #
-    # All values displayed to students are converted to CNY/AUD for consistency.
+    # Historical sources may arrive as AUD per CNY internally. User-facing output
+    # is always normalized to the quote convention: 1 AUD = X CNY.
 
     stats = data.get("stats")
     if stats:
-        period_chg = stats.get("period_change_pct", 0.0)
-        hi_aud_per_cny = stats.get("high_cny_aud")   # max AUD/CNY → min CNY/AUD
-        lo_aud_per_cny = stats.get("low_cny_aud")    # min AUD/CNY → max CNY/AUD
-        vol_std        = stats.get("volatility_std", 0.0)
-        trend_dir      = stats.get("trend_direction", "")
-        trend_7d       = stats.get("trend_7d_pct")
+        start_cny_per_aud = stats.get("start_cny_per_aud", stats.get("start_rate_cny_per_aud"))
+        end_cny_per_aud   = stats.get("end_cny_per_aud", stats.get("end_rate_cny_per_aud"))
+        period_chg = stats.get("period_change_cny_per_aud_pct")
+        if period_chg is None and start_cny_per_aud and end_cny_per_aud:
+            period_chg = (end_cny_per_aud / start_cny_per_aud - 1) * 100
+        if period_chg is None:
+            legacy_aud_per_cny_chg = stats.get("period_change_pct", 0.0)
+            period_chg = ((1 / (1 + legacy_aud_per_cny_chg / 100)) - 1) * 100
 
-        # Direction: negative period_change_pct means AUD/CNY fell = AUD strengthened
-        if period_chg < -0.5:
-            direction = "bullish_aud"
-        elif period_chg > 0.5:
-            direction = "bearish_aud"
+        lo_cny_per_aud = stats.get("low_cny_per_aud")
+        hi_cny_per_aud = stats.get("high_cny_per_aud")
+        hi_aud_per_cny = stats.get("high_aud_per_cny", stats.get("high_cny_aud"))
+        lo_aud_per_cny = stats.get("low_aud_per_cny", stats.get("low_cny_aud"))
+        vol_std        = stats.get("volatility_std_cny_per_aud", 0.0)
+        trend_dir      = stats.get("trend_direction_cny_per_aud", stats.get("trend_direction", ""))
+        trend_7d       = stats.get("trend_7d_cny_per_aud_pct")
+
+        direction, direction_text = _aud_cny_direction_from_cny_per_aud_change(float(period_chg))
+
+        if start_cny_per_aud and end_cny_per_aud:
+            parts = [
+                (
+                    f"{stats['period']} 期间：1 AUD = {start_cny_per_aud:.4f} CNY"
+                    f" → {end_cny_per_aud:.4f} CNY（{period_chg:+.2f}%）；{direction_text}"
+                )
+            ]
         else:
-            direction = "neutral"
+            parts = [
+                (
+                    f"{stats['period']} 期间：1 AUD = X CNY 口径变化 {period_chg:+.2f}%；"
+                    f"{direction_text}"
+                )
+            ]
 
-        parts = [f"{stats['period']} AUD 变动 {period_chg:+.2f}%（CNYAUD=X）"]
-
-        # Convert range from AUD/CNY to student-facing CNY/AUD
-        if hi_aud_per_cny and lo_aud_per_cny and hi_aud_per_cny > 0 and lo_aud_per_cny > 0:
-            period_lo_cny_aud = round(1.0 / hi_aud_per_cny, 4)  # AUD was cheapest here
-            period_hi_cny_aud = round(1.0 / lo_aud_per_cny, 4)  # AUD was most expensive here
-            parts.append(f"区间 {period_lo_cny_aud:.4f}–{period_hi_cny_aud:.4f} CNY/AUD")
+        if (lo_cny_per_aud is None or hi_cny_per_aud is None) and hi_aud_per_cny and lo_aud_per_cny:
+            lo_cny_per_aud = round(1.0 / hi_aud_per_cny, 4)
+            hi_cny_per_aud = round(1.0 / lo_aud_per_cny, 4)
+        if lo_cny_per_aud and hi_cny_per_aud:
+            parts.append(f"区间 {lo_cny_per_aud:.4f}–{hi_cny_per_aud:.4f} CNY/AUD")
 
         if trend_7d is not None:
-            parts.append(f"近7日 {trend_7d:+.2f}%（{trend_dir}）")
+            parts.append(f"近7日 1 AUD = X CNY 口径变化 {trend_7d:+.2f}%（{trend_dir}）")
         if vol_std:
-            # Explicit unit: σ of CNYAUD=X daily closes (price std dev, not return std dev)
-            parts.append(f"日收盘价格波动σ={vol_std:.4f}（AUD/CNY）")
+            parts.append(f"日收盘价格波动σ={vol_std:.4f}（CNY/AUD）")
 
         findings.append(Finding(
             key="historical_trend",
@@ -306,9 +333,10 @@ def _build_output(
             retrieved_at=retrieved_at,
         ))
 
-        if vol_std > _HIGH_VOLATILITY_STD:
+        legacy_vol_std = stats.get("volatility_std", 0.0)
+        if legacy_vol_std > _HIGH_VOLATILITY_STD:
             risks.append(
-                f"近期日收盘价格波动偏高（σ={vol_std:.4f} AUD/CNY），"
+                f"近期日收盘价格波动偏高（σ={vol_std:.4f} CNY/AUD），"
                 "参考汇率时效性有限，建议使用银行实时牌价"
             )
     else:

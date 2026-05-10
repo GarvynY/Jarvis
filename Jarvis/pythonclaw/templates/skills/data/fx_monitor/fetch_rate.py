@@ -239,32 +239,69 @@ def _build_stats(
     closes[i] = AUD per CNY  (same orientation as yfinance CNYAUD=X).
     dates[i]  = "YYYY-MM-DD" string, same length as closes, ascending.
     """
-    start_val = closes[0]
-    end_val   = closes[-1]
+    aud_per_cny_values = closes
+    cny_per_aud_values = [1 / v for v in aud_per_cny_values]
+
+    start_aud_per_cny = aud_per_cny_values[0]
+    end_aud_per_cny   = aud_per_cny_values[-1]
+    start_cny_per_aud = cny_per_aud_values[0]
+    end_cny_per_aud   = cny_per_aud_values[-1]
+
+    period_change_aud_per_cny_pct = (end_aud_per_cny / start_aud_per_cny - 1) * 100
+    period_change_cny_per_aud_pct = (end_cny_per_aud / start_cny_per_aud - 1) * 100
 
     stats: dict = {
         "period":                  period,
         "trading_days":            len(closes),
-        "start_rate_cny_per_aud":  round(1 / start_val, 4),
-        "end_rate_cny_per_aud":    round(1 / end_val, 4),
-        "period_change_pct":       round((end_val / start_val - 1) * 100, 4),
-        "high_cny_aud":            round(max(closes), 6),   # max AUD/CNY = min CNY/AUD
-        "low_cny_aud":             round(min(closes), 6),   # min AUD/CNY = max CNY/AUD
-        "mean_cny_aud":            round(statistics.mean(closes), 6),
-        "volatility_std":          round(statistics.stdev(closes), 6) if len(closes) >= 2 else 0.0,
+        "start_rate_cny_per_aud":  round(start_cny_per_aud, 4),
+        "end_rate_cny_per_aud":    round(end_cny_per_aud, 4),
+        "start_cny_per_aud":       round(start_cny_per_aud, 4),
+        "end_cny_per_aud":         round(end_cny_per_aud, 4),
+        "start_aud_per_cny":       round(start_aud_per_cny, 6),
+        "end_aud_per_cny":         round(end_aud_per_cny, 6),
+        "period_change_cny_per_aud_pct": round(period_change_cny_per_aud_pct, 4),
+        "period_change_aud_per_cny_pct": round(period_change_aud_per_cny_pct, 4),
+        # Legacy key retained for existing callers. It is AUD per CNY, not user-facing CNY per AUD.
+        "period_change_pct":       round(period_change_aud_per_cny_pct, 4),
+        "high_cny_per_aud":        round(max(cny_per_aud_values), 4),
+        "low_cny_per_aud":         round(min(cny_per_aud_values), 4),
+        "mean_cny_per_aud":        round(statistics.mean(cny_per_aud_values), 4),
+        "high_aud_per_cny":        round(max(aud_per_cny_values), 6),
+        "low_aud_per_cny":         round(min(aud_per_cny_values), 6),
+        "mean_aud_per_cny":        round(statistics.mean(aud_per_cny_values), 6),
+        # Legacy ambiguous keys retained for existing callers.
+        "high_cny_aud":            round(max(aud_per_cny_values), 6),
+        "low_cny_aud":             round(min(aud_per_cny_values), 6),
+        "mean_cny_aud":            round(statistics.mean(aud_per_cny_values), 6),
+        "volatility_std_cny_per_aud": (
+            round(statistics.stdev(cny_per_aud_values), 4) if len(cny_per_aud_values) >= 2 else 0.0
+        ),
+        "volatility_std_aud_per_cny": (
+            round(statistics.stdev(aud_per_cny_values), 6) if len(aud_per_cny_values) >= 2 else 0.0
+        ),
+        # Legacy key retained for existing callers. It is AUD per CNY.
+        "volatility_std":          round(statistics.stdev(aud_per_cny_values), 6) if len(aud_per_cny_values) >= 2 else 0.0,
         "data_source":             data_source,
     }
 
     if len(closes) >= 14:
         recent_7 = statistics.mean(closes[-7:])
         prior_7  = statistics.mean(closes[-14:-7])
-        trend_7d = (recent_7 / prior_7 - 1) * 100
-        stats["trend_7d_pct"]      = round(trend_7d, 4)
-        stats["trend_direction"]   = (
-            "CNY升值 (AUD贬值)" if trend_7d > 0.05
-            else "CNY贬值 (AUD升值)" if trend_7d < -0.05
-            else "横盘震荡"
+        recent_7_cny_per_aud = 1 / recent_7
+        prior_7_cny_per_aud  = 1 / prior_7
+        trend_7d_aud_per_cny = (recent_7 / prior_7 - 1) * 100
+        trend_7d_cny_per_aud = (recent_7_cny_per_aud / prior_7_cny_per_aud - 1) * 100
+        trend_direction = (
+            "AUD 相对 CNY 走强，CNY 相对 AUD 走弱" if trend_7d_cny_per_aud > 0.05
+            else "AUD 相对 CNY 走弱，CNY 相对 AUD 走强" if trend_7d_cny_per_aud < -0.05
+            else "AUD/CNY 相对横盘"
         )
+        stats["trend_7d_cny_per_aud_pct"] = round(trend_7d_cny_per_aud, 4)
+        stats["trend_7d_aud_per_cny_pct"] = round(trend_7d_aud_per_cny, 4)
+        # Legacy key retained for existing callers. It is AUD per CNY.
+        stats["trend_7d_pct"]      = round(trend_7d_aud_per_cny, 4)
+        stats["trend_direction_cny_per_aud"] = trend_direction
+        stats["trend_direction"]   = trend_direction
 
     if np is not None and len(closes) >= 5:
         x     = np.arange(len(closes), dtype=float)
@@ -456,17 +493,19 @@ def _format_text(data: dict) -> str:
 
     s = data.get("stats")
     if s:
+        period_change = s.get("period_change_cny_per_aud_pct", s.get("period_change_pct", 0.0))
+        trend_7d = s.get("trend_7d_cny_per_aud_pct")
         lines += [
             "",
             f"── 历史区间: {s['period']} ({s['trading_days']} 交易日) ──",
-            f"区间变动:    {s['period_change_pct']:+.2f}%",
-            f"高 / 低:     {s['high_cny_aud']} / {s['low_cny_aud']}  (CNY per AUD, yfinance)",
-            f"均值 (μ):    {s['mean_cny_aud']}",
-            f"波动率 (σ):  {s['volatility_std']}",
+            f"区间变动:    {period_change:+.2f}%  (1 AUD = X CNY)",
+            f"高 / 低:     {s.get('high_cny_per_aud', s.get('high_cny_aud'))} / {s.get('low_cny_per_aud', s.get('low_cny_aud'))}  CNY/AUD",
+            f"均值 (μ):    {s.get('mean_cny_per_aud', s.get('mean_cny_aud'))} CNY/AUD",
+            f"波动率 (σ):  {s.get('volatility_std_cny_per_aud', s.get('volatility_std'))} CNY/AUD",
         ]
-        if "trend_7d_pct" in s:
+        if trend_7d is not None:
             lines.append(
-                f"近7日趋势:  {s['trend_7d_pct']:+.4f}%  [{s.get('trend_direction', '')}]"
+                f"近7日趋势:  {trend_7d:+.4f}%  [{s.get('trend_direction_cny_per_aud', s.get('trend_direction', ''))}]"
             )
         if "regression_trend_annualised_pct" in s:
             lines.append(

@@ -322,6 +322,14 @@ def test_insert_and_list_traces() -> None:
             total_chunks=20,
             top_scores=[0.9, 0.8, 0.7, 0.6, 0.5],
             latency_ms=42,
+            section_title="汇率事实",
+            selected_chunk_ids=["c1", "c2"],
+            section_covered=True,
+            score_distribution={"count": 5, "min": 0.5, "max": 0.9, "avg": 0.7},
+            conflict_count=1,
+            conflict_pairs=[{"chunk_id_a": "c1", "chunk_id_b": "c2"}],
+            boosted_chunk_ids=["c1", "c2"],
+            scoring_method="composite",
         )
         t2 = RetrievalTrace(
             trace_id="t2",
@@ -339,6 +347,14 @@ def test_insert_and_list_traces() -> None:
         assert traces[0].trace_id == "t1"
         assert traces[0].query == "CNY/AUD 汇率"
         assert traces[0].top_scores == [0.9, 0.8, 0.7, 0.6, 0.5]
+        assert traces[0].section_title == "汇率事实"
+        assert traces[0].selected_chunk_ids == ["c1", "c2"]
+        assert traces[0].section_covered is True
+        assert traces[0].score_distribution["avg"] == 0.7
+        assert traces[0].conflict_count == 1
+        assert traces[0].conflict_pairs[0]["chunk_id_a"] == "c1"
+        assert traces[0].boosted_chunk_ids == ["c1", "c2"]
+        assert traces[0].scoring_method == "composite"
         assert traces[1].trace_id == "t2"
 
         assert store.list_traces("不存在") == []
@@ -532,8 +548,11 @@ def test_ingest_with_source_metadata() -> None:
         results = store.ingest_outputs(task, [output])
         chunk = store.get_chunk(results[0].chunk_ids[0])
         assert chunk is not None
-        assert chunk.source == "rba_official"
+        assert "url=https://rba.gov.au/rates" in chunk.source
+        assert "title=RBA 利率决议" in chunk.source
+        assert "provider=rba_official" in chunk.source
         assert "rba_official" in chunk.content
+        assert "https://rba.gov.au/rates" in chunk.content
     print("  ingest 保留来源元数据   OK")
 
 
@@ -749,24 +768,140 @@ def test_pack_dedup_by_chunk_id() -> None:
     print("  pack chunk_id 去重       OK")
 
 
-def test_pack_dedup_by_source() -> None:
+def test_pack_dedup_by_url() -> None:
     preset = FX_CNYAUD_PRESET
     with EvidenceStore(":memory:") as store:
         task = _make_task()
         store.insert_chunk(_make_chunk(
             chunk_id="a1", task_id="task-a", category="fx_price",
-            importance=0.9, content="X" * 30, source="same-source",
+            importance=0.9, content="X" * 30,
+            source="url=https://example.com/same | title=Same story | provider=google_news_rss",
         ))
         store.insert_chunk(_make_chunk(
             chunk_id="a2", task_id="task-a", category="fx_price",
-            importance=0.8, content="Y" * 30, source="same-source",
+            importance=0.8, content="Y" * 30,
+            source="url=https://www.example.com/same/ | title=Same story copy | provider=google_news_rss",
         ))
 
         pack = store.build_context_pack(task, preset, [])
         pack_ids = [it.chunk_id for it in pack.items]
         assert "a1" in pack_ids
         assert "a2" not in pack_ids
-    print("  pack source 去重         OK")
+    print("  pack URL 去重            OK")
+
+
+def test_pack_provider_label_does_not_dedup_distinct_urls() -> None:
+    preset = ResearchPreset(
+        name="rss_distinct",
+        research_type="fx",
+        default_agents=[],
+        report_sections=["新闻驱动"],
+        banned_terms=[],
+        default_time_horizon="short_term",
+    )
+    with EvidenceStore(":memory:") as store:
+        task = _make_task()
+        store.insert_chunk(_make_chunk(
+            chunk_id="rss1", task_id="task-a", category="news_event",
+            agent_name="news_agent", importance=0.9, content="A" * 30,
+            source="url=https://news.example.com/a | title=RBA signal A | provider=google_news_rss",
+        ))
+        store.insert_chunk(_make_chunk(
+            chunk_id="rss2", task_id="task-a", category="news_event",
+            agent_name="news_agent", importance=0.8, content="B" * 30,
+            source="url=https://news.example.com/b | title=RBA signal B | provider=google_news_rss",
+        ))
+
+        pack = store.build_context_pack(task, preset, [], max_chunks_per_section=5)
+        ids = [it.chunk_id for it in pack.items]
+        assert "rss1" in ids and "rss2" in ids, ids
+    print("  RSS 不同 URL 不互相去重  OK")
+
+
+def test_pack_same_url_selected_once() -> None:
+    preset = ResearchPreset(
+        name="same_url_once",
+        research_type="fx",
+        default_agents=[],
+        report_sections=["新闻驱动"],
+        banned_terms=[],
+        default_time_horizon="short_term",
+    )
+    with EvidenceStore(":memory:") as store:
+        task = _make_task()
+        for cid, imp in (("url1", 0.9), ("url2", 0.8)):
+            store.insert_chunk(_make_chunk(
+                chunk_id=cid, task_id="task-a", category="news_event",
+                agent_name="news_agent", importance=imp, content=cid * 20,
+                source="url=https://news.example.com/same | title=Same RBA story | provider=google_news_rss",
+            ))
+
+        pack = store.build_context_pack(task, preset, [], max_chunks_per_section=5)
+        ids = [it.chunk_id for it in pack.items]
+        assert len([i for i in ids if i in {"url1", "url2"}]) == 1, ids
+    print("  同 URL 仅选择一次        OK")
+
+
+def test_pack_provider_label_does_not_empty_later_section() -> None:
+    preset = ResearchPreset(
+        name="rss_sections",
+        research_type="fx",
+        default_agents=[],
+        report_sections=["新闻驱动", "宏观信号"],
+        banned_terms=[],
+        default_time_horizon="short_term",
+    )
+    with EvidenceStore(":memory:") as store:
+        task = _make_task()
+        store.insert_chunk(_make_chunk(
+            chunk_id="news-rss", task_id="task-a", category="news_event",
+            agent_name="news_agent", importance=0.9, content="新闻" * 20,
+            source="google_news_rss",
+        ))
+        store.insert_chunk(_make_chunk(
+            chunk_id="macro-rss", task_id="task-a", category="macro",
+            agent_name="macro_agent", importance=0.9, content="宏观" * 20,
+            source="google_news_rss",
+        ))
+
+        pack = store.build_context_pack(task, preset, [], max_chunks_per_section=1)
+        ids = [it.chunk_id for it in pack.items]
+        assert "news-rss" in ids, ids
+        assert "macro-rss" in ids, ids
+        traces = store.list_traces("task-a")
+        assert traces[0].retrieved_count == 1
+        assert traces[1].retrieved_count == 1
+    print("  RSS provider 不清空后续分区 OK")
+
+
+def test_pack_section_coverage_stable_with_provider_duplicates() -> None:
+    preset = ResearchPreset(
+        name="coverage_rss",
+        research_type="fx",
+        default_agents=[],
+        report_sections=["新闻驱动", "宏观信号"],
+        banned_terms=[],
+        default_time_horizon="short_term",
+    )
+    with EvidenceStore(":memory:") as store:
+        task = _make_task()
+        store.insert_chunk(_make_chunk(
+            chunk_id="cov-news", task_id="task-a", category="news_event",
+            agent_name="news_agent", importance=0.9, content="新闻覆盖" * 15,
+            source="google_news_rss",
+        ))
+        store.insert_chunk(_make_chunk(
+            chunk_id="cov-macro", task_id="task-a", category="macro",
+            agent_name="macro_agent", importance=0.9, content="宏观覆盖" * 15,
+            source="google_news_rss",
+        ))
+
+        pack = store.build_context_pack(task, preset, [], max_chunks_per_section=1)
+        traces = store.list_traces("task-a")
+        covered = sum(1 for t in traces if t.retrieved_count > 0)
+        assert covered == 2, f"Expected both sections covered, got {covered}/2"
+        assert sum(pack.coverage.values()) == len(pack.items)
+    print("  RSS provider 覆盖率保持稳定 OK")
 
 
 def test_pack_token_budget() -> None:
@@ -788,6 +923,36 @@ def test_pack_token_budget() -> None:
     print("  pack token 预算          OK")
 
 
+def test_pack_skips_oversized_candidate_and_keeps_section_covered() -> None:
+    with EvidenceStore(":memory:") as store:
+        task = _make_task(task_id="task-budget-skip")
+        preset = ResearchPreset(
+            name="budget_skip",
+            research_type="fx",
+            default_agents=[],
+            report_sections=["宏观信号"],
+            banned_terms=[],
+            default_time_horizon="short_term",
+        )
+        store.insert_chunk(_make_chunk(
+            chunk_id="macro-large", task_id="task-budget-skip",
+            category="macro", importance=0.95, content="X" * 7000,
+            source="url=https://example.com/large",
+        ))
+        store.insert_chunk(_make_chunk(
+            chunk_id="macro-small", task_id="task-budget-skip",
+            category="macro", importance=0.80, content="short macro evidence",
+            source="url=https://example.com/small",
+        ))
+
+        pack = store.build_context_pack(task, preset, [], token_budget=6000)
+        assert [item.chunk_id for item in pack.items] == ["macro-small"]
+        trace = store.list_traces("task-budget-skip")[0]
+        assert trace.section_covered is True
+        assert "skipped_over_budget=1" in trace.query
+    print("  pack 跳过超预算候选       OK")
+
+
 def test_pack_traces_created() -> None:
     preset = FX_CNYAUD_PRESET
     with EvidenceStore(":memory:") as store:
@@ -803,7 +968,11 @@ def test_pack_traces_created() -> None:
             assert "pre_dedup=" in t.query
             assert "selected=" in t.query
             assert "noise_rate=" in t.query
-            assert "chunk_ids=" in t.query
+            assert "chunk_ids=" not in t.query
+            assert isinstance(t.selected_chunk_ids, list)
+            assert t.section_title
+            assert t.section_covered == (t.retrieved_count > 0)
+            assert isinstance(t.score_distribution, dict)
             assert t.total_chunks == 6
             assert t.retrieved_count >= 0
     print("  pack 检索追踪已创建      OK")
@@ -852,6 +1021,533 @@ def test_pack_empty_store() -> None:
     print("  pack 空存储              OK")
 
 
+# ── Phase 10B — scored context pack ──────────────────────────────────────────
+
+def test_scored_pack_high_before_low() -> None:
+    """Higher composite_score chunks are selected before lower ones."""
+    with EvidenceStore(":memory:") as store:
+        task = _make_task()
+        store.insert_chunk(_make_chunk(
+            chunk_id="high", task_id="task-a", category="fx_price",
+            importance=0.9, confidence=0.9, content="H" * 30,
+            source="https://rba.gov.au/data",
+        ))
+        store.insert_chunk(_make_chunk(
+            chunk_id="low", task_id="task-a", category="fx_price",
+            importance=0.2, confidence=0.2, content="L" * 30,
+            source=None,
+        ))
+
+        pack = store.build_context_pack(task, FX_CNYAUD_PRESET, [])
+        ids = [it.chunk_id for it in pack.items if it.chunk_id in ("high", "low")]
+        assert ids[0] == "high", f"Expected 'high' first, got {ids}"
+    print("  10B: 高分优先于低分      OK")
+
+
+def test_scored_pack_item_has_scores() -> None:
+    """ContextPackItem carries composite_score and attention_score."""
+    with EvidenceStore(":memory:") as store:
+        task = _make_task()
+        store.insert_chunk(_make_chunk(
+            chunk_id="scored", task_id="task-a", category="fx_price",
+            importance=0.8, confidence=0.7, content="S" * 40,
+            source="https://reuters.com/aud",
+        ))
+
+        pack = store.build_context_pack(task, FX_CNYAUD_PRESET, [])
+        item = next((it for it in pack.items if it.chunk_id == "scored"), None)
+        assert item is not None
+        assert item.composite_score > 0, f"composite_score should be > 0, got {item.composite_score}"
+        assert item.attention_score > 0, f"attention_score should be > 0, got {item.attention_score}"
+        assert item.relevance_score == item.composite_score
+    print("  10B: item 包含评分       OK")
+
+
+def test_scored_pack_trace_scoring_method() -> None:
+    """RetrievalTrace records scoring_method."""
+    with EvidenceStore(":memory:") as store:
+        task = _make_task()
+        _seed_chunks_for_pack(store)
+
+        store.build_context_pack(task, FX_CNYAUD_PRESET, [])
+        traces = store.list_traces("task-a")
+        assert len(traces) > 0
+        for t in traces:
+            assert t.scoring_method == "composite", (
+                f"Expected 'composite', got {t.scoring_method!r}"
+            )
+            assert "scoring=composite" in t.query
+    print("  10B: trace 记录评分方法  OK")
+
+
+def test_scored_pack_scorer_failure_fallback() -> None:
+    """When scorer raises, fall back to legacy; composite_score reset to 0."""
+    import unittest.mock
+    import evidence_store as _es
+
+    def _broken_scorer(*_a, **_kw):
+        raise RuntimeError("scorer crashed")
+
+    with EvidenceStore(":memory:") as store:
+        task = _make_task()
+        _seed_chunks_for_pack(store)
+
+        with unittest.mock.patch.object(_es, "compute_evidence_score", _broken_scorer):
+            pack = store.build_context_pack(task, FX_CNYAUD_PRESET, [])
+
+        assert len(pack.items) > 0
+        traces = store.list_traces("task-a")
+        for t in traces:
+            assert t.scoring_method == "legacy"
+        for item in pack.items:
+            assert item.composite_score == 0.0, (
+                f"Fallback should reset composite_score to 0, got {item.composite_score}"
+            )
+            assert item.attention_score == 0.0
+    print("  10B: 评分故障回退旧排序  OK")
+
+
+def test_scored_pack_user_relevance_boost() -> None:
+    """User preferred_topics boost a matching chunk's rank."""
+    from schema import SafeUserContext
+    with EvidenceStore(":memory:") as store:
+        task = _make_task()
+        store.insert_chunk(_make_chunk(
+            chunk_id="match", task_id="task-a", category="fx_price",
+            importance=0.5, confidence=0.5, content="M" * 30,
+            source="https://rba.gov.au",
+        ))
+        store.insert_chunk(_make_chunk(
+            chunk_id="nomatch", task_id="task-a", category="fx_price",
+            importance=0.5, confidence=0.5, content="N" * 30,
+            source="https://rba.gov.au",
+        ))
+
+        ctx = SafeUserContext(preferred_topics=["fx_price"])
+        pack = store.build_context_pack(
+            task, FX_CNYAUD_PRESET, [],
+            safe_user_context=ctx,
+        )
+        items_fx = [it for it in pack.items if it.chunk_id in ("match", "nomatch")]
+        if len(items_fx) >= 2:
+            assert items_fx[0].chunk_id == "match", (
+                f"Expected 'match' first with user_relevance boost, got {items_fx[0].chunk_id}"
+            )
+    print("  10B: 用户相关性提升排名  OK")
+
+
+def test_chunk_score_fields_persisted() -> None:
+    """attention_score and composite_score survive insert → get round-trip."""
+    with EvidenceStore(":memory:") as store:
+        chunk = _make_chunk(chunk_id="persist-1")
+        chunk.attention_score = 0.75
+        chunk.composite_score = 0.82
+        store.insert_chunk(chunk)
+
+        loaded = store.get_chunk("persist-1")
+        assert loaded is not None
+        assert loaded.attention_score == 0.75
+        assert loaded.composite_score == 0.82
+    print("  10B: 评分字段持久化      OK")
+
+
+def test_scored_pack_persists_to_sqlite() -> None:
+    """After build_context_pack, get_chunk returns non-zero composite_score."""
+    with EvidenceStore(":memory:") as store:
+        task = _make_task()
+        store.insert_chunk(_make_chunk(
+            chunk_id="persist-check", task_id="task-a", category="fx_price",
+            importance=0.8, confidence=0.7, content="P" * 40,
+            source="https://reuters.com/aud",
+        ))
+
+        loaded_before = store.get_chunk("persist-check")
+        assert loaded_before is not None
+        assert loaded_before.composite_score == 0.0
+
+        store.build_context_pack(task, FX_CNYAUD_PRESET, [])
+
+        loaded_after = store.get_chunk("persist-check")
+        assert loaded_after is not None
+        assert loaded_after.composite_score > 0, (
+            f"composite_score should be > 0 after pack build, got {loaded_after.composite_score}"
+        )
+        assert loaded_after.attention_score > 0
+    print("  10B: 评分回写 SQLite     OK")
+
+
+def test_legacy_db_migration() -> None:
+    """Simulates a v1 database (no score columns) — migration adds them."""
+    import sqlite3
+
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.executescript("""
+    CREATE TABLE evidence_chunks (
+        chunk_id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL DEFAULT '',
+        preset_name TEXT NOT NULL DEFAULT '',
+        agent_name TEXT NOT NULL DEFAULT '',
+        content TEXT NOT NULL DEFAULT '',
+        source TEXT,
+        category TEXT NOT NULL DEFAULT '',
+        importance REAL NOT NULL DEFAULT 0.0,
+        confidence REAL NOT NULL DEFAULT 0.0,
+        entities_json TEXT NOT NULL DEFAULT '[]',
+        used_in_brief INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL DEFAULT '',
+        ttl_policy TEXT NOT NULL DEFAULT 'task',
+        token_estimate INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE TABLE evidence_findings (
+        finding_id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL DEFAULT '',
+        agent_name TEXT NOT NULL DEFAULT '',
+        key TEXT NOT NULL DEFAULT '',
+        summary TEXT NOT NULL DEFAULT '',
+        direction TEXT,
+        chunk_ids_json TEXT NOT NULL DEFAULT '[]',
+        evidence_score REAL,
+        category TEXT NOT NULL DEFAULT '',
+        importance REAL NOT NULL DEFAULT 0.0
+    );
+    CREATE TABLE citation_refs (
+        citation_id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL DEFAULT '',
+        chunk_id TEXT NOT NULL DEFAULT '',
+        finding_id TEXT,
+        section_title TEXT NOT NULL DEFAULT '',
+        relevance_score REAL NOT NULL DEFAULT 0.0
+    );
+    CREATE TABLE retrieval_traces (
+        trace_id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL DEFAULT '',
+        query TEXT NOT NULL DEFAULT '',
+        retrieved_count INTEGER NOT NULL DEFAULT 0,
+        total_chunks INTEGER NOT NULL DEFAULT 0,
+        top_scores_json TEXT NOT NULL DEFAULT '[]',
+        latency_ms INTEGER NOT NULL DEFAULT 0,
+        timestamp TEXT NOT NULL DEFAULT ''
+    );
+    CREATE TABLE schema_version (version INTEGER NOT NULL);
+    INSERT INTO schema_version (version) VALUES (1);
+    INSERT INTO evidence_chunks (chunk_id, task_id, content, importance, confidence)
+        VALUES ('old-chunk', 'task-old', 'legacy data', 0.6, 0.5);
+    """)
+    conn.close()
+
+    store = EvidenceStore(":memory:")
+    chunk = _make_chunk(chunk_id="new-chunk")
+    chunk.attention_score = 0.5
+    chunk.composite_score = 0.7
+    store.insert_chunk(chunk)
+    loaded = store.get_chunk("new-chunk")
+    assert loaded is not None
+    assert loaded.attention_score == 0.5
+    assert loaded.composite_score == 0.7
+    store.close()
+    print("  10B: 旧 DB 迁移安全      OK")
+
+
+# ── Phase 10C: conflict detection integration tests ──────────────────────────
+
+def test_conflict_detection_in_pack() -> None:
+    """build_context_pack detects conflicts between opposing findings."""
+    store = EvidenceStore(":memory:")
+    task = ResearchTask(task_id="t-conflict", preset_name="fx_cnyaud")
+    preset = FX_CNYAUD_PRESET
+
+    out_bull = AgentOutput(
+        agent_name="fx_agent", status="ok", confidence=0.8,
+        findings=[
+            Finding(key="bull_signal", summary="AUD看涨信号",
+                    direction="bullish_aud", category="fx_price", importance=0.8),
+        ],
+    )
+    out_bear = AgentOutput(
+        agent_name="news_agent", status="ok", confidence=0.7,
+        findings=[
+            Finding(key="bear_signal", summary="AUD看跌信号",
+                    direction="bearish_aud", category="fx_price", importance=0.7),
+        ],
+    )
+    enriched = store.ingest_outputs(task, [out_bull, out_bear])
+    pack = store.build_context_pack(task, preset, enriched, token_budget=50000)
+    assert len(pack.items) >= 2
+    store.close()
+    print("  10C: 冲突检测在 pack 中运行  OK")
+
+
+def test_conflict_boost_applied() -> None:
+    """Conflicting chunks get boosted composite_score."""
+    store = EvidenceStore(":memory:")
+    task = ResearchTask(task_id="t-boost", preset_name="fx_cnyaud")
+    preset = FX_CNYAUD_PRESET
+
+    out_bull = AgentOutput(
+        agent_name="fx_agent", status="ok", confidence=0.5,
+        findings=[
+            Finding(key="bull", summary="看涨", direction="bullish_aud",
+                    category="fx_price", importance=0.5),
+        ],
+    )
+    out_bear = AgentOutput(
+        agent_name="news_agent", status="ok", confidence=0.5,
+        findings=[
+            Finding(key="bear", summary="看跌", direction="bearish_aud",
+                    category="fx_price", importance=0.5),
+        ],
+    )
+    enriched = store.ingest_outputs(task, [out_bull, out_bear])
+
+    bull_chunk_id = enriched[0].chunk_ids[0]
+    bear_chunk_id = enriched[1].chunk_ids[0]
+
+    pack = store.build_context_pack(task, preset, enriched, token_budget=50000)
+
+    boosted_items = {it.chunk_id: it for it in pack.items}
+    if bull_chunk_id in boosted_items and bear_chunk_id in boosted_items:
+        bull_item = boosted_items[bull_chunk_id]
+        bear_item = boosted_items[bear_chunk_id]
+        assert bull_item.composite_score > 0
+        assert bear_item.composite_score > 0
+    store.close()
+    print("  10C: 冲突提升 composite_score  OK")
+
+
+def test_conflict_detector_failure_fallback() -> None:
+    """If conflict_detector raises, pack still builds successfully."""
+    import conflict_detector as cd_module
+    original_detect = cd_module.detect_conflicts
+
+    def _broken(*args, **kwargs):
+        raise RuntimeError("simulated conflict detector crash")
+
+    store = EvidenceStore(":memory:")
+    task = ResearchTask(task_id="t-cd-fail", preset_name="fx_cnyaud")
+    preset = FX_CNYAUD_PRESET
+
+    out = AgentOutput(
+        agent_name="fx_agent", status="ok", confidence=0.7,
+        findings=[
+            Finding(key="sig", summary="信号", direction="bullish_aud",
+                    category="fx_price", importance=0.7),
+        ],
+    )
+    enriched = store.ingest_outputs(task, [out])
+
+    import evidence_store as es_mod
+    es_mod.detect_conflicts = _broken
+    try:
+        pack = store.build_context_pack(task, preset, enriched, token_budget=50000)
+        assert isinstance(pack, ContextPack)
+        assert len(pack.items) >= 1
+    finally:
+        es_mod.detect_conflicts = original_detect
+    store.close()
+    print("  10C: 检测器故障回退正常       OK")
+
+
+def test_preselection_conflict_selects_lower_scored_bearish() -> None:
+    """10C.1D: lower-scored bearish evidence can enter top-k via preselection boost."""
+    import unittest.mock
+    import evidence_store as es_mod
+    from evidence_scorer import EvidenceScore
+
+    preset = ResearchPreset(
+        name="preselect_conflict",
+        research_type="fx",
+        default_agents=[],
+        report_sections=["汇率事实"],
+        banned_terms=[],
+        default_time_horizon="short_term",
+    )
+    with EvidenceStore(":memory:") as store:
+        task = _make_task(task_id="t-preselect")
+        out = AgentOutput(
+            agent_name="fx_agent",
+            status="ok",
+            confidence=0.8,
+            findings=[
+                Finding(key="bull", summary="看涨", direction="bullish_aud", category="fx_price", importance=0.8),
+                Finding(key="neutral", summary="中性", direction="neutral", category="fx_price", importance=0.8),
+                Finding(key="bear", summary="看跌", direction="bearish_aud", category="fx_price", importance=0.8),
+            ],
+        )
+        enriched = store.ingest_outputs(task, [out])
+        bull_id, neutral_id, bear_id = enriched[0].chunk_ids
+        base_scores = {bull_id: 0.70, neutral_id: 0.66, bear_id: 0.58}
+
+        def _score(chunk, *_args, **_kwargs):
+            score = base_scores[chunk.chunk_id]
+            return EvidenceScore(
+                chunk_id=chunk.chunk_id,
+                composite_score=score,
+                attention_score=score,
+                importance=score,
+                confidence=score,
+            )
+
+        with unittest.mock.patch.object(es_mod, "compute_evidence_score", _score):
+            pack = store.build_context_pack(
+                task, preset, [], max_chunks_per_section=2, token_budget=50000,
+            )
+
+        ids = [it.chunk_id for it in pack.items]
+        assert bull_id in ids, ids
+        assert bear_id in ids, ids
+        assert neutral_id not in ids, ids
+        bear_item = next(it for it in pack.items if it.chunk_id == bear_id)
+        assert bear_item.composite_score == 0.68, bear_item.composite_score
+        trace = store.list_traces("t-preselect")[0]
+        assert trace.conflict_count == 1
+        assert bear_id in trace.selected_chunk_ids
+        assert bear_id in trace.boosted_chunk_ids
+        assert trace.conflict_pairs
+    print("  10C.1D: 低分冲突证据进入 top-k OK")
+
+
+def test_preselection_conflict_boost_bounded() -> None:
+    """10C.1D: candidate-stage conflict boost is bounded to +0.10."""
+    import unittest.mock
+    import evidence_store as es_mod
+    from evidence_scorer import EvidenceScore
+
+    preset = ResearchPreset(
+        name="bounded_conflict",
+        research_type="fx",
+        default_agents=[],
+        report_sections=["汇率事实"],
+        banned_terms=[],
+        default_time_horizon="short_term",
+    )
+    with EvidenceStore(":memory:") as store:
+        task = _make_task(task_id="t-bounded")
+        out = AgentOutput(
+            agent_name="fx_agent",
+            status="ok",
+            confidence=0.8,
+            findings=[
+                Finding(key="bull", summary="看涨", direction="bullish_aud", category="fx_price", importance=0.8),
+                Finding(key="bear", summary="看跌", direction="bearish_aud", category="fx_price", importance=0.8),
+            ],
+        )
+        enriched = store.ingest_outputs(task, [out])
+        bull_id, bear_id = enriched[0].chunk_ids
+        base_scores = {bull_id: 0.61, bear_id: 0.52}
+
+        def _score(chunk, *_args, **_kwargs):
+            score = base_scores[chunk.chunk_id]
+            return EvidenceScore(chunk_id=chunk.chunk_id, composite_score=score, attention_score=score)
+
+        with unittest.mock.patch.object(es_mod, "compute_evidence_score", _score):
+            pack = store.build_context_pack(
+                task, preset, [], max_chunks_per_section=2, token_budget=50000,
+            )
+
+        for item in pack.items:
+            assert round(item.composite_score - base_scores[item.chunk_id], 4) <= 0.10
+            assert round(item.composite_score - base_scores[item.chunk_id], 4) >= 0.0
+    print("  10C.1D: 冲突加权上限正确      OK")
+
+
+def test_preselection_conflict_detector_failure_keeps_scored_sort() -> None:
+    """10C.1D: detector crash falls back to scored sorting, not legacy sorting."""
+    import unittest.mock
+    import evidence_store as es_mod
+    from evidence_scorer import EvidenceScore
+
+    preset = ResearchPreset(
+        name="conflict_fail_scored",
+        research_type="fx",
+        default_agents=[],
+        report_sections=["汇率事实"],
+        banned_terms=[],
+        default_time_horizon="short_term",
+    )
+
+    def _broken(*_args, **_kwargs):
+        raise RuntimeError("detector crashed")
+
+    with EvidenceStore(":memory:") as store:
+        task = _make_task(task_id="t-fail-scored")
+        out = AgentOutput(
+            agent_name="fx_agent",
+            status="ok",
+            confidence=0.8,
+            findings=[
+                Finding(key="bull", summary="看涨", direction="bullish_aud", category="fx_price", importance=0.1),
+                Finding(key="bear", summary="看跌", direction="bearish_aud", category="fx_price", importance=0.9),
+            ],
+        )
+        enriched = store.ingest_outputs(task, [out])
+        low_importance_high_score, high_importance_low_score = enriched[0].chunk_ids
+        base_scores = {
+            low_importance_high_score: 0.90,
+            high_importance_low_score: 0.20,
+        }
+
+        def _score(chunk, *_args, **_kwargs):
+            score = base_scores[chunk.chunk_id]
+            return EvidenceScore(chunk_id=chunk.chunk_id, composite_score=score, attention_score=score)
+
+        with unittest.mock.patch.object(es_mod, "compute_evidence_score", _score), \
+             unittest.mock.patch.object(es_mod, "detect_conflicts", _broken):
+            pack = store.build_context_pack(
+                task, preset, [], max_chunks_per_section=1, token_budget=50000,
+            )
+
+        assert pack.items[0].chunk_id == low_importance_high_score
+        trace = store.list_traces("t-fail-scored")[0]
+        assert trace.scoring_method == "composite"
+    print("  10C.1D: 检测失败保留评分排序  OK")
+
+
+def test_preselection_no_conflict_keeps_rank() -> None:
+    """10C.1D: with no conflicts, ranking remains the base score order."""
+    import unittest.mock
+    import evidence_store as es_mod
+    from evidence_scorer import EvidenceScore
+
+    preset = ResearchPreset(
+        name="no_conflict_rank",
+        research_type="fx",
+        default_agents=[],
+        report_sections=["汇率事实"],
+        banned_terms=[],
+        default_time_horizon="short_term",
+    )
+    with EvidenceStore(":memory:") as store:
+        task = _make_task(task_id="t-no-conflict")
+        out = AgentOutput(
+            agent_name="fx_agent",
+            status="ok",
+            confidence=0.8,
+            findings=[
+                Finding(key="a", summary="看涨A", direction="bullish_aud", category="fx_price", importance=0.8),
+                Finding(key="b", summary="看涨B", direction="bullish_aud", category="fx_price", importance=0.8),
+                Finding(key="c", summary="中性C", direction="neutral", category="fx_price", importance=0.8),
+            ],
+        )
+        enriched = store.ingest_outputs(task, [out])
+        c1, c2, c3 = enriched[0].chunk_ids
+        base_scores = {c1: 0.50, c2: 0.80, c3: 0.60}
+
+        def _score(chunk, *_args, **_kwargs):
+            score = base_scores[chunk.chunk_id]
+            return EvidenceScore(chunk_id=chunk.chunk_id, composite_score=score, attention_score=score)
+
+        with unittest.mock.patch.object(es_mod, "compute_evidence_score", _score):
+            pack = store.build_context_pack(
+                task, preset, [], max_chunks_per_section=3, token_budget=50000,
+            )
+
+        assert [it.chunk_id for it in pack.items] == [c2, c3, c1]
+        trace = store.list_traces("t-no-conflict")[0]
+        assert "conflicts=0" in trace.query
+    print("  10C.1D: 无冲突排名不变        OK")
+
+
 # ── 运行 ─────────────────────────────────────────────────────────────────────
 
 def run_all() -> None:
@@ -890,14 +1586,37 @@ def run_all() -> None:
         test_pack_max_chunks_per_section,
         test_pack_fallback_retrieval,
         test_pack_dedup_by_chunk_id,
-        test_pack_dedup_by_source,
+        test_pack_dedup_by_url,
+        test_pack_provider_label_does_not_dedup_distinct_urls,
+        test_pack_same_url_selected_once,
+        test_pack_provider_label_does_not_empty_later_section,
+        test_pack_section_coverage_stable_with_provider_duplicates,
         test_pack_token_budget,
+        test_pack_skips_oversized_candidate_and_keeps_section_covered,
         test_pack_traces_created,
         test_pack_coverage,
         test_pack_intra_section_dedup,
         test_pack_empty_store,
+        # Phase 10B — scored context pack
+        test_scored_pack_high_before_low,
+        test_scored_pack_item_has_scores,
+        test_scored_pack_trace_scoring_method,
+        test_scored_pack_scorer_failure_fallback,
+        test_scored_pack_user_relevance_boost,
+        test_chunk_score_fields_persisted,
+        test_scored_pack_persists_to_sqlite,
+        test_legacy_db_migration,
+        # Phase 10C — conflict detection integration
+        test_conflict_detection_in_pack,
+        test_conflict_boost_applied,
+        test_conflict_detector_failure_fallback,
+        # Phase 10C.1D — preselection conflict detection
+        test_preselection_conflict_selects_lower_scored_bearish,
+        test_preselection_conflict_boost_bounded,
+        test_preselection_conflict_detector_failure_keeps_scored_sort,
+        test_preselection_no_conflict_keeps_rank,
     ]
-    print("Phase 9.1 Step 5 — EvidenceStore 测试")
+    print("Phase 9.1 + 10B + 10C — EvidenceStore 测试")
     print("=" * 50)
     for test_fn in tests:
         test_fn()

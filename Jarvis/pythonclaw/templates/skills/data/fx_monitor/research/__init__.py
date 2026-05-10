@@ -6,7 +6,8 @@ Public surface of this package:
     Schema types:
         SafeUserContext, ResearchPreset, ResearchTask,
         SourceRef, Finding, AgentOutput,
-        ResearchSection, CostEstimate, ResearchBrief
+        ResearchSection, CostEstimate, ResearchBrief,
+        FollowupRequest
 
     Preset registry:
         PRESET_REGISTRY, FX_CNYAUD_PRESET
@@ -36,6 +37,7 @@ from .schema import (
     ResearchTask,
     SourceRef,
     Finding,
+    FollowupRequest,
     AgentOutput,
     ResearchSection,
     CostEstimate,
@@ -61,6 +63,7 @@ __all__ = [
     "ResearchTask",
     "SourceRef",
     "Finding",
+    "FollowupRequest",
     "AgentOutput",
     "ResearchSection",
     "CostEstimate",

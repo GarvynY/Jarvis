@@ -579,7 +579,7 @@ def _make_llm_json_with_chunks() -> str:
         "sections": [
             {
                 "title": "汇率事实",
-                "content": "CNY/AUD 今日参考汇率为 4.52 [chunk-fx-1]。",
+                "content": "CNY/AUD 汇率今日参考值为 4.52 [chunk-fx-1]。",
                 "source_agents": ["fx_agent"],
                 "chunk_ids": ["chunk-fx-1"],
             },
@@ -621,6 +621,8 @@ async def test_context_pack_used() -> None:
     fx_sec = next(s for s in brief.sections if s.title == "汇率事实")
     assert "chunk-fx-1" in fx_sec.chunk_ids
     assert "chunk-fx-1" in fx_sec.content
+    assert "CNY/AUD 汇率" not in fx_sec.content
+    assert "1 AUD = X CNY 口径" in fx_sec.content
 
     print("\n-- test_context_pack_used")
     print(f"   fx_sec.chunk_ids={fx_sec.chunk_ids}")

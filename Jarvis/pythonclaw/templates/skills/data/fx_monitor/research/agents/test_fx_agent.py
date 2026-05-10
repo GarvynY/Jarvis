@@ -14,6 +14,9 @@ Tests (no network — all use mock _fetch_rate):
   9. test_partial_data         — no stats/bank → status=partial, current_rate present
  10. test_unit_consistency     — historical range displayed as CNY/AUD not AUD/CNY [P1]
  11. test_confidence_cap       — confidence <= 0.85 for any input               [P1]
+ 12. test_cny_per_aud_decrease_direction — lower CNY/AUD means AUD weakens
+ 13. test_cny_per_aud_increase_direction — higher CNY/AUD means AUD strengthens
+ 14. test_no_ambiguous_ticker_direction — no "AUD 变动 ... CNYAUD=X" summary
 
 Run:
     cd Jarvis/pythonclaw/templates/skills/data/fx_monitor/research/agents
@@ -23,6 +26,7 @@ Run:
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import sys
 import unittest.mock
@@ -42,10 +46,8 @@ from agents.fx_agent import FXAgent, _sanitise_pair  # noqa: E402
 
 # ── Mock data (internally consistent) ────────────────────────────────────────
 #
-# yfinance CNYAUD=X quotes AUD per CNY:
-#   high_cny_aud = 0.2151  → cheapest AUD = 1/0.2151 = 4.649 CNY/AUD
-#   low_cny_aud  = 0.2083  → most expensive AUD = 1/0.2083 = 4.801 CNY/AUD
-#   period_change_pct = (0.2088/0.2151 - 1)*100 ≈ -2.93%  (AUD/CNY fell → AUD stronger)
+# Historical sources quote AUD per CNY internally; user-facing summaries use:
+#   1 AUD = X CNY.
 #
 _MOCK_FULL: dict = {
     "pair": "CNY/AUD",
@@ -76,16 +78,33 @@ _MOCK_FULL: dict = {
     "stats": {
         "period": "90d",
         "trading_days": 63,
+        "start_aud_per_cny": 0.2151,
+        "end_aud_per_cny": 0.2088,
+        "start_cny_per_aud": 4.6490,
+        "end_cny_per_aud": 4.7890,
         "start_rate_cny_per_aud": 4.6490,
         "end_rate_cny_per_aud": 4.7890,
-        # AUD/CNY fell from 0.2151 → 0.2088 = −2.93% → bullish_aud
+        # 1 AUD = X CNY rose from 4.6490 → 4.7890, so AUD strengthened vs CNY.
+        "period_change_cny_per_aud_pct": 3.0114,
+        "period_change_aud_per_cny_pct": -2.93,
         "period_change_pct": -2.93,
-        "high_cny_aud": 0.2151,   # max AUD/CNY → 1/0.2151 = 4.649 CNY/AUD (cheapest AUD)
-        "low_cny_aud":  0.2083,   # min AUD/CNY → 1/0.2083 = 4.801 CNY/AUD (most exp. AUD)
+        "high_cny_per_aud": 4.8010,
+        "low_cny_per_aud": 4.6490,
+        "mean_cny_per_aud": 4.7300,
+        "high_aud_per_cny": 0.2151,
+        "low_aud_per_cny": 0.2083,
+        "mean_aud_per_cny": 0.2115,
+        "high_cny_aud": 0.2151,
+        "low_cny_aud":  0.2083,
         "mean_cny_aud": 0.2115,
+        "volatility_std_cny_per_aud": 0.0780,
+        "volatility_std_aud_per_cny": 0.0035,
         "volatility_std": 0.0035,
+        "trend_7d_cny_per_aud_pct": 0.4520,
+        "trend_7d_aud_per_cny_pct": -0.45,
         "trend_7d_pct": -0.45,
-        "trend_direction": "CNY贬值 (AUD升值)",
+        "trend_direction_cny_per_aud": "AUD 相对 CNY 走强，CNY 相对 AUD 走弱",
+        "trend_direction": "AUD 相对 CNY 走强，CNY 相对 AUD 走弱",
         "regression_trend_annualised_pct": -12.5,
         "data_source": "yfinance CNYAUD=X",
     },
@@ -125,11 +144,55 @@ def _make_task(
 
 def _mock_fetch(return_value: dict):
     import agents.fx_agent as _mod
+    _mod._FETCH_CACHE.clear()
     return unittest.mock.patch.object(_mod, "_fetch_rate", return_value=return_value)
+
+
+def _historical_finding(output: AgentOutput):
+    hist_f = next((f for f in output.findings if f.key == "historical_trend"), None)
+    assert hist_f is not None, "historical_trend finding missing"
+    return hist_f
+
+
+def _mock_with_cny_per_aud_change(
+    start_cny_per_aud: float,
+    end_cny_per_aud: float,
+) -> dict:
+    data = copy.deepcopy(_MOCK_FULL)
+    stats = data["stats"]
+    start_aud_per_cny = 1 / start_cny_per_aud
+    end_aud_per_cny = 1 / end_cny_per_aud
+    period_change_cny_per_aud_pct = (end_cny_per_aud / start_cny_per_aud - 1) * 100
+    period_change_aud_per_cny_pct = (end_aud_per_cny / start_aud_per_cny - 1) * 100
+    trend_direction = (
+        "AUD 相对 CNY 走强，CNY 相对 AUD 走弱"
+        if period_change_cny_per_aud_pct > 0
+        else "AUD 相对 CNY 走弱，CNY 相对 AUD 走强"
+    )
+    stats.update({
+        "start_cny_per_aud": start_cny_per_aud,
+        "end_cny_per_aud": end_cny_per_aud,
+        "start_rate_cny_per_aud": start_cny_per_aud,
+        "end_rate_cny_per_aud": end_cny_per_aud,
+        "start_aud_per_cny": round(start_aud_per_cny, 6),
+        "end_aud_per_cny": round(end_aud_per_cny, 6),
+        "period_change_cny_per_aud_pct": round(period_change_cny_per_aud_pct, 4),
+        "period_change_aud_per_cny_pct": round(period_change_aud_per_cny_pct, 4),
+        "period_change_pct": round(period_change_aud_per_cny_pct, 4),
+        "low_cny_per_aud": min(start_cny_per_aud, end_cny_per_aud),
+        "high_cny_per_aud": max(start_cny_per_aud, end_cny_per_aud),
+        "trend_7d_cny_per_aud_pct": round(period_change_cny_per_aud_pct, 4),
+        "trend_7d_aud_per_cny_pct": round(period_change_aud_per_cny_pct, 4),
+        "trend_7d_pct": round(period_change_aud_per_cny_pct, 4),
+        "trend_direction_cny_per_aud": trend_direction,
+        "trend_direction": trend_direction,
+    })
+    return data
 
 
 def _mock_fetch_error(message: str = "network down"):
     import agents.fx_agent as _mod
+    _mod._FETCH_CACHE.clear()
     return unittest.mock.patch.object(
         _mod, "_fetch_rate", side_effect=RuntimeError(message)
     )
@@ -316,8 +379,7 @@ async def test_unit_consistency() -> None:
     with _mock_fetch(_MOCK_FULL):
         output = await FXAgent().run(_make_task())
 
-    hist_f = next((f for f in output.findings if f.key == "historical_trend"), None)
-    assert hist_f is not None, "historical_trend finding missing"
+    hist_f = _historical_finding(output)
 
     # high_cny_aud=0.2151 → period_lo_cny_aud = 1/0.2151 = 4.649 CNY/AUD
     # low_cny_aud=0.2083  → period_hi_cny_aud = 1/0.2083 = 4.801 CNY/AUD
@@ -352,6 +414,52 @@ async def test_confidence_cap() -> None:
     print("   PASS")
 
 
+async def test_cny_per_aud_decrease_direction() -> None:
+    """Lower 1 AUD = X CNY means AUD weakens versus CNY."""
+    data = _mock_with_cny_per_aud_change(4.80, 4.70)
+    with _mock_fetch(data):
+        output = await FXAgent().run(_make_task())
+
+    hist_f = _historical_finding(output)
+    assert hist_f.direction == "bearish_aud", hist_f
+    assert "AUD 相对 CNY 走弱" in hist_f.summary, hist_f.summary
+    assert "CNY 相对 AUD 走强" in hist_f.summary, hist_f.summary
+
+    print("\n-- test_cny_per_aud_decrease_direction")
+    print(f"   historical_trend: {hist_f.summary[:100]}")
+    print("   PASS")
+
+
+async def test_cny_per_aud_increase_direction() -> None:
+    """Higher 1 AUD = X CNY means AUD strengthens versus CNY."""
+    data = _mock_with_cny_per_aud_change(4.70, 4.80)
+    with _mock_fetch(data):
+        output = await FXAgent().run(_make_task())
+
+    hist_f = _historical_finding(output)
+    assert hist_f.direction == "bullish_aud", hist_f
+    assert "AUD 相对 CNY 走强" in hist_f.summary, hist_f.summary
+    assert "CNY 相对 AUD 走弱" in hist_f.summary, hist_f.summary
+
+    print("\n-- test_cny_per_aud_increase_direction")
+    print(f"   historical_trend: {hist_f.summary[:100]}")
+    print("   PASS")
+
+
+async def test_no_ambiguous_ticker_direction() -> None:
+    """No finding summary should expose raw ticker direction as the main interpretation."""
+    with _mock_fetch(_MOCK_FULL):
+        output = await FXAgent().run(_make_task())
+
+    all_findings = " ".join(f.summary for f in output.findings)
+    assert "AUD 变动" not in all_findings, all_findings
+    assert "CNYAUD=X" not in all_findings, all_findings
+
+    print("\n-- test_no_ambiguous_ticker_direction")
+    print("   No ambiguous ticker-direction text found in finding summaries")
+    print("   PASS")
+
+
 # ── Runner ────────────────────────────────────────────────────────────────────
 
 async def main() -> None:
@@ -368,8 +476,11 @@ async def main() -> None:
     await test_partial_data()
     await test_unit_consistency()
     await test_confidence_cap()
+    await test_cny_per_aud_decrease_direction()
+    await test_cny_per_aud_increase_direction()
+    await test_no_ambiguous_ticker_direction()
     print("\n" + "=" * 60)
-    print("All 11 tests passed.")
+    print("All 14 tests passed.")
 
 
 if __name__ == "__main__":

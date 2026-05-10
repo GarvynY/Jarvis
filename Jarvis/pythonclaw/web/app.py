@@ -59,6 +59,15 @@ def _web_raw_memory_api_enabled() -> bool:
     return config.get_bool("web", "enableRawMemoryApi", default=False)
 
 
+def _fx_research_debug_enabled() -> bool:
+    """Return whether the browser FX research debugger is enabled."""
+    return config.get_bool(
+        "web", "enableFxResearchDebug",
+        env="JARVIS_ENABLE_FX_RESEARCH_DEBUG",
+        default=False,
+    )
+
+
 def _admin_token() -> str:
     """Read the dashboard admin token from the environment only.
 
@@ -172,6 +181,8 @@ def create_app(provider: LLMProvider | None, *, build_provider_fn=None) -> FastA
     app.add_api_route("/api/channels/restart", _api_channels_restart, methods=["POST"])
     app.add_api_route("/api/files/clear", _api_clear_files, methods=["POST"])
     app.add_api_route("/api/files", _api_list_files, methods=["GET"])
+    app.add_api_route("/debug/fx_research", _debug_fx_research_page, methods=["GET"], response_class=HTMLResponse)
+    app.add_api_route("/api/debug/fx_research", _api_debug_fx_research, methods=["POST"])
     app.add_api_websocket_route("/ws/chat", _ws_chat)
 
     return app
@@ -919,6 +930,242 @@ async def _api_list_files(request: Request):
                 "modified": entry.stat().st_mtime,
             })
     return JSONResponse({"files": files, "dir": str(d)})
+
+
+# ── FX research browser debugger ──────────────────────────────────────────────
+
+async def _debug_fx_research_page(request: Request):
+    """Small local-only browser page for running the FX research workflow."""
+    enabled = _fx_research_debug_enabled()
+    status = (
+        "enabled"
+        if enabled
+        else "disabled: set web.enableFxResearchDebug=true or JARVIS_ENABLE_FX_RESEARCH_DEBUG=true"
+    )
+    html = f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Jarvis FX Research Debug</title>
+  <style>
+    body {{ margin: 0; font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #0f172a; color: #e5e7eb; }}
+    main {{ max-width: 980px; margin: 0 auto; padding: 28px 18px; }}
+    label {{ display: block; margin: 14px 0 6px; color: #cbd5e1; font-size: 13px; }}
+    input, button, textarea {{ font: inherit; }}
+    input {{ width: 100%; box-sizing: border-box; border: 1px solid #334155; border-radius: 8px; padding: 10px 12px; background: #111827; color: #e5e7eb; }}
+    button {{ margin-top: 16px; border: 0; border-radius: 8px; padding: 10px 14px; background: #38bdf8; color: #082f49; font-weight: 700; cursor: pointer; }}
+    button:disabled {{ opacity: .6; cursor: wait; }}
+    pre {{ white-space: pre-wrap; word-break: break-word; border: 1px solid #334155; border-radius: 8px; padding: 14px; background: #020617; min-height: 240px; }}
+    .panel {{ margin-top: 18px; border: 1px solid #334155; border-radius: 8px; background: #111827; padding: 14px; }}
+    .panel h2 {{ margin: 0 0 10px; font-size: 16px; }}
+    .followup {{ border-top: 1px solid #1f2937; padding: 12px 0; }}
+    .followup:first-of-type {{ border-top: 0; }}
+    .badge {{ display: inline-block; border: 1px solid #334155; border-radius: 999px; padding: 2px 8px; margin-right: 6px; color: #bae6fd; font-size: 12px; }}
+    .muted {{ color: #94a3b8; font-size: 13px; }}
+    .row {{ display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }}
+    @media (max-width: 720px) {{ .row {{ grid-template-columns: 1fr; }} }}
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Jarvis FX Research Debug</h1>
+    <p class="muted">状态：{status}</p>
+    <div class="row">
+      <div>
+        <label for="token">Admin token</label>
+        <input id="token" type="password" autocomplete="off" placeholder="JARVIS_WEB_ADMIN_TOKEN">
+      </div>
+      <div>
+        <label for="userId">User ID</label>
+        <input id="userId" inputmode="numeric" placeholder="Telegram user id；留空则使用 0">
+      </div>
+    </div>
+    <button id="run">Run /fx_research</button>
+    <p id="meta" class="muted"></p>
+    <section class="panel">
+      <h2>Follow-up Router 推荐</h2>
+      <p id="followupMeta" class="muted">尚未运行。默认仅推荐，不会启动额外 Agent。</p>
+      <div id="followups"></div>
+    </section>
+    <pre id="out"></pre>
+  </main>
+  <script>
+    const run = document.getElementById('run');
+    const out = document.getElementById('out');
+    const meta = document.getElementById('meta');
+    const followupMeta = document.getElementById('followupMeta');
+    const followups = document.getElementById('followups');
+    function escapeHtml(value) {{
+      return String(value ?? '').replace(/[&<>"']/g, ch => ({{
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+      }}[ch]));
+    }}
+    function renderFollowups(items) {{
+      const rows = Array.isArray(items) ? items : [];
+      followupMeta.textContent = rows.length
+        ? `生成 ${{rows.length}} 条推荐。推荐模式：未执行额外 Agent。`
+        : '未发现需要深入研究的方向。推荐模式：未执行额外 Agent。';
+      followups.innerHTML = rows.map((item, index) => `
+        <div class="followup">
+          <div>
+            <span class="badge">#${{index + 1}}</span>
+            <span class="badge">${{escapeHtml(item.trigger_type)}}</span>
+            <span class="badge">priority=${{escapeHtml(item.priority)}}</span>
+          </div>
+          <div><strong>${{escapeHtml(item.target_agent)}}</strong> · ${{escapeHtml(item.target_category)}}</div>
+          <div class="muted">${{escapeHtml(item.reason)}}</div>
+          <div>${{escapeHtml(item.suggested_query)}}</div>
+        </div>
+      `).join('');
+    }}
+    run.addEventListener('click', async () => {{
+      run.disabled = true;
+      out.textContent = '';
+      followups.innerHTML = '';
+      followupMeta.textContent = 'Running...';
+      meta.textContent = 'Running...';
+      try {{
+        const res = await fetch('/api/debug/fx_research', {{
+          method: 'POST',
+          headers: {{
+            'Content-Type': 'application/json',
+            'X-Jarvis-Admin-Token': document.getElementById('token').value
+          }},
+          body: JSON.stringify({{
+            user_id: document.getElementById('userId').value || 0,
+            preset_name: 'fx_cnyaud'
+          }})
+        }});
+        const data = await res.json();
+        if (!res.ok || !data.ok) {{
+          out.textContent = JSON.stringify(data, null, 2);
+        }} else {{
+          meta.textContent = `brief=${{data.brief_id}} latency=${{data.latency_s}}s coverage=${{data.trace_summary.covered_sections}}/${{data.trace_summary.total_sections}} conflicts=${{data.trace_summary.conflict_count}}`;
+          renderFollowups(data.followup_requests);
+          out.textContent = data.text;
+        }}
+      }} catch (err) {{
+        out.textContent = String(err);
+        followupMeta.textContent = 'Follow-up 推荐生成失败或请求失败。';
+      }} finally {{
+        run.disabled = false;
+      }}
+    }});
+  </script>
+</body>
+</html>"""
+    return HTMLResponse(html)
+
+
+async def _api_debug_fx_research(request: Request):
+    """Run the same FX research workflow as Telegram, without Telegram I/O."""
+    if not _fx_research_debug_enabled():
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": (
+                    "FX research debug API disabled. Set "
+                    "web.enableFxResearchDebug=true or "
+                    "JARVIS_ENABLE_FX_RESEARCH_DEBUG=true."
+                ),
+            },
+            status_code=404,
+        )
+    blocked = _require_admin(request)
+    if blocked:
+        return blocked
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    preset_name = str(body.get("preset_name") or "fx_cnyaud")
+    if preset_name != "fx_cnyaud":
+        return JSONResponse(
+            {"ok": False, "error": "Only preset_name='fx_cnyaud' is supported."},
+            status_code=400,
+        )
+
+    try:
+        user_id = int(body.get("user_id") or 0)
+    except (TypeError, ValueError):
+        return JSONResponse(
+            {"ok": False, "error": "user_id must be an integer."},
+            status_code=400,
+        )
+
+    t0 = time.monotonic()
+    try:
+        from ..channels._telegram_helpers import (
+            _ensure_research_path,
+            _format_research_brief,
+        )
+        _ensure_research_path()
+        import importlib
+
+        _coord = importlib.import_module("coordinator")
+        _super = importlib.import_module("supervisor")
+        _schema = importlib.import_module("schema")
+        _followup = importlib.import_module("followup_router")
+
+        task, outputs, cost_estimate = await _coord.run_research(
+            preset_name=preset_name,
+            user_id=user_id,
+        )
+        preset = _schema.PRESET_REGISTRY.get(task.preset_name)
+        if preset is None:
+            raise ValueError(f"Preset {task.preset_name!r} not found")
+
+        brief = await _super.SupervisorReportWriter().run(
+            task, preset, outputs, cost_estimate,
+        )
+        latency_s = time.monotonic() - t0
+        text = _format_research_brief(brief, latency_s)
+        traces = list(getattr(brief, "retrieval_traces", []) or [])
+        selected_ids: set[str] = set()
+        for trace in traces:
+            selected_ids.update(getattr(trace, "selected_chunk_ids", []) or [])
+        trace_summary = {
+            "total_chunks": max(
+                (int(getattr(t, "total_chunks", 0) or 0) for t in traces),
+                default=0,
+            ),
+            "selected_chunks": len(selected_ids),
+            "covered_sections": sum(
+                1 for t in traces
+                if getattr(t, "section_covered", False)
+                or int(getattr(t, "retrieved_count", 0) or 0) > 0
+            ),
+            "total_sections": len(traces),
+            "conflict_count": sum(
+                int(getattr(t, "conflict_count", 0) or 0) for t in traces
+            ),
+        }
+        followup_requests = _followup.generate_followup_requests(
+            task,
+            outputs,
+            context_pack=None,
+            conflict_summary={"conflict_count": trace_summary["conflict_count"]},
+        )
+        return JSONResponse({
+            "ok": True,
+            "brief_id": brief.task_id[:8],
+            "task_id": brief.task_id,
+            "latency_s": round(latency_s, 1),
+            "agent_statuses": brief.agent_statuses,
+            "data_gaps": brief.data_gaps,
+            "trace_summary": trace_summary,
+            "followup_execution_enabled": False,
+            "followup_requests": [req.to_dict() for req in followup_requests],
+            "text": text,
+        })
+    except Exception as exc:
+        logger.exception("[Web] FX research debug failed")
+        return JSONResponse(
+            {"ok": False, "error": str(exc)},
+            status_code=500,
+        )
 
 
 # ── Web file sender ───────────────────────────────────────────────────────────

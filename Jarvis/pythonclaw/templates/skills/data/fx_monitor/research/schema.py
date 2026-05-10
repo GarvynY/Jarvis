@@ -21,6 +21,7 @@ Phase 10 additions (backward-compatible埋点):
   - RegulatoryFlag   — vocabulary enum for AgentOutput.regulatory_flags
   - RiskFactor       — structured risk entry (AttentionLayer input)
   - DepthHint        — elastic expansion hint (AttentionLayer activation hook)
+  - FollowupRequest  — router recommendation for optional later deep-dive
   - Finding gains    — category, importance, source_ids, time_sensitivity
   - AgentOutput gains — risk_factors, depth_hints, depth_level, parent_agent
 
@@ -58,6 +59,10 @@ def now_iso() -> str:
 
 def _new_task_id() -> str:
     return str(uuid.uuid4())
+
+
+def _new_followup_id() -> str:
+    return f"follow-{uuid.uuid4()}"
 
 
 # ── Runtime JSON-safety guard ─────────────────────────────────────────────────
@@ -550,6 +555,47 @@ class DepthHint:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 6.1 FollowupRequest [Phase 10E addition]
+#     Lightweight router recommendation for optional deeper research.
+#
+#     MVP behaviour: the router returns these recommendations only. Coordinator
+#     execution remains opt-in behind a separate config flag.
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class FollowupRequest:
+    request_id: str = field(default_factory=_new_followup_id)
+    target_agent: str = ""
+    target_category: str = ""
+    reason: str = ""
+    priority: float = 0.0
+    suggested_query: str = ""
+    max_depth: int = 1
+    trigger_type: str = ""
+
+    def __post_init__(self) -> None:
+        validate_confidence(self.priority)
+        if self.max_depth < 0:
+            raise ValueError(f"FollowupRequest.max_depth must be >= 0, got {self.max_depth}")
+
+    def to_dict(self) -> dict[str, Any]:
+        return to_dict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "FollowupRequest":
+        return cls(
+            request_id=d.get("request_id", _new_followup_id()),
+            target_agent=d.get("target_agent", ""),
+            target_category=d.get("target_category", ""),
+            reason=d.get("reason", ""),
+            priority=float(d.get("priority", 0.0)),
+            suggested_query=d.get("suggested_query", ""),
+            max_depth=int(d.get("max_depth", 1)),
+            trigger_type=d.get("trigger_type", ""),
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Phase 9.1 — Runtime Micro-RAG evidence dataclasses
 #
 # EvidenceChunk   — one chunk of text stored in the evidence store
@@ -601,6 +647,8 @@ class EvidenceChunk:
     created_at: str = field(default_factory=now_iso)
     ttl_policy: str = "task"             # "session" / "task" / "persistent"
     token_estimate: int = 0              # 近似 token 数，用于预算跟踪
+    attention_score: float = 0.0         # Phase 10 — attention-inspired score [0,1]
+    composite_score: float = 0.0         # Phase 10 — weighted composite score [0,1]
 
     def __post_init__(self) -> None:
         validate_confidence(self.importance)
@@ -627,6 +675,8 @@ class EvidenceChunk:
             created_at=d.get("created_at", now_iso()),
             ttl_policy=d.get("ttl_policy", "task"),
             token_estimate=int(d.get("token_estimate", 0)),
+            attention_score=float(d.get("attention_score", 0.0)),
+            composite_score=float(d.get("composite_score", 0.0)),
         )
 
 
@@ -710,8 +760,10 @@ class ContextPackItem:
     chunk_id: str = ""
     agent_name: str = ""
     text: str = ""
-    relevance_score: float = 0.0         # [0,1]
+    relevance_score: float = 0.0         # [0,1] — set to composite_score when scored
     token_estimate: int = 0
+    composite_score: float = 0.0         # Phase 10 — evidence_scorer composite
+    attention_score: float = 0.0         # Phase 10 — evidence_scorer attention
 
     def __post_init__(self) -> None:
         validate_confidence(self.relevance_score)
@@ -727,6 +779,8 @@ class ContextPackItem:
             text=d.get("text", ""),
             relevance_score=float(d.get("relevance_score", 0.0)),
             token_estimate=int(d.get("token_estimate", 0)),
+            composite_score=float(d.get("composite_score", 0.0)),
+            attention_score=float(d.get("attention_score", 0.0)),
         )
 
 
@@ -769,6 +823,14 @@ class RetrievalTrace:
     top_scores: list[float] = field(default_factory=list)   # 每个元素 [0,1]
     latency_ms: int = 0
     timestamp: str = field(default_factory=now_iso)
+    section_title: str = ""
+    selected_chunk_ids: list[str] = field(default_factory=list)
+    section_covered: bool = False
+    score_distribution: dict[str, Any] = field(default_factory=dict)
+    conflict_count: int = 0
+    conflict_pairs: list[dict[str, Any]] = field(default_factory=list)
+    boosted_chunk_ids: list[str] = field(default_factory=list)
+    scoring_method: str = ""             # Phase 10 — "composite" or "legacy"
 
     def __post_init__(self) -> None:
         for i, score in enumerate(self.top_scores):
@@ -787,6 +849,14 @@ class RetrievalTrace:
             top_scores=list(d.get("top_scores") or []),
             latency_ms=int(d.get("latency_ms", 0)),
             timestamp=d.get("timestamp", now_iso()),
+            section_title=d.get("section_title", ""),
+            selected_chunk_ids=list(d.get("selected_chunk_ids") or []),
+            section_covered=bool(d.get("section_covered", False)),
+            score_distribution=dict(d.get("score_distribution") or {}),
+            conflict_count=int(d.get("conflict_count", 0)),
+            conflict_pairs=list(d.get("conflict_pairs") or []),
+            boosted_chunk_ids=list(d.get("boosted_chunk_ids") or []),
+            scoring_method=d.get("scoring_method", ""),
         )
 
 

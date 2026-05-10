@@ -56,6 +56,7 @@ sys.modules.setdefault("pythonclaw.channels", _channels_pkg)
 _spec.loader.exec_module(_mod)  # type: ignore[union-attr]
 _format_research_brief = _mod._format_research_brief
 _make_feedback_keyboard = _mod._make_feedback_keyboard
+_parse_feedback_callback_data = _mod._parse_feedback_callback_data
 _extract_news_topic = _mod._extract_news_topic
 
 
@@ -76,6 +77,14 @@ class _RetrievalTrace:
     retrieved_count: int = 0
     total_chunks: int = 0
     top_scores: list[float] = field(default_factory=list)
+    section_title: str = ""
+    selected_chunk_ids: list[str] = field(default_factory=list)
+    section_covered: bool = False
+    score_distribution: dict = field(default_factory=dict)
+    conflict_count: int = 0
+    conflict_pairs: list[dict] = field(default_factory=list)
+    boosted_chunk_ids: list[str] = field(default_factory=list)
+    scoring_method: str = ""
 
 
 @dataclass
@@ -122,14 +131,15 @@ class TestFormatBriefEvidenceTrace(unittest.TestCase):
                 _Section(title="新闻驱动", chunk_ids=["c3"]),
             ],
             retrieval_traces=[
-                _RetrievalTrace(retrieved_count=10),
-                _RetrievalTrace(retrieved_count=5),
+                _RetrievalTrace(total_chunks=10, retrieved_count=2, selected_chunk_ids=["c1", "c2"], section_covered=True),
+                _RetrievalTrace(total_chunks=10, retrieved_count=1, selected_chunk_ids=["c3"], section_covered=True),
             ],
         )
         text = _format_research_brief(brief, 3.0)
         self.assertIn("证据追踪", text)
-        self.assertIn("15 个证据片段", text)
-        self.assertIn("最终使用了 3 个", text)
+        self.assertIn("从 10 个证据片段中筛选出 3 个", text)
+        self.assertIn("覆盖 2/2 个章节", text)
+        self.assertIn("识别出 0 组方向冲突", text)
 
     def test_dedup_chunk_ids_across_sections(self):
         """Same chunk_id in two sections is counted once."""
@@ -138,10 +148,10 @@ class TestFormatBriefEvidenceTrace(unittest.TestCase):
                 _Section(chunk_ids=["c1", "c2"]),
                 _Section(title="新闻驱动", chunk_ids=["c1"]),
             ],
-            retrieval_traces=[_RetrievalTrace(retrieved_count=8)],
+            retrieval_traces=[_RetrievalTrace(total_chunks=8, selected_chunk_ids=["c1", "c2"], section_covered=True)],
         )
         text = _format_research_brief(brief, 2.0)
-        self.assertIn("最终使用了 2 个", text)
+        self.assertIn("筛选出 2 个", text)
 
     def test_only_chunk_ids_no_traces(self):
         """chunk_ids present but no retrieval_traces → line still appears."""
@@ -150,14 +160,23 @@ class TestFormatBriefEvidenceTrace(unittest.TestCase):
         )
         text = _format_research_brief(brief, 1.0)
         self.assertIn("证据追踪", text)
-        self.assertIn("0 个证据片段", text)
-        self.assertIn("最终使用了 1 个", text)
+        self.assertIn("从 0 个证据片段中筛选出 1 个", text)
+
+    def test_legacy_trace_without_new_fields_formats(self):
+        """Old traces without structured selected ids still format correctly."""
+        brief = _Brief(
+            sections=[_Section(chunk_ids=["c1", "c2"])],
+            retrieval_traces=[_RetrievalTrace(retrieved_count=2, total_chunks=9)],
+        )
+        text = _format_research_brief(brief, 1.0)
+        self.assertIn("从 9 个证据片段中筛选出 2 个", text)
+        self.assertIn("覆盖 1/1 个章节", text)
 
     def test_evidence_line_before_cost(self):
         """Evidence line appears before the cost footer."""
         brief = _Brief(
             sections=[_Section(chunk_ids=["c1"])],
-            retrieval_traces=[_RetrievalTrace(retrieved_count=3)],
+            retrieval_traces=[_RetrievalTrace(total_chunks=3, selected_chunk_ids=["c1"], section_covered=True)],
         )
         text = _format_research_brief(brief, 1.0)
         ev_pos = text.index("证据追踪")
@@ -217,14 +236,23 @@ class TestFormatBriefEvidenceTrace(unittest.TestCase):
         self.assertIn("普通内容", text)
         self.assertNotIn("证据", text.split("证据追踪")[0] if "证据追踪" in text else text)
 
-    def test_evidence_log_note_in_footer(self):
-        """Footer mentions logs when evidence is present."""
+    def test_evidence_summary_hides_raw_ids(self):
+        """Evidence summary is compact and does not expose raw chunk IDs."""
         brief = _Brief(
             sections=[_Section(chunk_ids=["c1"])],
-            retrieval_traces=[_RetrievalTrace(retrieved_count=3)],
+            retrieval_traces=[
+                _RetrievalTrace(
+                    total_chunks=3,
+                    selected_chunk_ids=["c1"],
+                    section_covered=True,
+                    conflict_count=2,
+                )
+            ],
         )
         text = _format_research_brief(brief, 1.0)
-        self.assertIn("完整证据 ID 已记录在系统日志中", text)
+        evidence_line = next(line for line in text.splitlines() if "证据追踪" in line)
+        self.assertIn("识别出 2 组方向冲突", evidence_line)
+        self.assertNotIn("c1", evidence_line)
 
 
 class TestFeedbackKeyboardTopic(unittest.TestCase):
@@ -242,7 +270,7 @@ class TestFeedbackKeyboardTopic(unittest.TestCase):
     def test_topic_truncated(self):
         kb = _make_feedback_keyboard("news", "a" * 50)
         data = kb.inline_keyboard[0][0].callback_data
-        self.assertIn("news:" + "a" * 20, data)
+        self.assertIn("news:" + "a" * 18, data)
         self.assertTrue(len(data) <= 64)
 
     def test_all_three_buttons(self):
@@ -252,6 +280,32 @@ class TestFeedbackKeyboardTopic(unittest.TestCase):
         self.assertIn("useful:research:fx_cnyaud", buttons[0].callback_data)
         self.assertIn("not_useful:research:fx_cnyaud", buttons[1].callback_data)
         self.assertIn("not_interested:research:fx_cnyaud", buttons[2].callback_data)
+
+    def test_research_feedback_metadata_is_short_and_parseable(self):
+        kb = _make_feedback_keyboard(
+            "research",
+            "fx_cnyaud",
+            brief_id="df0083d5-abcdef",
+            category="fx_cnyaud",
+        )
+        buttons = kb.inline_keyboard[0]
+        for button in buttons:
+            data = button.callback_data
+            self.assertLessEqual(len(data.encode("utf-8")), 64)
+            self.assertIn(":b=df0083d5-abc", data)
+            self.assertIn(":c=fx_cnyaud", data)
+            parsed = _parse_feedback_callback_data(data)
+            self.assertEqual(parsed["source"], "research")
+            self.assertEqual(parsed["topic"], "fx_cnyaud")
+            self.assertEqual(parsed["brief_id"], "df0083d5-abc")
+            self.assertEqual(parsed["category"], "fx_cnyaud")
+
+    def test_legacy_feedback_callback_parse(self):
+        parsed = _parse_feedback_callback_data("fb:not_useful:news:RBA")
+        self.assertEqual(parsed["event_type"], "not_useful")
+        self.assertEqual(parsed["source"], "news")
+        self.assertEqual(parsed["topic"], "RBA")
+        self.assertEqual(parsed["category"], "RBA")
 
 
 class TestExtractNewsTopic(unittest.TestCase):

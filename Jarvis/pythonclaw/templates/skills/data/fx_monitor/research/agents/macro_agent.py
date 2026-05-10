@@ -271,6 +271,28 @@ def _parse_llm_response(
         direction = str(value or "neutral")
         return direction if direction in _VALID_DIRECTIONS else "neutral"
 
+    def _source_ids_for_signal(field: str) -> list[str]:
+        """Return compact, signal-specific source URLs instead of all results."""
+        patterns = {
+            "rba_signal":  ("rba", "reserve bank", "澳联储"),
+            "pboc_signal": ("pboc", "people's bank", "central bank", "yuan", "中国央行", "人民币"),
+            "usd_signal":  ("fed", "federal reserve", "usd", "dollar", "美元", "美联储"),
+        }.get(field, ())
+        urls: list[str] = []
+        for r in results[:_MAX_RESULTS_TO_LLM]:
+            haystack = " ".join(
+                str(r.get(k, "") or "")
+                for k in ("query", "title", "snippet", "source")
+            ).lower()
+            if patterns and not any(p.lower() in haystack for p in patterns):
+                continue
+            url = str(r.get("url", "") or "").strip()
+            if url and url not in urls:
+                urls.append(url)
+            if len(urls) >= 2:
+                break
+        return urls
+
     if text:
         try:
             m = re.search(r"\{.*\}", text, re.DOTALL)
@@ -308,6 +330,7 @@ def _parse_llm_response(
                         key=key,
                         summary=f"{label}: {direction.replace('_', ' ')}",
                         direction=direction,
+                        source_ids=_source_ids_for_signal(field),
                     ))
 
                 overall_direction = data.get("overall_direction")
@@ -325,6 +348,7 @@ def _parse_llm_response(
                         key=f"macro_detail_{i}",
                         summary=title[:220],
                         direction=detail_direction,
+                        source_ids=[r.get("url", "")] if r.get("url") else [],
                     ))
 
                 return findings[:_MAX_FINDINGS], risks, summary, data_gaps, unsafe_removed
@@ -340,6 +364,7 @@ def _parse_llm_response(
                 key=f"macro_raw_{i}",
                 summary=title,
                 direction=None,
+                source_ids=[r.get("url", "")] if r.get("url") else [],
             ))
     summary = f"基于 {len(results)} 条搜索结果（LLM分析不可用）"
     return findings, [], summary, [], False

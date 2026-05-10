@@ -585,16 +585,37 @@ def test_retrieval_trace() -> None:
         total_chunks=20,
         top_scores=[0.95, 0.88, 0.72, 0.65, 0.51],
         latency_ms=42,
+        section_title="汇率事实",
+        selected_chunk_ids=["c1", "c2"],
+        section_covered=True,
+        score_distribution={"count": 5, "min": 0.51, "max": 0.95, "avg": 0.742},
+        conflict_count=1,
+        conflict_pairs=[{"chunk_id_a": "c1", "chunk_id_b": "c2"}],
+        boosted_chunk_ids=["c1", "c2"],
+        scoring_method="composite",
     )
     d = _json_round_trip(trace, "RetrievalTrace")
     assert d["trace_id"].startswith("trace-")
     assert d["retrieved_count"] == 5
     assert len(d["top_scores"]) == 5
     assert isinstance(d["timestamp"], str)
+    assert d["section_title"] == "汇率事实"
+    assert d["selected_chunk_ids"] == ["c1", "c2"]
+    assert d["section_covered"] is True
+    assert d["conflict_count"] == 1
+    assert d["boosted_chunk_ids"] == ["c1", "c2"]
 
     trace2 = RetrievalTrace.from_dict(d)
     assert trace2.query == "CNY/AUD 汇率事实"
+    assert trace2.section_title == "汇率事实"
+    assert trace2.selected_chunk_ids == ["c1", "c2"]
+    assert trace2.conflict_pairs[0]["chunk_id_a"] == "c1"
     assert trace.to_dict() == d
+
+    legacy = RetrievalTrace.from_dict({"query": "old", "retrieved_count": 1})
+    assert legacy.selected_chunk_ids == []
+    assert legacy.section_covered is False
+    assert legacy.score_distribution == {}
     print("  RetrievalTrace           OK")
 
 
