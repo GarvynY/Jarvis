@@ -5,11 +5,12 @@ Rule-based, deterministic evidence scoring for attention-inspired routing.
 No LLM calls, no external APIs, no Telegram modifications.
 
 Scoring formula (composite_score):
-    importance      × 0.35
-  + confidence      × 0.25
+    importance      × 0.30
+  + confidence      × 0.20
   + recency_score   × 0.20
-  + source_quality  × 0.10
+  + source_quality  × 0.15
   + user_relevance  × 0.10
+  + conflict_value   × 0.05
 
 All sub-scores and the composite are clamped to [0.0, 1.0].
 """
@@ -33,11 +34,12 @@ except ImportError:
 
 # ── Weights ──────────────────────────────────────────────────────────────────
 
-W_IMPORTANCE: float = 0.35
-W_CONFIDENCE: float = 0.25
+W_IMPORTANCE: float = 0.30
+W_CONFIDENCE: float = 0.20
 W_RECENCY: float = 0.20
-W_SOURCE_QUALITY: float = 0.10
+W_SOURCE_QUALITY: float = 0.15
 W_USER_RELEVANCE: float = 0.10
+W_CONFLICT: float = 0.05
 
 # ── Recency decay ────────────────────────────────────────────────────────────
 
@@ -155,6 +157,7 @@ class ScoreBreakdown:
     recency_score: float = 0.0
     source_quality_score: float = 0.0
     user_relevance_score: float = 0.0
+    conflict_value: float = 0.0
 
 
 @dataclass
@@ -190,6 +193,15 @@ class EvidenceScore:
 
 def _clamp(v: float) -> float:
     return max(0.0, min(1.0, v))
+
+
+def _safe_float(value: object, default: float = 0.0) -> float:
+    if value is None or value == "":
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def _parse_iso(ts: str) -> datetime | None:
@@ -375,6 +387,7 @@ def compute_evidence_score(
     *,
     now_iso_str: str | None = None,
     category_feedback_summary: dict[str, float] | None = None,
+    conflict_value: float | None = None,
 ) -> EvidenceScore:
     """Compute composite evidence score for a single chunk.
 
@@ -389,13 +402,19 @@ def compute_evidence_score(
         safe_user_context,
         category_feedback_summary=category_feedback_summary,
     )
+    cv = _clamp(_safe_float(
+        getattr(chunk, "conflict_value", 0.0)
+        if conflict_value is None
+        else conflict_value
+    ))
 
     composite = _clamp(round(
         imp * W_IMPORTANCE
         + conf * W_CONFIDENCE
         + rec * W_RECENCY
         + sq * W_SOURCE_QUALITY
-        + ur * W_USER_RELEVANCE,
+        + ur * W_USER_RELEVANCE
+        + cv * W_CONFLICT,
         4,
     ))
 
@@ -423,7 +442,7 @@ def compute_evidence_score(
         recency_score=rec,
         source_quality_score=sq,
         user_relevance_score=ur,
-        conflict_value=0.0,
+        conflict_value=cv,
         reason=reason,
     )
 

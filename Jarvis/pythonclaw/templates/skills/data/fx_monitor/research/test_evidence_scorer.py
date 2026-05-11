@@ -27,6 +27,8 @@ Tests:
   22. test_reuters_beats_marketpulse
   23. test_crypto_sources_low_for_fx_macro
   24. test_missing_url_title_no_crash
+  25. test_conflict_value_in_composite
+  26. test_conflict_value_invalid_safe
 
 Run:
     cd Jarvis/pythonclaw/templates/skills/data/fx_monitor/research
@@ -57,6 +59,7 @@ from evidence_scorer import (  # noqa: E402
     W_RECENCY,
     W_SOURCE_QUALITY,
     W_USER_RELEVANCE,
+    W_CONFLICT,
 )
 
 
@@ -272,6 +275,7 @@ def test_composite_formula() -> None:
         + score.recency_score * W_RECENCY
         + 0.95 * W_SOURCE_QUALITY
         + 0.8 * W_USER_RELEVANCE
+        + 0.0 * W_CONFLICT
     )
     expected = max(0.0, min(1.0, round(expected, 4)))
     assert abs(score.composite_score - expected) < 0.001, (
@@ -336,12 +340,14 @@ def test_score_breakdown_fields() -> None:
         recency_score=0.9,
         source_quality_score=0.7,
         user_relevance_score=0.3,
+        conflict_value=0.2,
     )
     assert sb.importance == 0.8
     assert sb.confidence == 0.6
     assert sb.recency_score == 0.9
     assert sb.source_quality_score == 0.7
     assert sb.user_relevance_score == 0.3
+    assert sb.conflict_value == 0.2
     print("  ScoreBreakdown fields           OK")
 
 
@@ -358,7 +364,8 @@ def test_zero_chunk_baseline() -> None:
         + 0.0 * W_CONFIDENCE
         + 0.5 * W_RECENCY
         + 0.2 * W_SOURCE_QUALITY
-        + 0.3 * W_USER_RELEVANCE,
+        + 0.3 * W_USER_RELEVANCE
+        + 0.0 * W_CONFLICT,
         4,
     )
     assert abs(score.composite_score - expected_baseline) < 0.001, (
@@ -404,6 +411,42 @@ def test_missing_url_title_no_crash() -> None:
     print("  missing URL/title no crash      OK")
 
 
+def test_conflict_value_in_composite() -> None:
+    chunk = _make_chunk(
+        importance=0.4,
+        confidence=0.5,
+        source="https://www.reuters.com/markets/currencies/aud-cny",
+        category="macro",
+        created_at=_now_str(),
+    )
+    now = _now_str()
+    base = compute_evidence_score(chunk, now_iso_str=now, conflict_value=0.0)
+    conflicted = compute_evidence_score(chunk, now_iso_str=now, conflict_value=1.0)
+    expected_delta = W_CONFLICT
+    actual_delta = round(conflicted.composite_score - base.composite_score, 4)
+    assert conflicted.conflict_value == 1.0
+    assert abs(actual_delta - expected_delta) < 0.001, (
+        f"Expected conflict contribution {expected_delta}, got {actual_delta}"
+    )
+    print("  conflict value enters composite OK")
+
+
+def test_conflict_value_invalid_safe() -> None:
+    chunk = _make_chunk()
+    chunk.conflict_value = None  # type: ignore[attr-defined]
+    none_score = compute_evidence_score(chunk, now_iso_str=_now_str())
+    assert none_score.conflict_value == 0.0
+
+    chunk.conflict_value = "bad-value"  # type: ignore[attr-defined]
+    bad_score = compute_evidence_score(chunk, now_iso_str=_now_str())
+    assert bad_score.conflict_value == 0.0
+
+    chunk.conflict_value = ""  # type: ignore[attr-defined]
+    empty_score = compute_evidence_score(chunk, now_iso_str=_now_str())
+    assert empty_score.conflict_value == 0.0
+    print("  invalid conflict value safe      OK")
+
+
 # ── Runner ───────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -436,9 +479,11 @@ def main() -> None:
     test_reuters_beats_marketpulse()
     test_crypto_sources_low_for_fx_macro()
     test_missing_url_title_no_crash()
+    test_conflict_value_in_composite()
+    test_conflict_value_invalid_safe()
 
     print("\n" + "=" * 60)
-    print("All 26 tests passed.")
+    print("All 28 tests passed.")
 
 
 if __name__ == "__main__":
