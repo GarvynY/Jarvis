@@ -607,6 +607,15 @@ _ONBOARDING_INTRO = (
 # ── Inline feedback button helpers ────────────────────────────────────────────
 
 _FB_PREFIX = "fb:"
+_NF_PREFIX = "nf:"
+_PD_PREFIX = "pd:"
+
+_NEWS_NOT_INTERESTED_REASONS: dict[str, str] = {
+    "old": "内容太旧",
+    "shallow": "逻辑太浅",
+    "irrelevant": "相关度低",
+    "known": "我已知道",
+}
 
 _FB_SOURCE_LABELS: dict[str, str] = {
     "research": "研究简报",
@@ -725,6 +734,85 @@ def _parse_feedback_callback_data(data: str) -> dict[str, str | None]:
     if parsed["category"] is None:
         parsed["category"] = parsed["topic"]
     return parsed
+
+
+def _make_news_not_interested_reason_keyboard(feedback_id: int | str) -> InlineKeyboardMarkup:
+    safe_id = _safe_callback_part(str(feedback_id), 12)
+    rows = [
+        [
+            InlineKeyboardButton(
+                label,
+                callback_data=f"{_NF_PREFIX}nir:{safe_id}:{code}",
+            )
+        ]
+        for code, label in _NEWS_NOT_INTERESTED_REASONS.items()
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+def _parse_news_feedback_callback_data(data: str) -> dict[str, str | None]:
+    """Parse short news feedback callbacks.
+
+    Formats:
+      nf:u:<feedback_id>:<tag_index>
+      nf:ni:<feedback_id>
+      nf:nir:<feedback_id>:<reason_code>
+    """
+    if not data.startswith(_NF_PREFIX):
+        return {}
+    parts = data[len(_NF_PREFIX):].split(":")
+    action = parts[0] if parts else ""
+    parsed: dict[str, str | None] = {
+        "action": action or None,
+        "feedback_id": parts[1] if len(parts) > 1 and parts[1] else None,
+        "tag_index": parts[2] if action == "u" and len(parts) > 2 else None,
+        "reason_code": parts[2] if action == "nir" and len(parts) > 2 else None,
+    }
+    return parsed
+
+
+def _make_preference_declaration_keyboard(declaration_id: int | str) -> InlineKeyboardMarkup:
+    safe_id = _safe_callback_part(str(declaration_id), 12)
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("确认", callback_data=f"{_PD_PREFIX}confirm:{safe_id}"),
+        InlineKeyboardButton("不确认", callback_data=f"{_PD_PREFIX}reject:{safe_id}"),
+    ]])
+
+
+def _parse_preference_declaration_callback_data(data: str) -> dict[str, str | None]:
+    if not data.startswith(_PD_PREFIX):
+        return {}
+    parts = data[len(_PD_PREFIX):].split(":")
+    return {
+        "action": parts[0] if parts else None,
+        "declaration_id": parts[1] if len(parts) > 1 and parts[1] else None,
+    }
+
+
+def _format_preference_declarations(
+    declarations: list[dict[str, Any]],
+    *,
+    title: str,
+    empty: str,
+    limit: int = 5,
+) -> str:
+    lines = [title]
+    if not declarations:
+        lines.append(empty)
+        return "\n".join(lines)
+    for index, item in enumerate(declarations[:limit], start=1):
+        declaration = str(item.get("declaration") or "").strip()
+        evidence_count = item.get("evidence_count")
+        metadata = item.get("metadata") or {}
+        confidence_hint = metadata.get("confidence_hint")
+        suffix = []
+        if evidence_count:
+            suffix.append(f"证据 {evidence_count}")
+        if confidence_hint:
+            suffix.append(f"置信 {confidence_hint}")
+        meta = f"（{' / '.join(suffix)}）" if suffix else ""
+        lines.append(f"{index}. {declaration}{meta}")
+    return "\n".join(lines)
 
 
 _KEYWORD_TOPIC_MAP: list[tuple[str, str]] = [

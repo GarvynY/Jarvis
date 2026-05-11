@@ -83,6 +83,9 @@ from ._telegram_helpers import (
     _ONBOARDING_INTRO,
     # Feedback inline buttons
     _FB_PREFIX,
+    _NF_PREFIX,
+    _PD_PREFIX,
+    _NEWS_NOT_INTERESTED_REASONS,
     _FB_SOURCE_LABELS,
     _FEEDBACK_TYPE_ALIASES,
     _FEEDBACK_TYPE_LABELS,
@@ -101,7 +104,12 @@ from ._telegram_helpers import (
     _delete_profile_requires_confirmation,
     # Feedback UI
     _make_feedback_keyboard,
+    _make_news_not_interested_reason_keyboard,
+    _make_preference_declaration_keyboard,
     _parse_feedback_callback_data,
+    _parse_news_feedback_callback_data,
+    _parse_preference_declaration_callback_data,
+    _format_preference_declarations,
     _extract_news_topic,
     _parse_feedback_args,
     _format_feedback_confirmation,
@@ -283,7 +291,12 @@ class TelegramBot:
     async def _cmd_my_profile(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._check_access(update, context):
             return
-        from ..core.personalization import get_or_create_user, get_user_profile, mark_onboarding_completed
+        from ..core.personalization import (
+            get_or_create_user,
+            get_user_profile,
+            list_preference_declarations,
+            mark_onboarding_completed,
+        )
 
         if update.effective_user is None or update.message is None:
             return
@@ -296,6 +309,33 @@ class TelegramBot:
             profile = get_user_profile(telegram_user_id)
 
         await update.message.reply_text(_format_user_profile(profile, created=created))
+        pending = list_preference_declarations(telegram_user_id, status="pending")
+        confirmed = list_preference_declarations(telegram_user_id, status="confirmed")
+        if confirmed:
+            await update.message.reply_text(
+                _format_preference_declarations(
+                    confirmed,
+                    title="已确认的隐式偏好：",
+                    empty="- 暂无已确认声明",
+                )
+            )
+        if pending:
+            await update.message.reply_text(
+                _format_preference_declarations(
+                    pending,
+                    title="待确认的隐式偏好：",
+                    empty="- 暂无待确认声明",
+                )
+            )
+            for item in pending[:5]:
+                declaration_id = item.get("id")
+                declaration = str(item.get("declaration") or "").strip()
+                if not declaration_id or not declaration:
+                    continue
+                await update.message.reply_text(
+                    f"待确认：{declaration}",
+                    reply_markup=_make_preference_declaration_keyboard(declaration_id),
+                )
 
     async def _cmd_privacy(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._check_access(update, context):
@@ -384,6 +424,12 @@ class TelegramBot:
             return
 
         data = query.data or ""
+        if data.startswith(_PD_PREFIX):
+            await self._handle_preference_declaration_callback(update, context)
+            return
+        if data.startswith(_NF_PREFIX):
+            await self._handle_news_feedback_callback(update, context)
+            return
         if not data.startswith(_FB_PREFIX):
             return
 
@@ -447,6 +493,171 @@ class TelegramBot:
                 "[Telegram] Inferred preference aggregation failed for user_id=%s",
                 query.from_user.id, exc_info=True,
             )
+
+    async def _handle_news_feedback_callback(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        """Handle short-lived news tag feedback callbacks."""
+        query = update.callback_query
+        if query is None or query.from_user is None:
+            return
+
+        parsed = _parse_news_feedback_callback_data(query.data or "")
+        action = parsed.get("action")
+        feedback_id = parsed.get("feedback_id")
+        if not feedback_id:
+            await query.answer("反馈已过期或格式无效。")
+            return
+
+        from ..core.personalization import (
+            get_news_feedback_context,
+            log_feedback_event,
+            update_inferred_preferences_from_feedback,
+        )
+
+        news_context = get_news_feedback_context(query.from_user.id, feedback_id)
+        if not news_context:
+            await query.answer("这条反馈上下文已过期。")
+            return
+
+        tags = list(news_context.get("tags") or [])
+        message_id = str(query.message.message_id) if query.message else None
+        base_metadata = {
+            "source": "inline_button:news_tag",
+            "news_feedback_id": str(feedback_id),
+        }
+
+        if action == "ni":
+            try:
+                await query.edit_message_reply_markup(
+                    reply_markup=_make_news_not_interested_reason_keyboard(feedback_id)
+                )
+            except Exception:
+                logger.exception("[Telegram] Failed to show news not-interested reasons")
+            await query.answer("请选择不感兴趣的原因。")
+            return
+
+        if action == "u":
+            try:
+                tag_index = int(parsed.get("tag_index") or -1)
+            except ValueError:
+                tag_index = -1
+            if tag_index < 0 or tag_index >= len(tags):
+                await query.answer("主题已过期或无效。")
+                return
+            topic = str(tags[tag_index])
+            event_type = "useful"
+            category = "news_tag"
+            metadata = dict(base_metadata)
+            metadata["tag_index"] = tag_index
+        elif action == "nir":
+            reason_code = parsed.get("reason_code") or ""
+            reason_label = _NEWS_NOT_INTERESTED_REASONS.get(reason_code)
+            if not reason_label:
+                await query.answer("未知原因。")
+                return
+            topic = reason_label
+            event_type = "not_interested"
+            category = "news_article_quality"
+            metadata = dict(base_metadata)
+            metadata["reason_code"] = reason_code
+            metadata["tags"] = tags[:3]
+        else:
+            await query.answer("未知反馈类型。")
+            return
+
+        try:
+            log_feedback_event(
+                query.from_user.id,
+                event_type,
+                topic=topic,
+                category=category,
+                message_id=message_id,
+                metadata=metadata,
+            )
+        except Exception:
+            logger.exception("[Telegram] Failed to log news feedback user_id=%s", query.from_user.id)
+            await query.answer("记录失败，请稍后再试。")
+            return
+
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+
+        try:
+            update_inferred_preferences_from_feedback(query.from_user.id)
+        except Exception:
+            logger.warning(
+                "[Telegram] Inferred preference aggregation failed for user_id=%s",
+                query.from_user.id,
+                exc_info=True,
+            )
+
+        await query.answer(f"已记录：{topic}")
+        logger.info(
+            "[Telegram] News feedback logged: user_id=%s action=%s topic=%s feedback_id=%s",
+            query.from_user.id, action, topic, feedback_id,
+        )
+
+    async def _handle_preference_declaration_callback(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        """Handle pending inferred preference declaration confirmation."""
+        query = update.callback_query
+        if query is None or query.from_user is None:
+            return
+        parsed = _parse_preference_declaration_callback_data(query.data or "")
+        action = parsed.get("action")
+        declaration_id = parsed.get("declaration_id")
+        if not declaration_id:
+            await query.answer("声明编号无效。")
+            return
+        status_map = {
+            "confirm": "confirmed",
+            "reject": "rejected",
+        }
+        status = status_map.get(str(action or ""))
+        if not status:
+            await query.answer("未知操作。")
+            return
+
+        from ..core.personalization import update_preference_declaration_status
+
+        try:
+            ok = update_preference_declaration_status(
+                query.from_user.id,
+                declaration_id,
+                status,
+            )
+        except Exception:
+            logger.exception(
+                "[Telegram] Failed to update preference declaration user_id=%s id=%s",
+                query.from_user.id,
+                declaration_id,
+            )
+            await query.answer("更新失败，请稍后再试。")
+            return
+        if not ok:
+            await query.answer("声明不存在或已不可用。")
+            return
+
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        label = "已确认" if status == "confirmed" else "已不确认"
+        await query.answer(label)
+        logger.info(
+            "[Telegram] Preference declaration updated: user_id=%s id=%s status=%s",
+            query.from_user.id,
+            declaration_id,
+            status,
+        )
 
     async def _maybe_start_onboarding(
         self,
@@ -1410,7 +1621,7 @@ class TelegramBot:
         app.add_handler(CommandHandler("fx_research", self._cmd_fx_research))
         app.add_handler(CommandHandler("clear_files", self._cmd_clear_files))
         app.add_handler(CallbackQueryHandler(
-            self._handle_feedback_callback, pattern=r"^fb:"
+            self._handle_feedback_callback, pattern=r"^(?:fb|nf|pd):"
         ))
         app.add_handler(MessageHandler(
             (filters.TEXT | filters.PHOTO | filters.VOICE | filters.AUDIO)

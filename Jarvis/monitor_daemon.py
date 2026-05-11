@@ -13,6 +13,7 @@ Run with: python monitor_daemon.py
 
 import json
 import logging
+import re
 import subprocess
 import sys
 import time
@@ -53,6 +54,7 @@ STATE_PATH   = Path.home() / ".pythonclaw" / "context" / "daemon_state.json"
 
 RATE_INTERVAL_SEC      = 30 * 60   # how often to fetch rate
 NEWS_INTERVAL_SEC      = 20 * 60   # how often to scan news
+PREFERENCE_INTERVAL_SEC = NEWS_INTERVAL_SEC  # only for real-time news feedback
 SIMPLE_THRESHOLD_PCT   = 0.3       # rate-only alert (no LLM)
 COMBINED_THRESHOLD_PCT = 0.8       # news + rate → LLM alert
 RATE_HISTORY_HOURS     = 48        # window for rolling high
@@ -91,6 +93,26 @@ def _feedback_keyboard(source: str) -> dict:
             {"text": "🚫 不感兴趣", "callback_data": f"fb:not_interested:{source}"},
         ]]
     }
+
+
+def _news_feedback_keyboard(tag_buttons: list[tuple[str, int, int]]) -> dict:
+    """Return raw Telegram keyboard for tag-level news feedback."""
+    rows: list[list[dict[str, str]]] = []
+    tag_row: list[dict[str, str]] = []
+    for label, feedback_id, tag_index in tag_buttons[:3]:
+        safe_label = str(label or "").strip()[:16] or "主题"
+        tag_row.append({
+            "text": f"{safe_label}👍",
+            "callback_data": f"nf:u:{int(feedback_id)}:{int(tag_index)}",
+        })
+    if tag_row:
+        rows.append(tag_row)
+    if tag_buttons:
+        rows.append([{
+            "text": "🚫 不感兴趣",
+            "callback_data": f"nf:ni:{int(tag_buttons[0][1])}",
+        }])
+    return {"inline_keyboard": rows} if rows else _feedback_keyboard("news")
 
 
 def _reply_markup_source(reply_markup: dict | None) -> str:
@@ -145,6 +167,18 @@ def _telegram_send(
                     log.info("Telegram message sent with feedback keyboard; response parse skipped")
     except Exception as e:
         log.error("Failed to send Telegram message: %s", e)
+
+
+def _iter_telegram_user_ids(chat_id: int | str | list) -> list[int]:
+    """Return Telegram user ids for private real-time news feedback processing."""
+    raw_items = chat_id if isinstance(chat_id, list) else [chat_id]
+    out: list[int] = []
+    for item in raw_items:
+        try:
+            out.append(int(item))
+        except (TypeError, ValueError):
+            log.debug("Skipping non-numeric Telegram id for preference agent: %s", item)
+    return out
 
 
 # ── skill scripts ─────────────────────────────────────────────────────────────
@@ -304,63 +338,215 @@ def _48h_high(state: dict) -> float | None:
 # ── LLM analysis ─────────────────────────────────────────────────────────────
 
 NO_RELEVANCE = "无关"   # per-article signal that article has no CNY/AUD impact
+_MAX_NEWS_ARTICLES_FOR_LLM = 8
+_MAX_NEWS_TAGS = 3
+_MAX_NEWS_TAG_CHARS = 16
+_MAX_NEWS_SUMMARY_CHARS = 180
+_LLM_ARTICLE_ANALYSIS_RETRIES = 2
+_SENSITIVE_TEXT_PATTERNS = (
+    re.compile(r"https?://\S+", re.I),
+    re.compile(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}"),
+    re.compile(r"\b(?:\+?\d[\d\s().-]{6,}\d)\b"),
+    re.compile(r"\b(?:api[_-]?key|token|password|passwd|secret)\b\s*[:=]\s*\S+", re.I),
+)
+_TAG_UNSAFE_PATTERN = re.compile(r"[^\w\u4e00-\u9fff/&+\- ]+")
+
+
+def _strip_json_fence(raw: str) -> str:
+    text = (raw or "").strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.I)
+        text = re.sub(r"\s*```$", "", text)
+    return text.strip()
+
+
+def _filter_sensitive_text(text: str) -> str:
+    clean = str(text or "").strip()
+    for pattern in _SENSITIVE_TEXT_PATTERNS:
+        clean = pattern.sub("[已过滤]", clean)
+    return re.sub(r"\s+", " ", clean).strip()
+
+
+def _limit_chars(text: str, max_chars: int) -> str:
+    clean = _filter_sensitive_text(text)
+    if len(clean) <= max_chars:
+        return clean
+    return clean[: max_chars - 1].rstrip() + "…"
+
+
+def _normalize_tag_key(tag: str) -> str:
+    return re.sub(r"[\s_\-]+", "", tag).lower()
+
+
+def _sanitize_news_tag(tag: object) -> str:
+    clean = _filter_sensitive_text(str(tag or ""))
+    clean = _TAG_UNSAFE_PATTERN.sub("", clean)
+    clean = re.sub(r"\s+", " ", clean).strip(" -_/+")
+    if not clean or "[已过滤]" in clean:
+        return ""
+    if len(clean) > _MAX_NEWS_TAG_CHARS:
+        clean = clean[:_MAX_NEWS_TAG_CHARS].rstrip()
+    return clean
+
+
+def _sanitize_news_tags(tags: object) -> list[str]:
+    if not isinstance(tags, list):
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for tag in tags:
+        clean = _sanitize_news_tag(tag)
+        key = _normalize_tag_key(clean)
+        if not clean or key in seen:
+            continue
+        seen.add(key)
+        out.append(clean)
+        if len(out) >= _MAX_NEWS_TAGS:
+            break
+    return out
+
+
+def _parse_llm_article_analysis(
+    raw: str,
+    articles: list[dict],
+) -> list[tuple[dict, str, list[str]]]:
+    """
+    Parse and validate JSON article relevance output.
+
+    Expected schema:
+      {"articles": [{"index": 1, "relevant": true, "summary": "...", "tags": ["..."]}]}
+    """
+    payload = json.loads(_strip_json_fence(raw))
+    if not isinstance(payload, dict) or not isinstance(payload.get("articles"), list):
+        raise ValueError("article analysis must be a JSON object with an articles list")
+
+    max_items = min(len(articles), _MAX_NEWS_ARTICLES_FOR_LLM)
+    result: list[tuple[dict, str, list[str]]] = []
+    seen_indexes: set[int] = set()
+
+    for item in payload["articles"]:
+        if not isinstance(item, dict):
+            raise ValueError("each article result must be an object")
+        try:
+            index = int(item.get("index"))
+        except (TypeError, ValueError):
+            raise ValueError("article index must be an integer") from None
+        if index < 1 or index > max_items:
+            raise ValueError(f"article index out of range: {index}")
+        if index in seen_indexes:
+            raise ValueError(f"duplicate article index: {index}")
+        seen_indexes.add(index)
+
+        relevant = item.get("relevant")
+        if not isinstance(relevant, bool):
+            raise ValueError("article relevant must be boolean")
+        if not relevant:
+            continue
+
+        summary = _limit_chars(str(item.get("summary") or ""), _MAX_NEWS_SUMMARY_CHARS)
+        if not summary or NO_RELEVANCE in summary:
+            raise ValueError(f"relevant article {index} is missing a valid summary")
+
+        tags = _sanitize_news_tags(item.get("tags"))
+        if not tags:
+            raise ValueError(f"relevant article {index} is missing valid tags")
+
+        article = dict(articles[index - 1])
+        article["_llm_tags"] = tags
+        result.append((article, summary, tags))
+
+    expected_indexes = set(range(1, max_items + 1))
+    if seen_indexes != expected_indexes:
+        missing = sorted(expected_indexes - seen_indexes)
+        raise ValueError(f"article analysis missing indexes: {missing}")
+
+    return result
+
+
+def _build_news_analysis_prompt(
+    articles: list[dict],
+    safe_user_context: dict | None = None,
+    repair_error: str | None = None,
+    previous_output: str | None = None,
+) -> str:
+    numbered = "\n".join(
+        f"{i+1}. {a['title']}" for i, a in enumerate(articles[:_MAX_NEWS_ARTICLES_FOR_LLM])
+    )
+    repair = ""
+    if repair_error:
+        repair = (
+            "\n上一次输出未通过格式校验，请只返回修正后的 JSON。"
+            f"\n校验错误：{repair_error}"
+        )
+        if previous_output:
+            repair += f"\n上一次输出：{_limit_chars(previous_output, 1200)}"
+
+    return (
+        f"{_safe_context_prompt_line(safe_user_context)}"
+        f"以下是新出现的新闻。请判断每条新闻是否与 CNY/AUD（1 AUD = X CNY）"
+        f"汇率研究相关，并为相关新闻生成简短中文分析和主题标签。{repair}\n\n"
+        f"{numbered}\n\n"
+        "严格只输出 JSON，不要 Markdown，不要解释。Schema：\n"
+        '{"articles":[{"index":1,"relevant":true,"summary":"不超过90字中文，说明新闻内容和可能汇率影响","tags":["2-16字主题A","主题B","主题C"]}]}\n'
+        "规则：\n"
+        f"- 必须覆盖上面每个编号，index 使用原编号。\n"
+        f"- 完全无关时 relevant=false，summary 可为空，tags=[]。\n"
+        f"- 相关时 tags 1 到 {_MAX_NEWS_TAGS} 个，短词或短语，去重，避免宽泛词如“新闻”。\n"
+        "- 标签优先表达用户可反馈的主题，例如 RBA利率、澳元商品货币、中国宽松政策、能源风险。\n"
+        "- 不要输出 URL、邮箱、电话号码、token、密码、地址等敏感或可识别信息。"
+    )
+
+
+def _call_article_analysis_llm(client: object, prompt: str) -> str:
+    response = call_with_backoff(
+        "deepseek",
+        client.chat.completions.create,
+        model="deepseek-chat",
+        max_tokens=700,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    return response.choices[0].message.content.strip()
+
+
+def _make_deepseek_client(api_key: str) -> object:
+    from openai import OpenAI
+
+    return OpenAI(
+        api_key=api_key,
+        base_url="https://api.deepseek.com/v1",
+        timeout=60.0,
+    )
 
 
 def _llm_per_article_analysis(
     api_key: str,
     articles: list[dict],
     safe_user_context: dict | None = None,
-) -> list[tuple[dict, str]]:
+) -> list[tuple[dict, str, list[str]]]:
     """
-    For each article, generate a 1-2 sentence Chinese summary of content
-    and CNY/AUD impact. Articles with no rate relevance are marked NO_RELEVANCE.
+    For each article, classify relevance and generate a Chinese summary plus tags.
 
-    Returns list of (article, summary) for relevant articles only.
+    Returns list of (article, summary, tags) for relevant articles only.
     """
-    from openai import OpenAI
+    client = _make_deepseek_client(api_key)
+    previous_output = ""
+    last_error = ""
+    for _attempt in range(_LLM_ARTICLE_ANALYSIS_RETRIES):
+        prompt = _build_news_analysis_prompt(
+            articles,
+            safe_user_context,
+            repair_error=last_error or None,
+            previous_output=previous_output or None,
+        )
+        raw = _call_article_analysis_llm(client, prompt)
+        try:
+            return _parse_llm_article_analysis(raw, articles)
+        except (json.JSONDecodeError, ValueError) as exc:
+            previous_output = raw
+            last_error = str(exc)
+            log.warning("LLM per-article JSON validation failed: %s", last_error)
 
-    numbered = "\n".join(
-        f"{i+1}. {a['title']}" for i, a in enumerate(articles[:8])
-    )
-    prompt = (
-        f"{_safe_context_prompt_line(safe_user_context)}"
-        f"以下是新出现的新闻，请对每条用1-2句中文回复：先简述新闻内容，再说明对"
-        f"CNY/AUD（人民币/澳元）汇率的可能影响。\n"
-        f"如果某条与CNY/AUD汇率完全无关，只写'{NO_RELEVANCE}'。\n\n"
-        f"{numbered}\n\n"
-        f"按编号顺序回复，每条单独一行，格式示例：\n"
-        f"1. 伊朗宣布封锁霍尔木兹海峡，油价急涨；澳元作为商品货币或受提振，AUD短期偏强。\n"
-        f"2. {NO_RELEVANCE}\n"
-        f"3. RBA 暗示下月加息，澳元利差优势扩大，CNY/AUD 汇率中期承压。"
-    )
-
-    client = OpenAI(
-        api_key=api_key,
-        base_url="https://api.deepseek.com/v1",
-        timeout=60.0,
-    )
-    response = call_with_backoff(
-        "deepseek",
-        client.chat.completions.create,
-        model="deepseek-chat",
-        max_tokens=400,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    raw = response.choices[0].message.content.strip()
-
-    # Parse numbered lines back to articles
-    import re
-    result: list[tuple[dict, str]] = []
-    for i, article in enumerate(articles[:8]):
-        pattern = rf"^\s*{i+1}[.\uff0e]\s*(.+)"
-        for line in raw.splitlines():
-            m = re.match(pattern, line)
-            if m:
-                summary = m.group(1).strip()
-                if summary and NO_RELEVANCE not in summary:
-                    result.append((article, summary))
-                break
-    return result
+    raise ValueError(f"LLM per-article analysis did not return valid JSON: {last_error}")
 
 
 def _llm_combined_analysis(
@@ -401,6 +587,84 @@ def _llm_combined_analysis(
         messages=[{"role": "user", "content": prompt}],
     )
     return response.choices[0].message.content.strip()
+
+
+def _store_news_feedback_contexts(
+    chat_id: int,
+    relevant: list[tuple[dict, str, list[str]]],
+) -> list[tuple[str, int, int]]:
+    """Store one short-lived push-level feedback context and return tag buttons."""
+    try:
+        from pythonclaw.core.personalization import (
+            get_news_feedback_rollup_status,
+            store_news_feedback_context,
+        )
+    except Exception as exc:
+        log.warning("News feedback context store unavailable: %s", exc)
+        return []
+
+    unique_tags: list[str] = []
+    seen_tags: set[str] = set()
+    for _article, _summary, tags in relevant:
+        for index, tag in enumerate(tags):
+            if len(unique_tags) >= 3:
+                break
+            key = str(tag).strip().lower()
+            if not key or key in seen_tags:
+                continue
+            seen_tags.add(key)
+            unique_tags.append(str(tag))
+    if not unique_tags:
+        return []
+
+    title = " | ".join(str(article.get("title") or "") for article, _summary, _tags in relevant[:3])
+    summary = "\n".join(
+        f"- {str(article.get('title') or '')}: {summary}"
+        for article, summary, _tags in relevant[:5]
+    )
+    first_article = relevant[0][0]
+    structured_articles = [
+        {
+            "title": str(article.get("title") or ""),
+            "summary": summary,
+            "url": article.get("url"),
+            "published": article.get("published") or article.get("published_at"),
+            "tags": tags,
+        }
+        for article, summary, tags in relevant[:5]
+    ]
+    try:
+        feedback_id = store_news_feedback_context(
+            chat_id,
+            article_title=title,
+            article_summary=summary,
+            article_url=first_article.get("url"),
+            tags=unique_tags,
+            articles=structured_articles,
+            metadata={
+                "source": "monitor_daemon",
+                "scope": "news_push",
+                "article_count": len(relevant),
+            },
+        )
+    except Exception as exc:
+        log.warning("Failed to store news feedback context: %s", exc)
+        return []
+
+    buttons = [(tag, feedback_id, index) for index, tag in enumerate(unique_tags)]
+
+    try:
+        status = get_news_feedback_rollup_status(chat_id)
+        log.info(
+            "News feedback context stored: user_id=%s context_id=%s feedback_count=%s threshold_reached=%s",
+            chat_id,
+            feedback_id,
+            status.get("feedback_count"),
+            status.get("threshold_reached"),
+        )
+    except Exception as exc:
+        log.debug("News feedback rollup status unavailable: %s", exc)
+    return buttons
 
 
 # ── main check functions ───────────────────────────────────────────────────────
@@ -499,7 +763,7 @@ def check_news(api_key: str, token: str, chat_id: int,
 
     lines = "\n\n".join(
         f"• <b>{a['title']}</b>\n  {summary}"
-        for a, summary in relevant
+        for a, summary, _tags in relevant
     )
 
     # Append current bank rate footer — refresh if cache older than 10 min
@@ -522,7 +786,21 @@ def check_news(api_key: str, token: str, chat_id: int,
         rate_footer = _format_bank_rate_footer(fresh, preferred_banks)
 
     msg = f"📰 <b>CNY/AUD 相关新闻</b>\n\n{lines}{rate_footer}"
-    _telegram_send(token, chat_id, msg, reply_markup=_feedback_keyboard("news"))
+    recipients = chat_id if isinstance(chat_id, list) else [chat_id]
+    for recipient in recipients:
+        try:
+            tag_buttons = _store_news_feedback_contexts(int(recipient), relevant)
+        except (TypeError, ValueError):
+            tag_buttons = []
+        _telegram_send(
+            token,
+            recipient,
+            msg,
+            reply_markup=(
+                _news_feedback_keyboard(tag_buttons)
+                if tag_buttons else _feedback_keyboard("news")
+            ),
+        )
     log.info("News alert sent: %d/%d articles relevant", len(relevant), len(articles))
     return articles
 
@@ -591,6 +869,40 @@ def check_combined(
     log.info("Combined LLM alert sent.")
 
 
+def check_news_feedback_preferences(chat_id: int | str | list) -> None:
+    """Run PreferenceAgent MVP for real-time news feedback only."""
+    user_ids = _iter_telegram_user_ids(chat_id)
+    if not user_ids:
+        return
+    try:
+        from pythonclaw.core.personalization import run_preference_agent_for_user
+    except Exception as exc:
+        log.warning("PreferenceAgent unavailable: %s", exc)
+        return
+
+    for user_id in user_ids:
+        try:
+            result = run_preference_agent_for_user(user_id)
+        except Exception as exc:
+            log.warning("PreferenceAgent run failed for user_id=%s: %s", user_id, exc)
+            continue
+        if not result.ok:
+            log.warning(
+                "PreferenceAgent did not complete for user_id=%s error=%s",
+                user_id,
+                result.error,
+            )
+            continue
+        if result.declarations_created:
+            log.info(
+                "PreferenceAgent created %d pending declaration(s) for user_id=%s contexts=%s attempts=%s",
+                result.declarations_created,
+                user_id,
+                ",".join(result.context_ids_summarized),
+                result.attempts,
+            )
+
+
 # ── main loop ─────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -609,6 +921,7 @@ def main() -> None:
     state      = _load_state()
     last_rate  = 0.0
     last_news  = 0.0
+    last_preference = 0.0
     last_rate_info: dict | None = None
     pending_articles: list[dict] = []
 
@@ -636,6 +949,14 @@ def main() -> None:
             except Exception as e:
                 log.error("News check error: %s", e)
             last_news = time.monotonic()
+
+        # ── real-time news feedback preference summarization only ────────────
+        if now - last_preference >= PREFERENCE_INTERVAL_SEC:
+            try:
+                check_news_feedback_preferences(chat_id)
+            except Exception as e:
+                log.error("PreferenceAgent check error: %s", e)
+            last_preference = time.monotonic()
 
         # ── combined check (runs after either check produces new data) ────────
         if pending_articles and last_rate_info:

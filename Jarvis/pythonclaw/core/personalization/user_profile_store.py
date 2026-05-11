@@ -24,7 +24,7 @@ from ... import config
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 6
 
 # ── Inference aggregation thresholds ─────────────────────────────────────────
 # Minimum number of 'useful' feedback events on a topic before it may be
@@ -77,6 +77,7 @@ INFERRED_PREFERENCE_KEYS = {
     "high_interest_topics",
     "low_interest_topics",
 }
+PREFERENCE_DECLARATION_STATUSES = {"pending", "confirmed", "rejected", "deleted"}
 
 FEEDBACK_EVENT_TYPES = {"useful", "not_useful", "useless", "not_interested"}
 SENSITIVE_KEY_MARKERS = {
@@ -110,6 +111,10 @@ MAX_EVENT_TEXT_BYTES = 256
 MAX_METADATA_STRING_BYTES = 1024
 MAX_TOPICS_PER_FIELD = 20
 MAX_BANKS_PER_FIELD = 10
+NEWS_FEEDBACK_CONTEXT_TTL_DAYS = 3
+NEWS_FEEDBACK_SUMMARY_TRIGGER_COUNT = 10
+NEWS_FEEDBACK_IDLE_LOG_DAYS = 7
+NEWS_FEEDBACK_TAG_CATEGORIES = {"news_tag", "news_article_quality"}
 
 PREFERRED_SUMMARY_STYLES = {"brief", "standard", "detailed", "action_first"}
 PRIVACY_LEVELS = {"minimal", "standard", "strict"}
@@ -462,6 +467,10 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
         for column in ("task_id", "brief_id", "section_title", "category"):
             if column not in feedback_columns:
                 conn.execute(f"ALTER TABLE feedback_events ADD COLUMN {column} TEXT")
+
+    news_context_columns = _column_names(conn, "news_feedback_context")
+    if news_context_columns and "articles_json" not in news_context_columns:
+        conn.execute("ALTER TABLE news_feedback_context ADD COLUMN articles_json TEXT")
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
 
@@ -539,10 +548,43 @@ def init_db(db_path: str | Path | None = None) -> Path:
                 FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
             );
 
+            CREATE TABLE IF NOT EXISTS news_feedback_context (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                article_title TEXT,
+                article_summary TEXT,
+                article_url TEXT,
+                tags_json TEXT NOT NULL,
+                articles_json TEXT,
+                metadata_json TEXT,
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                summarized_at TEXT,
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS preference_declarations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                declaration TEXT NOT NULL,
+                evidence_count INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'pending',
+                source TEXT,
+                metadata_json TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                confirmed_at TEXT,
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
+
             CREATE INDEX IF NOT EXISTS idx_feedback_user_created
                 ON feedback_events(user_id, created_at);
             CREATE INDEX IF NOT EXISTS idx_raw_events_expires
                 ON raw_events(expires_at);
+            CREATE INDEX IF NOT EXISTS idx_news_feedback_context_user_expires
+                ON news_feedback_context(user_id, expires_at);
+            CREATE INDEX IF NOT EXISTS idx_preference_declarations_user_status
+                ON preference_declarations(user_id, status, created_at);
             """
         )
         _migrate_schema(conn)
@@ -554,6 +596,20 @@ def purge_expired_raw_events(db_path: str | Path | None = None) -> int:
     init_db(db_path)
     with _connect(db_path) as conn:
         return _purge_expired_raw_events(conn)
+
+
+def purge_expired_news_feedback_context(db_path: str | Path | None = None) -> int:
+    """Delete expired news feedback context rows that were already summarized."""
+    init_db(db_path)
+    with _connect(db_path) as conn:
+        cur = conn.execute(
+            """
+            DELETE FROM news_feedback_context
+            WHERE expires_at <= ? AND summarized_at IS NOT NULL
+            """,
+            (_now(),),
+        )
+        return int(cur.rowcount)
 
 
 def _compact_database_after_delete(db_path: str | Path | None = None) -> None:
@@ -911,14 +967,17 @@ def log_feedback_event(
     if event_type not in FEEDBACK_EVENT_TYPES:
         raise ValueError(f"Unsupported feedback event_type: {event_type}")
     topic = _validate_event_text(topic, path="topic")
-    if topic is not None and topic not in ALLOWED_FEEDBACK_TOPICS:
+    raw_category = _validate_event_text(category, path="category") or topic
+    category = raw_category.lower() if raw_category else None
+    if (
+        topic is not None
+        and topic not in ALLOWED_FEEDBACK_TOPICS
+        and category not in NEWS_FEEDBACK_TAG_CATEGORIES
+    ):
         raise ValueError(f"topic_not_allowed:{topic}")
     task_id = _validate_event_text(task_id, path="task_id")
     brief_id = _validate_event_text(brief_id, path="brief_id")
     section_title = _validate_event_text(section_title, path="section_title")
-    category = _validate_event_text(category, path="category") or topic
-    if category:
-        category = category.lower()
     message_id = _validate_event_text(message_id, path="message_id")
     _reject_sensitive_payload(metadata or {}, path="metadata")
     init_db(db_path)
@@ -946,6 +1005,382 @@ def log_feedback_event(
             ),
         )
         return int(cur.lastrowid)
+
+
+def store_news_feedback_context(
+    telegram_user_id: int | str,
+    *,
+    article_title: str,
+    article_summary: str,
+    article_url: str | None = None,
+    tags: list[str] | None = None,
+    articles: list[dict[str, Any]] | None = None,
+    metadata: dict[str, Any] | None = None,
+    ttl_days: int = NEWS_FEEDBACK_CONTEXT_TTL_DAYS,
+    db_path: str | Path | None = None,
+) -> int:
+    """Store short-lived news context for tag-level Telegram feedback.
+
+    This table is intentionally time-bound. It stores only the article-level
+    context needed to interpret a short callback token; it is not returned by
+    ``get_user_profile()`` and is not sent to LLM prompts.
+    """
+    title = _validate_event_text(article_title, path="article_title") or ""
+    summary = _validate_event_text(article_summary, path="article_summary") or ""
+    url = _validate_event_text(article_url, path="article_url")
+    clean_tags = _validate_topic_list(tags or [], path="news_feedback_tags")
+    if not clean_tags:
+        raise ValueError("news_feedback_context requires at least one tag")
+    clean_articles: list[dict[str, Any]] = []
+    for index, item in enumerate(articles or []):
+        if not isinstance(item, dict):
+            raise ValueError(f"articles[{index}] must be a dict")
+        clean_item = {
+            "title": _validate_event_text(item.get("title"), path=f"articles[{index}].title"),
+            "summary": _validate_event_text(item.get("summary"), path=f"articles[{index}].summary"),
+            "url": _validate_event_text(item.get("url"), path=f"articles[{index}].url"),
+            "published": _validate_event_text(item.get("published"), path=f"articles[{index}].published"),
+            "tags": _validate_topic_list(item.get("tags") or [], path=f"articles[{index}].tags"),
+        }
+        clean_articles.append({
+            key: value for key, value in clean_item.items()
+            if value not in (None, "", [])
+        })
+    _reject_sensitive_payload(metadata or {}, path="metadata")
+    now = datetime.now(timezone.utc)
+    expires_at = (now + timedelta(days=max(1, int(ttl_days)))).isoformat(timespec="seconds")
+
+    init_db(db_path)
+    with _connect(db_path) as conn:
+        user = _ensure_user(conn, telegram_user_id)
+        cur = conn.execute(
+            """
+            INSERT INTO news_feedback_context (
+                user_id, article_title, article_summary, article_url, tags_json,
+                articles_json, metadata_json, created_at, expires_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                user["id"],
+                title,
+                summary,
+                url,
+                _json_dumps(clean_tags),
+                _json_dumps(clean_articles),
+                _json_dumps(metadata or {}),
+                now.isoformat(timespec="seconds"),
+                expires_at,
+            ),
+        )
+        return int(cur.lastrowid)
+
+
+def get_news_feedback_context(
+    telegram_user_id: int | str,
+    feedback_id: int | str,
+    db_path: str | Path | None = None,
+) -> dict[str, Any] | None:
+    """Return an unexpired short-lived news feedback context row for a user."""
+    try:
+        fid = int(feedback_id)
+    except (TypeError, ValueError):
+        return None
+    init_db(db_path)
+    with _connect(db_path) as conn:
+        user = _user_row(conn, telegram_user_id)
+        if user is None:
+            return None
+        row = conn.execute(
+            """
+            SELECT *
+            FROM news_feedback_context
+            WHERE id = ? AND user_id = ? AND expires_at > ?
+            """,
+            (fid, user["id"], _now()),
+        ).fetchone()
+        if row is None:
+            return None
+        data = dict(row)
+        data["tags"] = _json_loads(data.pop("tags_json", None), [])
+        data["articles"] = _json_loads(data.pop("articles_json", None), [])
+        data["metadata"] = _json_loads(data.pop("metadata_json", None), {})
+        return data
+
+
+def get_news_feedback_rollup_status(
+    telegram_user_id: int | str,
+    db_path: str | Path | None = None,
+) -> dict[str, Any]:
+    """Return lightweight status for future PreferenceAgent scheduling/logging."""
+    init_db(db_path)
+    with _connect(db_path) as conn:
+        user = _user_row(conn, telegram_user_id)
+        if user is None:
+            return {
+                "feedback_count": 0,
+                "context_count": 0,
+                "threshold_reached": False,
+                "idle_log_due": False,
+            }
+        rows = conn.execute(
+            """
+            SELECT nf.id, nf.created_at,
+                   COUNT(fe.id) AS feedback_count
+            FROM news_feedback_context nf
+            LEFT JOIN feedback_events fe
+              ON fe.user_id = nf.user_id
+             AND json_extract(fe.metadata_json, '$.news_feedback_id') = CAST(nf.id AS TEXT)
+            WHERE nf.user_id = ? AND nf.expires_at > ?
+            GROUP BY nf.id
+            """,
+            (user["id"], _now()),
+        ).fetchall()
+
+    feedback_count = sum(int(row["feedback_count"]) for row in rows)
+    oldest_created = min((row["created_at"] for row in rows), default=None)
+    idle_log_due = False
+    if oldest_created and feedback_count < NEWS_FEEDBACK_SUMMARY_TRIGGER_COUNT:
+        try:
+            oldest_dt = datetime.fromisoformat(str(oldest_created))
+            idle_log_due = (
+                datetime.now(timezone.utc) - oldest_dt
+                >= timedelta(days=NEWS_FEEDBACK_IDLE_LOG_DAYS)
+            )
+        except ValueError:
+            idle_log_due = False
+    if idle_log_due:
+        logger.info(
+            "News feedback below summary trigger after %d days: user_id=%s count=%d threshold=%d",
+            NEWS_FEEDBACK_IDLE_LOG_DAYS,
+            telegram_user_id,
+            feedback_count,
+            NEWS_FEEDBACK_SUMMARY_TRIGGER_COUNT,
+        )
+    return {
+        "feedback_count": feedback_count,
+        "context_count": len(rows),
+        "threshold_reached": feedback_count >= NEWS_FEEDBACK_SUMMARY_TRIGGER_COUNT,
+        "idle_log_due": idle_log_due,
+    }
+
+
+def get_due_news_feedback_contexts(
+    telegram_user_id: int | str,
+    db_path: str | Path | None = None,
+) -> list[dict[str, Any]]:
+    """Return unsummarized news contexts due for PreferenceAgent processing.
+
+    A row is due when it has feedback and either:
+      - the per-user feedback count reached the trigger threshold, or
+      - the row reached its 3-day expiry.
+    """
+    init_db(db_path)
+    now = _now()
+    with _connect(db_path) as conn:
+        user = _user_row(conn, telegram_user_id)
+        if user is None:
+            return []
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM news_feedback_context
+            WHERE user_id = ? AND summarized_at IS NULL
+            ORDER BY created_at ASC
+            """,
+            (user["id"],),
+        ).fetchall()
+        feedback_rows = conn.execute(
+            """
+            SELECT metadata_json, event_type, topic, category, created_at
+            FROM feedback_events
+            WHERE user_id = ?
+            """,
+            (user["id"],),
+        ).fetchall()
+
+    feedback_by_context: dict[str, list[dict[str, Any]]] = {}
+    for row in feedback_rows:
+        metadata = _json_loads(row["metadata_json"], {}) or {}
+        context_id = str(metadata.get("news_feedback_id") or "")
+        if not context_id:
+            continue
+        feedback_by_context.setdefault(context_id, []).append(
+            {
+                "event_type": row["event_type"],
+                "topic": row["topic"],
+                "category": row["category"],
+                "created_at": row["created_at"],
+            }
+        )
+
+    total_feedback_count = sum(len(items) for items in feedback_by_context.values())
+    threshold_reached = total_feedback_count >= NEWS_FEEDBACK_SUMMARY_TRIGGER_COUNT
+    due: list[dict[str, Any]] = []
+    for row in rows:
+        data = dict(row)
+        context_feedback = feedback_by_context.get(str(data["id"]), [])
+        if not context_feedback:
+            continue
+        expired = str(data["expires_at"]) <= now
+        if not expired and not threshold_reached:
+            continue
+        data["tags"] = _json_loads(data.pop("tags_json", None), [])
+        data["articles"] = _json_loads(data.pop("articles_json", None), [])
+        data["metadata"] = _json_loads(data.pop("metadata_json", None), {})
+        data["feedback_events"] = context_feedback
+        data["trigger_type"] = "threshold" if threshold_reached else "expired"
+        due.append(data)
+    return due
+
+
+def mark_news_feedback_contexts_summarized(
+    context_ids: list[int | str],
+    db_path: str | Path | None = None,
+) -> int:
+    """Mark news feedback contexts as summarized after PreferenceAgent processing."""
+    ids: list[int] = []
+    for context_id in context_ids:
+        try:
+            ids.append(int(context_id))
+        except (TypeError, ValueError):
+            continue
+    if not ids:
+        return 0
+    init_db(db_path)
+    placeholders = ",".join("?" for _ in ids)
+    with _connect(db_path) as conn:
+        cur = conn.execute(
+            f"""
+            UPDATE news_feedback_context
+            SET summarized_at = ?
+            WHERE id IN ({placeholders})
+            """,
+            (_now(), *ids),
+        )
+        return int(cur.rowcount)
+
+
+def create_preference_declaration(
+    telegram_user_id: int | str,
+    declaration: str,
+    *,
+    evidence_count: int = 0,
+    source: str = "news_feedback",
+    metadata: dict[str, Any] | None = None,
+    status: str = "pending",
+    db_path: str | Path | None = None,
+) -> int:
+    """Create a pending inferred preference declaration for user confirmation."""
+    status = str(status or "pending").strip()
+    if status not in PREFERENCE_DECLARATION_STATUSES:
+        raise ValueError(f"Unsupported preference declaration status: {status}")
+    text = _validate_event_text(declaration, path="declaration")
+    if not text:
+        raise ValueError("preference declaration cannot be empty")
+    source = _validate_event_text(source, path="source") or "news_feedback"
+    _reject_sensitive_payload(metadata or {}, path="metadata")
+    now = _now()
+    init_db(db_path)
+    with _connect(db_path) as conn:
+        user = _ensure_user(conn, telegram_user_id)
+        cur = conn.execute(
+            """
+            INSERT INTO preference_declarations (
+                user_id, declaration, evidence_count, status, source,
+                metadata_json, created_at, updated_at, confirmed_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                user["id"],
+                text,
+                max(0, int(evidence_count)),
+                status,
+                source,
+                _json_dumps(metadata or {}),
+                now,
+                now,
+                now if status == "confirmed" else None,
+            ),
+        )
+        return int(cur.lastrowid)
+
+
+def list_preference_declarations(
+    telegram_user_id: int | str,
+    *,
+    status: str | None = None,
+    db_path: str | Path | None = None,
+) -> list[dict[str, Any]]:
+    """List inferred preference declarations without exposing raw feedback rows."""
+    if status is not None and status not in PREFERENCE_DECLARATION_STATUSES:
+        raise ValueError(f"Unsupported preference declaration status: {status}")
+    init_db(db_path)
+    with _connect(db_path) as conn:
+        user = _user_row(conn, telegram_user_id)
+        if user is None:
+            return []
+        if status is None:
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM preference_declarations
+                WHERE user_id = ?
+                ORDER BY created_at DESC, id DESC
+                """,
+                (user["id"],),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM preference_declarations
+                WHERE user_id = ? AND status = ?
+                ORDER BY created_at DESC, id DESC
+                """,
+                (user["id"], status),
+            ).fetchall()
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        data = dict(row)
+        data["metadata"] = _json_loads(data.pop("metadata_json", None), {})
+        out.append(data)
+    return out
+
+
+def update_preference_declaration_status(
+    telegram_user_id: int | str,
+    declaration_id: int | str,
+    status: str,
+    *,
+    db_path: str | Path | None = None,
+) -> bool:
+    """Update declaration status: pending/confirmed/rejected/deleted."""
+    status = str(status or "").strip()
+    if status not in PREFERENCE_DECLARATION_STATUSES:
+        raise ValueError(f"Unsupported preference declaration status: {status}")
+    try:
+        declaration_id_int = int(declaration_id)
+    except (TypeError, ValueError):
+        return False
+    now = _now()
+    init_db(db_path)
+    with _connect(db_path) as conn:
+        user = _user_row(conn, telegram_user_id)
+        if user is None:
+            return False
+        cur = conn.execute(
+            """
+            UPDATE preference_declarations
+            SET status = ?,
+                updated_at = ?,
+                confirmed_at = CASE WHEN ? = 'confirmed' THEN ? ELSE confirmed_at END
+            WHERE id = ? AND user_id = ?
+            """,
+            (status, now, status, now, declaration_id_int, user["id"]),
+        )
+        return cur.rowcount > 0
 
 
 def get_user_category_feedback_summary(

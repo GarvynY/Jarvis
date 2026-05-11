@@ -56,7 +56,10 @@ sys.modules.setdefault("pythonclaw.channels", _channels_pkg)
 _spec.loader.exec_module(_mod)  # type: ignore[union-attr]
 _format_research_brief = _mod._format_research_brief
 _make_feedback_keyboard = _mod._make_feedback_keyboard
+_make_preference_declaration_keyboard = _mod._make_preference_declaration_keyboard
 _parse_feedback_callback_data = _mod._parse_feedback_callback_data
+_parse_preference_declaration_callback_data = _mod._parse_preference_declaration_callback_data
+_format_preference_declarations = _mod._format_preference_declarations
 _extract_news_topic = _mod._extract_news_topic
 
 
@@ -306,6 +309,38 @@ class TestFeedbackKeyboardTopic(unittest.TestCase):
         self.assertEqual(parsed["source"], "news")
         self.assertEqual(parsed["topic"], "RBA")
         self.assertEqual(parsed["category"], "RBA")
+
+    def test_preference_declaration_keyboard_is_short_and_parseable(self):
+        kb = _make_preference_declaration_keyboard(12345)
+        buttons = kb.inline_keyboard[0]
+        confirm = buttons[0].callback_data
+        reject = buttons[1].callback_data
+
+        self.assertEqual(confirm, "pd:confirm:12345")
+        self.assertEqual(reject, "pd:reject:12345")
+        self.assertLessEqual(len(confirm.encode("utf-8")), 64)
+        self.assertEqual(
+            _parse_preference_declaration_callback_data(confirm),
+            {"action": "confirm", "declaration_id": "12345"},
+        )
+
+    def test_preference_declarations_format(self):
+        text = _format_preference_declarations(
+            [
+                {
+                    "declaration": "用户可能关注 RBA 利率对换汇时点的影响。",
+                    "evidence_count": 10,
+                    "metadata": {"confidence_hint": "medium"},
+                }
+            ],
+            title="待确认的隐式偏好：",
+            empty="- 暂无",
+        )
+
+        self.assertIn("待确认的隐式偏好", text)
+        self.assertIn("用户可能关注 RBA", text)
+        self.assertIn("证据 10", text)
+        self.assertIn("置信 medium", text)
 
 
 class TestExtractNewsTopic(unittest.TestCase):
