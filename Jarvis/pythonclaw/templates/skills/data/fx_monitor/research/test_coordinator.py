@@ -75,6 +75,14 @@ def _patch_profile_raises():
     )
 
 
+def _patch_full_profile(profile: dict):
+    """Patch get_user_profile inside coordinator to return full profile rows."""
+    return unittest.mock.patch(
+        "coordinator.get_user_profile",
+        return_value=profile,
+    )
+
+
 def _patch_agents(agent_map: dict[str, object]):
     """Replace the entire AGENT_REGISTRY for the duration of the test."""
     return unittest.mock.patch.dict(_coord.AGENT_REGISTRY, agent_map, clear=True)
@@ -228,6 +236,34 @@ async def test_safe_ctx_fallback() -> None:
 
     print("\n-- test_safe_ctx_fallback")
     print(f"   risk_level={ctx.risk_level}  privacy_level={ctx.privacy_level}")
+    print("   PASS")
+
+
+async def test_runtime_preference_hints_attached() -> None:
+    """Full profile preferences become runtime-only scorer hints."""
+    mock_agents = {
+        "fx_agent":    type("_FX",    (OkMockAgent,), {"agent_name": "fx_agent"}),
+        "news_agent":  type("_News",  (OkMockAgent,), {"agent_name": "news_agent"}),
+        "macro_agent": type("_Macro", (OkMockAgent,), {"agent_name": "macro_agent"}),
+    }
+    profile = {
+        "explicit_preferences": {"preferred_banks": ["中国银行"]},
+        "inferred_preferences": {
+            "high_interest_topics": ["地缘政治风险", "能源价格"],
+            "low_interest_topics": ["逻辑太浅"],
+        },
+    }
+    with _patch_profile(_MOCK_USER_CTX), _patch_full_profile(profile), _patch_agents(mock_agents):
+        task, _, _ = await _coord.run_research("fx_cnyaud", user_id=99)
+
+    ctx = task.safe_user_context
+    assert getattr(ctx, "preferred_banks", None) == ["中国银行"]
+    assert getattr(ctx, "inferred_high_interest_topics", None) == ["地缘政治风险", "能源价格"]
+    assert getattr(ctx, "inferred_low_interest_topics", None) == ["逻辑太浅"]
+    assert "preferred_banks" not in ctx.to_dict()
+
+    print("\n-- test_runtime_preference_hints_attached")
+    print("   runtime-only preference hints attached")
     print("   PASS")
 
 
@@ -577,6 +613,7 @@ async def main() -> None:
     await test_missing_agent()
     await test_safe_ctx_populated()
     await test_safe_ctx_fallback()
+    await test_runtime_preference_hints_attached()
     await test_risk_output_last()
     await test_cost_estimate()
     await test_all_outputs_json_safe()
@@ -590,7 +627,7 @@ async def main() -> None:
     await test_evidence_store_permission_error()
 
     print("\n" + "=" * 60)
-    print("All 17 tests passed.")
+    print("All 18 tests passed.")
 
 
 if __name__ == "__main__":

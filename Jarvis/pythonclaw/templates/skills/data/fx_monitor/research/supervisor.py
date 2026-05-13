@@ -636,6 +636,7 @@ class SupervisorReportWriter:
                 context_pack = store.build_context_pack(
                     task, preset, outputs,
                     token_budget=_CONTEXT_PACK_TOKEN_BUDGET,
+                    safe_user_context=task.safe_user_context,
                 )
             if not context_pack.items:
                 context_pack = None

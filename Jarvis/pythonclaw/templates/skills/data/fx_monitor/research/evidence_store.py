@@ -60,7 +60,7 @@ except ImportError:
     detect_conflicts = None  # type: ignore[assignment]
     apply_conflict_boost = None  # type: ignore[assignment]
 
-_SCHEMA_VERSION = 3
+_SCHEMA_VERSION = 4
 
 _DDL = """\
 CREATE TABLE IF NOT EXISTS evidence_chunks (
@@ -79,7 +79,14 @@ CREATE TABLE IF NOT EXISTS evidence_chunks (
     ttl_policy     TEXT NOT NULL DEFAULT 'task',
     token_estimate INTEGER NOT NULL DEFAULT 0,
     attention_score REAL NOT NULL DEFAULT 0.0,
-    composite_score REAL NOT NULL DEFAULT 0.0
+    composite_score REAL NOT NULL DEFAULT 0.0,
+    score_importance REAL NOT NULL DEFAULT 0.0,
+    score_confidence REAL NOT NULL DEFAULT 0.0,
+    score_recency REAL NOT NULL DEFAULT 0.0,
+    score_source_quality REAL NOT NULL DEFAULT 0.0,
+    score_user_relevance REAL NOT NULL DEFAULT 0.0,
+    score_conflict_value REAL NOT NULL DEFAULT 0.0,
+    score_reason TEXT NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS idx_chunks_task     ON evidence_chunks(task_id);
@@ -179,6 +186,8 @@ class EvidenceStore:
             self._migrate_to_v2(cur)
         if current_version < 3:
             self._migrate_to_v3(cur)
+        if current_version < 4:
+            self._migrate_to_v4(cur)
         if row is None:
             cur.execute(
                 "INSERT INTO schema_version (version) VALUES (?)",
@@ -228,6 +237,24 @@ class EvidenceStore:
             except Exception:
                 pass
 
+    def _migrate_to_v4(self, cur: Any) -> None:
+        """Add persisted score breakdown columns if missing."""
+        for col, typedef in (
+            ("score_importance", "REAL NOT NULL DEFAULT 0.0"),
+            ("score_confidence", "REAL NOT NULL DEFAULT 0.0"),
+            ("score_recency", "REAL NOT NULL DEFAULT 0.0"),
+            ("score_source_quality", "REAL NOT NULL DEFAULT 0.0"),
+            ("score_user_relevance", "REAL NOT NULL DEFAULT 0.0"),
+            ("score_conflict_value", "REAL NOT NULL DEFAULT 0.0"),
+            ("score_reason", "TEXT NOT NULL DEFAULT ''"),
+        ):
+            try:
+                cur.execute(
+                    f"ALTER TABLE evidence_chunks ADD COLUMN {col} {typedef}"
+                )
+            except Exception:
+                pass
+
     def close(self) -> None:
         self._conn.close()
 
@@ -245,8 +272,10 @@ class EvidenceStore:
                (chunk_id, task_id, preset_name, agent_name, content, source,
                 category, importance, confidence, entities_json,
                 used_in_brief, created_at, ttl_policy, token_estimate,
-                attention_score, composite_score)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                attention_score, composite_score, score_importance,
+                score_confidence, score_recency, score_source_quality,
+                score_user_relevance, score_conflict_value, score_reason)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 chunk.chunk_id,
                 chunk.task_id,
@@ -264,6 +293,13 @@ class EvidenceStore:
                 chunk.token_estimate,
                 chunk.attention_score,
                 chunk.composite_score,
+                chunk.score_importance,
+                chunk.score_confidence,
+                chunk.score_recency,
+                chunk.score_source_quality,
+                chunk.score_user_relevance,
+                chunk.score_conflict_value,
+                chunk.score_reason,
             ),
         )
         self._conn.commit()
@@ -692,6 +728,7 @@ class EvidenceStore:
         use_scorer = compute_evidence_score is not None
         scoring_method = "composite" if use_scorer else "legacy"
         total_conflict_count = 0
+        scored_chunks: dict[str, EvidenceChunk] = {}
 
         for section_title in preset.report_sections:
             if tokens_used >= token_budget:
@@ -752,6 +789,14 @@ class EvidenceStore:
                         score_map[c.chunk_id] = es.composite_score
                         c.composite_score = es.composite_score
                         c.attention_score = es.attention_score
+                        c.score_importance = es.importance
+                        c.score_confidence = es.confidence
+                        c.score_recency = es.recency_score
+                        c.score_source_quality = es.source_quality_score
+                        c.score_user_relevance = es.user_relevance_score
+                        c.score_conflict_value = es.conflict_value
+                        c.score_reason = es.reason
+                        scored_chunks[c.chunk_id] = c
 
                     if detect_conflicts is not None and len(deduped) >= 2:
                         try:
@@ -782,8 +827,20 @@ class EvidenceStore:
                                     )
                                     for c in deduped:
                                         if c.chunk_id in score_map:
+                                            delta = max(
+                                                0.0,
+                                                score_map[c.chunk_id] - before_scores.get(c.chunk_id, 0.0),
+                                            )
                                             c.composite_score = score_map[c.chunk_id]
                                             c.attention_score = score_map[c.chunk_id]
+                                            if delta > 0:
+                                                c.score_conflict_value = round(delta, 4)
+                                                if "conflict_boost" not in c.score_reason:
+                                                    c.score_reason = (
+                                                        f"{c.score_reason},conflict_boost"
+                                                        if c.score_reason else "conflict_boost"
+                                                    )
+                                            scored_chunks[c.chunk_id] = c
                                     section_conflict_pairs = [cp.to_dict() for cp in summary.conflicts]
                         except Exception:
                             _log.warning(
@@ -802,6 +859,13 @@ class EvidenceStore:
                     for c in deduped:
                         c.composite_score = 0.0
                         c.attention_score = 0.0
+                        c.score_importance = 0.0
+                        c.score_confidence = 0.0
+                        c.score_recency = 0.0
+                        c.score_source_quality = 0.0
+                        c.score_user_relevance = 0.0
+                        c.score_conflict_value = 0.0
+                        c.score_reason = ""
                     deduped.sort(
                         key=lambda c: (c.importance, c.confidence, c.created_at),
                         reverse=True,
@@ -820,6 +884,7 @@ class EvidenceStore:
                 if tokens_used + c.token_estimate > token_budget:
                     skipped_over_budget += 1
                     continue
+                c.used_in_brief = True
                 cs = score_map.get(c.chunk_id, c.importance)
                 item = ContextPackItem(
                     chunk_id=c.chunk_id,
@@ -888,14 +953,39 @@ class EvidenceStore:
         for item in all_items:
             coverage[item.agent_name] = coverage.get(item.agent_name, 0) + 1
 
-        if scoring_method == "composite" and all_items:
+        selected_item_ids = [item.chunk_id for item in all_items]
+        if selected_item_ids:
             try:
-                for item in all_items:
+                self.mark_used_in_brief(selected_item_ids)
+            except Exception:
+                _log.warning(
+                    "used_in_brief persist failed; context pack remains usable",
+                    exc_info=True,
+                )
+
+        if scoring_method == "composite" and scored_chunks:
+            try:
+                for chunk in scored_chunks.values():
                     self._conn.execute(
                         "UPDATE evidence_chunks "
-                        "SET composite_score = ?, attention_score = ? "
+                        "SET composite_score = ?, attention_score = ?, "
+                        "score_importance = ?, score_confidence = ?, "
+                        "score_recency = ?, score_source_quality = ?, "
+                        "score_user_relevance = ?, score_conflict_value = ?, "
+                        "score_reason = ? "
                         "WHERE chunk_id = ?",
-                        (item.composite_score, item.attention_score, item.chunk_id),
+                        (
+                            chunk.composite_score,
+                            chunk.attention_score,
+                            chunk.score_importance,
+                            chunk.score_confidence,
+                            chunk.score_recency,
+                            chunk.score_source_quality,
+                            chunk.score_user_relevance,
+                            chunk.score_conflict_value,
+                            chunk.score_reason,
+                            chunk.chunk_id,
+                        ),
                     )
                 self._conn.commit()
             except Exception:
@@ -985,6 +1075,13 @@ class EvidenceStore:
             token_estimate=int(row["token_estimate"]),
             attention_score=float(row["attention_score"]),
             composite_score=float(row["composite_score"]),
+            score_importance=float(row["score_importance"]),
+            score_confidence=float(row["score_confidence"]),
+            score_recency=float(row["score_recency"]),
+            score_source_quality=float(row["score_source_quality"]),
+            score_user_relevance=float(row["score_user_relevance"]),
+            score_conflict_value=float(row["score_conflict_value"]),
+            score_reason=row["score_reason"],
         )
 
     @staticmethod

@@ -633,6 +633,7 @@ class _StubStore:
     """Minimal EvidenceStore stub for supervisor tests."""
     def __init__(self, pack: ContextPack | None = None):
         self._pack = pack or ContextPack()
+        self.build_kwargs: dict = {}
 
     def __enter__(self):
         return self
@@ -641,6 +642,7 @@ class _StubStore:
         pass
 
     def build_context_pack(self, *_args, **_kwargs) -> ContextPack:
+        self.build_kwargs = dict(_kwargs)
         return self._pack
 
     def list_traces(self, _task_id: str):
@@ -669,6 +671,30 @@ async def test_context_pack_store_failure() -> None:
 
     print("\n-- test_context_pack_store_failure")
     print(f"   sections={len(brief.sections)}  conclusion present=True")
+    print("   PASS")
+
+
+async def test_context_pack_receives_safe_user_context() -> None:
+    """Supervisor passes task.safe_user_context into ContextPack scoring."""
+    outputs = [_ok_agent(a) for a in ("fx_agent", "news_agent", "macro_agent", "risk_agent")]
+    pack = _make_context_pack()
+    store = _StubStore(pack)
+    task = _make_task()
+    setattr(task.safe_user_context, "category_feedback_summary", {"news_event": 1.0})
+
+    with _mock_llm_text(_make_llm_json_with_chunks()), \
+         unittest.mock.patch.object(_sup, "EvidenceStore", lambda: store):
+        brief = await SupervisorReportWriter().run(task, _PRESET, outputs, _make_cost())
+
+    assert isinstance(brief, ResearchBrief)
+    assert store.build_kwargs.get("safe_user_context") is task.safe_user_context
+    assert getattr(
+        store.build_kwargs["safe_user_context"],
+        "category_feedback_summary",
+    ) == {"news_event": 1.0}
+
+    print("\n-- test_context_pack_receives_safe_user_context")
+    print("   task.safe_user_context flowed into build_context_pack")
     print("   PASS")
 
 
@@ -830,6 +856,7 @@ async def main() -> None:
     await test_provenance_note_on_unattributed_section()
     # Phase 9.1 Step 6 — ContextPack integration
     await test_context_pack_used()
+    await test_context_pack_receives_safe_user_context()
     await test_context_pack_store_failure()
     await test_empty_context_pack_data_gap()
     await test_banned_filter_with_context_pack()
@@ -840,7 +867,7 @@ async def main() -> None:
     await test_trace_retrieval_failure_non_fatal()
 
     print("\n" + "=" * 60)
-    print("All 21 tests passed.")
+    print("All 22 tests passed.")
 
 
 if __name__ == "__main__":

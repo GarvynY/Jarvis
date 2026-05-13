@@ -649,6 +649,13 @@ class EvidenceChunk:
     token_estimate: int = 0              # 近似 token 数，用于预算跟踪
     attention_score: float = 0.0         # Phase 10 — attention-inspired score [0,1]
     composite_score: float = 0.0         # Phase 10 — weighted composite score [0,1]
+    score_importance: float = 0.0        # Phase 10 — persisted score breakdown
+    score_confidence: float = 0.0
+    score_recency: float = 0.0
+    score_source_quality: float = 0.0
+    score_user_relevance: float = 0.0
+    score_conflict_value: float = 0.0
+    score_reason: str = ""
 
     def __post_init__(self) -> None:
         validate_confidence(self.importance)
@@ -677,6 +684,13 @@ class EvidenceChunk:
             token_estimate=int(d.get("token_estimate", 0)),
             attention_score=float(d.get("attention_score", 0.0)),
             composite_score=float(d.get("composite_score", 0.0)),
+            score_importance=float(d.get("score_importance", 0.0)),
+            score_confidence=float(d.get("score_confidence", 0.0)),
+            score_recency=float(d.get("score_recency", 0.0)),
+            score_source_quality=float(d.get("score_source_quality", 0.0)),
+            score_user_relevance=float(d.get("score_user_relevance", 0.0)),
+            score_conflict_value=float(d.get("score_conflict_value", 0.0)),
+            score_reason=d.get("score_reason", ""),
         )
 
 

@@ -448,6 +448,11 @@ class TelegramBot:
             await query.answer("未知反馈类型。")
             return
 
+        try:
+            await query.answer("已收到，正在处理...")
+        except Exception:
+            pass
+
         from ..core.personalization import log_feedback_event, update_inferred_preferences_from_feedback
 
         try:
@@ -460,13 +465,17 @@ class TelegramBot:
                 section_title=section_title,
                 category=category,
                 message_id=str(query.message.message_id) if query.message else None,
+                idempotency_key=f"tg_callback:{query.id}",
                 metadata={"source": f"inline_button:{source}"},
             )
         except Exception:
             logger.exception(
                 "[Telegram] Failed to log inline feedback user_id=%s", query.from_user.id
             )
-            await query.answer("记录失败，请稍后再试。")
+            try:
+                await query.answer("反馈保存失败，请稍后再试。", show_alert=True)
+            except Exception:
+                pass
             return
 
         # Remove buttons so the same message can't be rated twice
@@ -478,7 +487,10 @@ class TelegramBot:
         label = _FEEDBACK_TYPE_LABELS[event_type]
         source_label = _FB_SOURCE_LABELS.get(source, source)
         topic_suffix = f"/{topic}" if topic else ""
-        await query.answer(f"已记录：{label}（{source_label}{topic_suffix}），谢谢！")
+        try:
+            await query.answer(f"已记录：{label}（{source_label}{topic_suffix}），谢谢！")
+        except Exception:
+            pass
 
         logger.info(
             "[Telegram] Inline feedback logged: user_id=%s event=%s source=%s "
@@ -571,17 +583,26 @@ class TelegramBot:
             return
 
         try:
+            await query.answer("已收到，正在处理...")
+        except Exception:
+            pass
+
+        try:
             log_feedback_event(
                 query.from_user.id,
                 event_type,
                 topic=topic,
                 category=category,
                 message_id=message_id,
+                idempotency_key=f"tg_callback:{query.id}",
                 metadata=metadata,
             )
         except Exception:
             logger.exception("[Telegram] Failed to log news feedback user_id=%s", query.from_user.id)
-            await query.answer("记录失败，请稍后再试。")
+            try:
+                await query.answer("反馈保存失败，请稍后再试。", show_alert=True)
+            except Exception:
+                pass
             return
 
         try:
@@ -598,7 +619,10 @@ class TelegramBot:
                 exc_info=True,
             )
 
-        await query.answer(f"已记录：{topic}")
+        try:
+            await query.answer(f"已记录：{topic}")
+        except Exception:
+            pass
         logger.info(
             "[Telegram] News feedback logged: user_id=%s action=%s topic=%s feedback_id=%s",
             query.from_user.id, action, topic, feedback_id,
@@ -631,6 +655,11 @@ class TelegramBot:
         from ..core.personalization import update_preference_declaration_status
 
         try:
+            await query.answer("已收到，正在处理...")
+        except Exception:
+            pass
+
+        try:
             ok = update_preference_declaration_status(
                 query.from_user.id,
                 declaration_id,
@@ -642,10 +671,16 @@ class TelegramBot:
                 query.from_user.id,
                 declaration_id,
             )
-            await query.answer("更新失败，请稍后再试。")
+            try:
+                await query.answer("更新失败，请稍后再试。", show_alert=True)
+            except Exception:
+                pass
             return
         if not ok:
-            await query.answer("声明不存在或已不可用。")
+            try:
+                await query.answer("声明不存在或已不可用。", show_alert=True)
+            except Exception:
+                pass
             return
 
         try:
@@ -653,7 +688,10 @@ class TelegramBot:
         except Exception:
             pass
         label = "已确认" if status == "confirmed" else "已不确认"
-        await query.answer(label)
+        try:
+            await query.answer(label)
+        except Exception:
+            pass
         logger.info(
             "[Telegram] Preference declaration updated: user_id=%s id=%s status=%s",
             query.from_user.id,

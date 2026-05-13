@@ -15,6 +15,7 @@ import json
 import logging
 import re
 import sqlite3
+import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -24,7 +25,9 @@ from ... import config
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
+SQLITE_BUSY_TIMEOUT_MS = 5_000
+SQLITE_RETRY_DELAYS_SECONDS = (0.1, 0.3, 0.7)
 
 # ── Inference aggregation thresholds ─────────────────────────────────────────
 # Minimum number of 'useful' feedback events on a topic before it may be
@@ -241,6 +244,35 @@ def _json_loads(value: str | None, default: Any = None) -> Any:
         return default
 
 
+def _is_retryable_sqlite_error(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return isinstance(exc, sqlite3.OperationalError) and (
+        "database is locked" in text
+        or "database table is locked" in text
+        or "database is busy" in text
+    )
+
+
+def _run_with_sqlite_retry(operation: Any) -> Any:
+    """Run a short SQLite write with bounded retry for transient lock contention."""
+    last_exc: BaseException | None = None
+    for attempt, delay in enumerate((*SQLITE_RETRY_DELAYS_SECONDS, 0.0)):
+        try:
+            return operation()
+        except sqlite3.Error as exc:
+            if not _is_retryable_sqlite_error(exc) or attempt >= len(SQLITE_RETRY_DELAYS_SECONDS):
+                raise
+            last_exc = exc
+            logger.warning(
+                "SQLite busy in personalization store; retrying in %.1fs",
+                delay,
+            )
+            time.sleep(delay)
+    if last_exc is not None:
+        raise last_exc
+    return operation()
+
+
 def _is_sensitive_key(key: str) -> bool:
     if key == "preferred_banks":
         return False
@@ -424,11 +456,12 @@ def _clean_updates(updates: dict[str, Any], allowed: set[str]) -> dict[str, Any]
 def _connect(db_path: str | Path | None = None) -> Iterator[sqlite3.Connection]:
     path = Path(db_path) if db_path is not None else _default_db_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path)
+    conn = sqlite3.connect(path, timeout=SQLITE_BUSY_TIMEOUT_MS / 1000)
     conn.row_factory = sqlite3.Row
     try:
         conn.execute("PRAGMA foreign_keys = ON")
         conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
         yield conn
         conn.commit()
     except sqlite3.Error:
@@ -471,6 +504,8 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
         for column in ("task_id", "brief_id", "section_title", "category"):
             if column not in feedback_columns:
                 conn.execute(f"ALTER TABLE feedback_events ADD COLUMN {column} TEXT")
+        if "idempotency_key" not in feedback_columns:
+            conn.execute("ALTER TABLE feedback_events ADD COLUMN idempotency_key TEXT")
 
     news_context_columns = _column_names(conn, "news_feedback_context")
     if news_context_columns and "articles_json" not in news_context_columns:
@@ -537,6 +572,7 @@ def init_db(db_path: str | Path | None = None) -> Path:
                 section_title TEXT,
                 category TEXT,
                 message_id TEXT,
+                idempotency_key TEXT,
                 metadata_json TEXT,
                 created_at TEXT NOT NULL,
                 FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
@@ -592,6 +628,13 @@ def init_db(db_path: str | Path | None = None) -> Path:
             """
         )
         _migrate_schema(conn)
+        conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_feedback_user_idempotency
+                ON feedback_events(user_id, idempotency_key)
+                WHERE idempotency_key IS NOT NULL
+            """
+        )
     return path
 
 
@@ -963,6 +1006,7 @@ def log_feedback_event(
     section_title: str | None = None,
     category: str | None = None,
     message_id: str | None = None,
+    idempotency_key: str | None = None,
     metadata: dict[str, Any] | None = None,
     db_path: str | Path | None = None,
 ) -> int:
@@ -983,32 +1027,48 @@ def log_feedback_event(
     brief_id = _validate_event_text(brief_id, path="brief_id")
     section_title = _validate_event_text(section_title, path="section_title")
     message_id = _validate_event_text(message_id, path="message_id")
+    idempotency_key = _validate_event_text(idempotency_key, path="idempotency_key")
     _reject_sensitive_payload(metadata or {}, path="metadata")
     init_db(db_path)
-    with _connect(db_path) as conn:
-        user = _ensure_user(conn, telegram_user_id)
-        cur = conn.execute(
-            """
-            INSERT INTO feedback_events (
-                user_id, event_type, topic, task_id, brief_id, section_title,
-                category, message_id, metadata_json, created_at
+
+    def _write() -> int:
+        with _connect(db_path) as conn:
+            user = _ensure_user(conn, telegram_user_id)
+            if idempotency_key:
+                existing = conn.execute(
+                    """
+                    SELECT id FROM feedback_events
+                    WHERE user_id = ? AND idempotency_key = ?
+                    """,
+                    (user["id"], idempotency_key),
+                ).fetchone()
+                if existing is not None:
+                    return int(existing["id"])
+            cur = conn.execute(
+                """
+                INSERT INTO feedback_events (
+                    user_id, event_type, topic, task_id, brief_id, section_title,
+                    category, message_id, idempotency_key, metadata_json, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    user["id"],
+                    event_type,
+                    topic,
+                    task_id,
+                    brief_id,
+                    section_title,
+                    category,
+                    message_id,
+                    idempotency_key,
+                    _json_dumps(metadata or {}),
+                    _now(),
+                ),
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                user["id"],
-                event_type,
-                topic,
-                task_id,
-                brief_id,
-                section_title,
-                category,
-                message_id,
-                _json_dumps(metadata or {}),
-                _now(),
-            ),
-        )
-        return int(cur.lastrowid)
+            return int(cur.lastrowid)
+
+    return int(_run_with_sqlite_retry(_write))
 
 
 def store_news_feedback_context(
@@ -1094,29 +1154,33 @@ def store_news_feedback_context(
     expires_at = (now + timedelta(days=max(1, int(ttl_days)))).isoformat(timespec="seconds")
 
     init_db(db_path)
-    with _connect(db_path) as conn:
-        user = _ensure_user(conn, telegram_user_id)
-        cur = conn.execute(
-            """
-            INSERT INTO news_feedback_context (
-                user_id, article_title, article_summary, article_url, tags_json,
-                articles_json, metadata_json, created_at, expires_at
+
+    def _write() -> int:
+        with _connect(db_path) as conn:
+            user = _ensure_user(conn, telegram_user_id)
+            cur = conn.execute(
+                """
+                INSERT INTO news_feedback_context (
+                    user_id, article_title, article_summary, article_url, tags_json,
+                    articles_json, metadata_json, created_at, expires_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    user["id"],
+                    title,
+                    summary,
+                    url,
+                    _json_dumps(clean_tags),
+                    _json_dumps(clean_articles),
+                    _json_dumps(metadata or {}),
+                    now.isoformat(timespec="seconds"),
+                    expires_at,
+                ),
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                user["id"],
-                title,
-                summary,
-                url,
-                _json_dumps(clean_tags),
-                _json_dumps(clean_articles),
-                _json_dumps(metadata or {}),
-                now.isoformat(timespec="seconds"),
-                expires_at,
-            ),
-        )
-        return int(cur.lastrowid)
+            return int(cur.lastrowid)
+
+    return int(_run_with_sqlite_retry(_write))
 
 
 def get_news_feedback_context(
@@ -1412,21 +1476,25 @@ def update_preference_declaration_status(
         return False
     now = _now()
     init_db(db_path)
-    with _connect(db_path) as conn:
-        user = _user_row(conn, telegram_user_id)
-        if user is None:
-            return False
-        cur = conn.execute(
-            """
-            UPDATE preference_declarations
-            SET status = ?,
-                updated_at = ?,
-                confirmed_at = CASE WHEN ? = 'confirmed' THEN ? ELSE confirmed_at END
-            WHERE id = ? AND user_id = ?
-            """,
-            (status, now, status, now, declaration_id_int, user["id"]),
-        )
-        return cur.rowcount > 0
+
+    def _write() -> bool:
+        with _connect(db_path) as conn:
+            user = _user_row(conn, telegram_user_id)
+            if user is None:
+                return False
+            cur = conn.execute(
+                """
+                UPDATE preference_declarations
+                SET status = ?,
+                    updated_at = ?,
+                    confirmed_at = CASE WHEN ? = 'confirmed' THEN ? ELSE confirmed_at END
+                WHERE id = ? AND user_id = ?
+                """,
+                (status, now, status, now, declaration_id_int, user["id"]),
+            )
+            return cur.rowcount > 0
+
+    return bool(_run_with_sqlite_retry(_write))
 
 
 def get_user_category_feedback_summary(

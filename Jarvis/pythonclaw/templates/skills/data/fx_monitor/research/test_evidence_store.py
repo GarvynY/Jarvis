@@ -29,6 +29,7 @@ Phase 9.1 Step 2 — EvidenceStore SQLite MVP 测试。
 from __future__ import annotations
 
 import sys
+import tempfile
 from pathlib import Path
 
 _HERE = Path(__file__).parent
@@ -1137,18 +1138,32 @@ def test_scored_pack_user_relevance_boost() -> None:
 
 
 def test_chunk_score_fields_persisted() -> None:
-    """attention_score and composite_score survive insert → get round-trip."""
+    """Composite score and score breakdown survive insert → get round-trip."""
     with EvidenceStore(":memory:") as store:
         chunk = _make_chunk(chunk_id="persist-1")
         chunk.attention_score = 0.75
         chunk.composite_score = 0.82
+        chunk.score_importance = 0.81
+        chunk.score_confidence = 0.71
+        chunk.score_recency = 0.91
+        chunk.score_source_quality = 0.68
+        chunk.score_user_relevance = 0.83
+        chunk.score_conflict_value = 0.10
+        chunk.score_reason = "high_imp,user_match,conflict_boost"
         store.insert_chunk(chunk)
 
         loaded = store.get_chunk("persist-1")
         assert loaded is not None
         assert loaded.attention_score == 0.75
         assert loaded.composite_score == 0.82
-    print("  10B: 评分字段持久化      OK")
+        assert loaded.score_importance == 0.81
+        assert loaded.score_confidence == 0.71
+        assert loaded.score_recency == 0.91
+        assert loaded.score_source_quality == 0.68
+        assert loaded.score_user_relevance == 0.83
+        assert loaded.score_conflict_value == 0.10
+        assert loaded.score_reason == "high_imp,user_match,conflict_boost"
+    print("  10B: 评分分解字段持久化  OK")
 
 
 def test_scored_pack_persists_to_sqlite() -> None:
@@ -1173,7 +1188,65 @@ def test_scored_pack_persists_to_sqlite() -> None:
             f"composite_score should be > 0 after pack build, got {loaded_after.composite_score}"
         )
         assert loaded_after.attention_score > 0
-    print("  10B: 评分回写 SQLite     OK")
+        assert loaded_after.score_importance == 0.8
+        assert loaded_after.score_confidence == 0.7
+        assert loaded_after.score_recency > 0
+        assert loaded_after.score_source_quality > 0
+        assert loaded_after.score_user_relevance >= 0.3
+        assert loaded_after.score_reason
+    print("  10B: 评分分解回写 SQLite OK")
+
+
+def test_context_pack_marks_selected_chunks_used() -> None:
+    """Selected ContextPack chunks are persisted as used_in_brief."""
+    with EvidenceStore(":memory:") as store:
+        task = _make_task(task_id="task-used")
+        preset = ResearchPreset(
+            name="used_flag_single_section",
+            research_type="fx",
+            default_agents=[],
+            report_sections=["汇率事实"],
+            banned_terms=[],
+            default_time_horizon="short_term",
+        )
+        selected = _make_chunk(
+            chunk_id="used-selected",
+            task_id="task-used",
+            category="fx_price",
+            importance=0.8,
+            confidence=0.8,
+            content="Selected chunk",
+            source="https://reuters.com/selected",
+        )
+        overflow = _make_chunk(
+            chunk_id="used-overflow",
+            task_id="task-used",
+            category="fx_price",
+            importance=0.7,
+            confidence=0.7,
+            content="Overflow chunk",
+            source="https://reuters.com/overflow",
+        )
+        store.insert_chunk(selected)
+        store.insert_chunk(overflow)
+
+        pack = store.build_context_pack(
+            task,
+            preset,
+            [],
+            max_chunks_per_section=1,
+            token_budget=50000,
+        )
+
+        selected_ids = {item.chunk_id for item in pack.items}
+        loaded_selected = store.get_chunk("used-selected")
+        loaded_overflow = store.get_chunk("used-overflow")
+        assert loaded_selected is not None
+        assert loaded_overflow is not None
+        assert "used-selected" in selected_ids
+        assert loaded_selected.used_in_brief is True
+        assert loaded_overflow.used_in_brief is False
+    print("  10B: 选中 chunk 标记 used OK")
 
 
 def test_legacy_db_migration() -> None:
@@ -1247,6 +1320,71 @@ def test_legacy_db_migration() -> None:
     assert loaded.composite_score == 0.7
     store.close()
     print("  10B: 旧 DB 迁移安全      OK")
+
+
+def test_v3_db_migration_adds_score_breakdown() -> None:
+    """Simulates a v3 database — migration adds persisted score breakdown columns."""
+    import sqlite3
+
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = Path(tmp) / "research_evidence.sqlite3"
+        conn = sqlite3.connect(db_path)
+        conn.executescript("""
+        CREATE TABLE evidence_chunks (
+            chunk_id TEXT PRIMARY KEY,
+            task_id TEXT NOT NULL DEFAULT '',
+            preset_name TEXT NOT NULL DEFAULT '',
+            agent_name TEXT NOT NULL DEFAULT '',
+            content TEXT NOT NULL DEFAULT '',
+            source TEXT,
+            category TEXT NOT NULL DEFAULT '',
+            importance REAL NOT NULL DEFAULT 0.0,
+            confidence REAL NOT NULL DEFAULT 0.0,
+            entities_json TEXT NOT NULL DEFAULT '[]',
+            used_in_brief INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL DEFAULT '',
+            ttl_policy TEXT NOT NULL DEFAULT 'task',
+            token_estimate INTEGER NOT NULL DEFAULT 0,
+            attention_score REAL NOT NULL DEFAULT 0.0,
+            composite_score REAL NOT NULL DEFAULT 0.0
+        );
+        CREATE TABLE schema_version (version INTEGER NOT NULL);
+        INSERT INTO schema_version (version) VALUES (3);
+        INSERT INTO evidence_chunks (chunk_id, task_id, content, importance, confidence)
+            VALUES ('old-v3-chunk', 'task-old', 'legacy v3 data', 0.6, 0.5);
+        """)
+        conn.close()
+
+        with EvidenceStore(db_path) as store:
+            columns = {
+                row[1]
+                for row in store._conn.execute("PRAGMA table_info(evidence_chunks)").fetchall()
+            }
+            for col in (
+                "score_importance",
+                "score_confidence",
+                "score_recency",
+                "score_source_quality",
+                "score_user_relevance",
+                "score_conflict_value",
+                "score_reason",
+            ):
+                assert col in columns, f"Missing migrated column {col}"
+
+            old = store.get_chunk("old-v3-chunk")
+            assert old is not None
+            assert old.score_importance == 0.0
+            assert old.score_reason == ""
+
+            chunk = _make_chunk(chunk_id="new-v4-chunk")
+            chunk.score_user_relevance = 0.83
+            chunk.score_reason = "user_match"
+            store.insert_chunk(chunk)
+            loaded = store.get_chunk("new-v4-chunk")
+            assert loaded is not None
+            assert loaded.score_user_relevance == 0.83
+            assert loaded.score_reason == "user_match"
+    print("  10B: v3 DB 评分分解迁移  OK")
 
 
 # ── Phase 10C: conflict detection integration tests ──────────────────────────
@@ -1605,7 +1743,9 @@ def run_all() -> None:
         test_scored_pack_user_relevance_boost,
         test_chunk_score_fields_persisted,
         test_scored_pack_persists_to_sqlite,
+        test_context_pack_marks_selected_chunks_used,
         test_legacy_db_migration,
+        test_v3_db_migration_adds_score_breakdown,
         # Phase 10C — conflict detection integration
         test_conflict_detection_in_pack,
         test_conflict_boost_applied,

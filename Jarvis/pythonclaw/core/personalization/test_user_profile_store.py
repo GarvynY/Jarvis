@@ -93,6 +93,7 @@ class TestFeedbackEventsPhase10D(unittest.TestCase):
             self.assertIn("brief_id", columns)
             self.assertIn("section_title", columns)
             self.assertIn("category", columns)
+            self.assertIn("idempotency_key", columns)
             with sqlite3.connect(db_path) as conn:
                 news_columns = {row[1] for row in conn.execute("PRAGMA table_info(news_feedback_context)")}
                 declaration_columns = {
@@ -142,6 +143,59 @@ class TestFeedbackEventsPhase10D(unittest.TestCase):
             self.assertEqual(row["category"], "macro")
             self.assertEqual(row["message_id"], "99")
             self.assertIn("unit_test", row["metadata_json"])
+
+    def test_feedback_idempotency_key_deduplicates_retries(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = self._db_path(tmp)
+            first_id = log_feedback_event(
+                "456",
+                "useful",
+                topic="fx_cnyaud",
+                category="macro",
+                idempotency_key="tg_callback:test-1",
+                db_path=db_path,
+            )
+            second_id = log_feedback_event(
+                "456",
+                "useful",
+                topic="fx_cnyaud",
+                category="macro",
+                idempotency_key="tg_callback:test-1",
+                db_path=db_path,
+            )
+            third_id = log_feedback_event(
+                "456",
+                "not_useful",
+                topic="fx_cnyaud",
+                category="macro",
+                idempotency_key="tg_callback:test-2",
+                db_path=db_path,
+            )
+            with sqlite3.connect(db_path) as conn:
+                count = conn.execute("SELECT COUNT(*) FROM feedback_events").fetchone()[0]
+
+            self.assertEqual(first_id, second_id)
+            self.assertNotEqual(first_id, third_id)
+            self.assertEqual(count, 2)
+
+    def test_sqlite_retry_retries_transient_lock(self) -> None:
+        attempts = {"count": 0}
+        original_sleep = _store.time.sleep
+
+        def flaky_operation() -> str:
+            attempts["count"] += 1
+            if attempts["count"] == 1:
+                raise sqlite3.OperationalError("database is locked")
+            return "ok"
+
+        try:
+            _store.time.sleep = lambda _seconds: None
+            result = _store._run_with_sqlite_retry(flaky_operation)
+        finally:
+            _store.time.sleep = original_sleep
+
+        self.assertEqual(result, "ok")
+        self.assertEqual(attempts["count"], 2)
 
     def test_feedback_category_is_normalized_to_lowercase(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

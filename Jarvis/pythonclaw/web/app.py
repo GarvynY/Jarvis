@@ -28,6 +28,7 @@ from ..core.llm.base import LLMProvider
 from ..core.persistent_agent import PersistentAgent
 from ..core.session_store import SessionStore
 from ..core.skill_loader import SkillRegistry
+from .fx_research_debug import build_phase10_debug_payload
 
 logger = logging.getLogger(__name__)
 
@@ -988,6 +989,11 @@ async def _debug_fx_research_page(request: Request):
       <p id="followupMeta" class="muted">尚未运行。默认仅推荐，不会启动额外 Agent。</p>
       <div id="followups"></div>
     </section>
+    <section class="panel">
+      <h2>Phase 10 Debug</h2>
+      <p id="phase10Meta" class="muted">尚未运行。</p>
+      <pre id="phase10Out"></pre>
+    </section>
     <pre id="out"></pre>
   </main>
   <script>
@@ -996,6 +1002,8 @@ async def _debug_fx_research_page(request: Request):
     const meta = document.getElementById('meta');
     const followupMeta = document.getElementById('followupMeta');
     const followups = document.getElementById('followups');
+    const phase10Meta = document.getElementById('phase10Meta');
+    const phase10Out = document.getElementById('phase10Out');
     function escapeHtml(value) {{
       return String(value ?? '').replace(/[&<>"']/g, ch => ({{
         '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
@@ -1022,8 +1030,10 @@ async def _debug_fx_research_page(request: Request):
     run.addEventListener('click', async () => {{
       run.disabled = true;
       out.textContent = '';
+      phase10Out.textContent = '';
       followups.innerHTML = '';
       followupMeta.textContent = 'Running...';
+      phase10Meta.textContent = 'Running...';
       meta.textContent = 'Running...';
       try {{
         const res = await fetch('/api/debug/fx_research', {{
@@ -1043,11 +1053,15 @@ async def _debug_fx_research_page(request: Request):
         }} else {{
           meta.textContent = `brief=${{data.brief_id}} latency=${{data.latency_s}}s coverage=${{data.trace_summary.covered_sections}}/${{data.trace_summary.total_sections}} conflicts=${{data.trace_summary.conflict_count}}`;
           renderFollowups(data.followup_requests);
+          const p10 = data.phase10 || {{}};
+          phase10Meta.textContent = `ranking=${{p10.ranking_basis || 'unknown'}} selected=${{p10.score_summary?.selected_count ?? 0}} used=${{p10.score_summary?.used_in_brief_count ?? 0}} scored=${{p10.score_summary?.scored_selected_count ?? 0}}`;
+          phase10Out.textContent = JSON.stringify(p10, null, 2);
           out.textContent = data.text;
         }}
       }} catch (err) {{
         out.textContent = String(err);
         followupMeta.textContent = 'Follow-up 推荐生成失败或请求失败。';
+        phase10Meta.textContent = 'Phase 10 Debug 生成失败或请求失败。';
       }} finally {{
         run.disabled = false;
       }}
@@ -1108,6 +1122,7 @@ async def _api_debug_fx_research(request: Request):
         _super = importlib.import_module("supervisor")
         _schema = importlib.import_module("schema")
         _followup = importlib.import_module("followup_router")
+        _evidence_store = importlib.import_module("evidence_store")
 
         task, outputs, cost_estimate = await _coord.run_research(
             preset_name=preset_name,
@@ -1142,6 +1157,11 @@ async def _api_debug_fx_research(request: Request):
                 int(getattr(t, "conflict_count", 0) or 0) for t in traces
             ),
         }
+        phase10 = build_phase10_debug_payload(
+            brief.task_id,
+            traces,
+            _evidence_store.EvidenceStore,
+        )
         followup_requests = _followup.generate_followup_requests(
             task,
             outputs,
@@ -1156,6 +1176,7 @@ async def _api_debug_fx_research(request: Request):
             "agent_statuses": brief.agent_statuses,
             "data_gaps": brief.data_gaps,
             "trace_summary": trace_summary,
+            "phase10": phase10,
             "followup_execution_enabled": False,
             "followup_requests": [req.to_dict() for req in followup_requests],
             "text": text,

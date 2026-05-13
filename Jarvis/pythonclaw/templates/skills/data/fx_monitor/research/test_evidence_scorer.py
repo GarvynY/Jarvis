@@ -74,12 +74,13 @@ def _make_chunk(
     category: str = "",
     entities: list[str] | None = None,
     created_at: str | None = None,
+    content: str = "test content",
 ) -> EvidenceChunk:
     return EvidenceChunk(
         chunk_id=chunk_id,
         task_id="task-test",
         agent_name="fx_agent",
-        content="test content",
+        content=content,
         source=source,
         category=category,
         importance=importance,
@@ -169,16 +170,16 @@ def test_user_topic_match_boost() -> None:
     ctx = SafeUserContext(preferred_topics=["rba", "fx_price"])
     chunk = _make_chunk(category="fx_price")
     ur = compute_user_relevance_score(chunk, ctx)
-    assert ur == 0.8, f"Matching category should be 0.8, got {ur}"
-    print("  user topic category match → 0.8 OK")
+    assert ur >= 0.8, f"Matching category should be at least 0.8, got {ur}"
+    print("  user topic category match ≥ 0.8 OK")
 
 
 def test_user_topic_entity_match() -> None:
     ctx = SafeUserContext(preferred_topics=["CNY/AUD", "iron_ore"])
     chunk = _make_chunk(entities=["CNY/AUD", "USD"])
     ur = compute_user_relevance_score(chunk, ctx)
-    assert ur == 0.8, f"Matching entity should be 0.8, got {ur}"
-    print("  user topic entity match → 0.8   OK")
+    assert ur >= 0.8, f"Matching entity should be at least 0.8, got {ur}"
+    print("  user topic entity match ≥ 0.8   OK")
 
 
 def test_user_no_context_neutral() -> None:
@@ -217,6 +218,68 @@ def test_negative_category_feedback_lowers_relevance() -> None:
     )
     assert ur == 0.1, f"Negative category feedback should lower to 0.1, got {ur}"
     print("  negative category feedback lowers OK")
+
+
+def test_news_tag_feedback_maps_to_evidence_categories() -> None:
+    ctx = SafeUserContext()
+    setattr(ctx, "category_feedback_summary", {"news_tag": 1.0})
+    news = _make_chunk(category="news_event")
+    macro = _make_chunk(category="macro")
+    risk = _make_chunk(category="risk")
+    fx = _make_chunk(category="fx_price")
+
+    assert compute_user_relevance_score(news, ctx) == 0.84
+    assert compute_user_relevance_score(macro, ctx) == 0.78
+    assert compute_user_relevance_score(risk, ctx) == 0.74
+    assert compute_user_relevance_score(fx, ctx) == 0.64
+    print("  news_tag feedback maps categories OK")
+
+
+def test_inferred_interest_topics_map_to_macro_news_risk() -> None:
+    ctx = SafeUserContext()
+    setattr(ctx, "inferred_high_interest_topics", ["地缘政治风险", "能源价格"])
+    chunk = _make_chunk(
+        category="macro",
+        content="OPEC and Hormuz disruption may affect oil prices, inflation and AUD.",
+    )
+    ur = compute_user_relevance_score(chunk, ctx)
+    assert ur >= 0.86, f"Energy/geopolitical inferred topics should boost macro, got {ur}"
+    score = compute_evidence_score(chunk, ctx, now_iso_str=_now_str())
+    assert score.user_relevance_score == ur
+    print("  inferred topic mapping boost OK")
+
+
+def test_quality_dislike_penalizes_shallow_chunks() -> None:
+    ctx = SafeUserContext()
+    setattr(ctx, "inferred_high_interest_topics", ["澳元走势"])
+    setattr(ctx, "inferred_low_interest_topics", ["逻辑太浅"])
+    chunk = _make_chunk(
+        category="news_event",
+        content="Aussie Dollar fatigue? Technical signs hint at an AUD/USD pullback.",
+        source="https://marketpulse.com/aud-usd-pullback",
+    )
+    ur = compute_user_relevance_score(
+        chunk,
+        ctx,
+        category_feedback_summary={"news_article_quality": -1.0},
+    )
+    assert 0.35 <= ur <= 0.6, f"Shallow quality dislike should penalize, got {ur}"
+    print("  quality dislike penalty OK")
+
+
+def test_explicit_fx_use_and_bank_preferences_boost_relevance() -> None:
+    ctx = SafeUserContext(purpose="living", target_rate=4.78)
+    setattr(ctx, "preferred_banks", ["中国银行"])
+    fx = _make_chunk(
+        category="fx_price",
+        content="中国银行 AUD 现汇卖出价为 4.9347。",
+        source="Chinese bank FX boards",
+    )
+    macro = _make_chunk(category="macro", content="General monetary policy update.")
+
+    assert compute_user_relevance_score(fx, ctx) >= 0.75
+    assert compute_user_relevance_score(macro, ctx) == 0.3
+    print("  explicit FX use/bank preference boost OK")
 
 
 def test_invalid_timestamp_no_crash() -> None:
@@ -274,7 +337,7 @@ def test_composite_formula() -> None:
         + 0.6 * W_CONFIDENCE
         + score.recency_score * W_RECENCY
         + 0.95 * W_SOURCE_QUALITY
-        + 0.8 * W_USER_RELEVANCE
+        + score.user_relevance_score * W_USER_RELEVANCE
         + 0.0 * W_CONFLICT
     )
     expected = max(0.0, min(1.0, round(expected, 4)))
@@ -466,6 +529,10 @@ def main() -> None:
     test_user_no_context_neutral()
     test_positive_category_feedback_boosts_relevance()
     test_negative_category_feedback_lowers_relevance()
+    test_news_tag_feedback_maps_to_evidence_categories()
+    test_inferred_interest_topics_map_to_macro_news_risk()
+    test_quality_dislike_penalizes_shallow_chunks()
+    test_explicit_fx_use_and_bank_preferences_boost_relevance()
     test_invalid_timestamp_no_crash()
     test_empty_timestamp_no_crash()
     test_all_scores_clamped()
@@ -483,7 +550,7 @@ def main() -> None:
     test_conflict_value_invalid_safe()
 
     print("\n" + "=" * 60)
-    print("All 28 tests passed.")
+    print("All 32 tests passed.")
 
 
 if __name__ == "__main__":

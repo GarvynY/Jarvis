@@ -57,12 +57,16 @@ try:
     from pythonclaw.core.personalization import (
         build_safe_user_context,
         get_user_category_feedback_summary,
+        get_user_profile,
     )
 except Exception:  # noqa: BLE001
     def build_safe_user_context(*_args: object, **_kwargs: object) -> dict:  # type: ignore[misc]
         return {}
 
     def get_user_category_feedback_summary(*_args: object, **_kwargs: object) -> dict:  # type: ignore[misc]
+        return {}
+
+    def get_user_profile(*_args: object, **_kwargs: object) -> dict:  # type: ignore[misc]
         return {}
 
 
@@ -186,6 +190,21 @@ async def run_research(
             # Runtime-only scorer hint. SafeUserContext.to_dict()/from_dict()
             # intentionally exclude it so feedback history is never prompted.
             setattr(safe_ctx, "category_feedback_summary", summary)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        profile = get_user_profile(user_id)
+        explicit = (profile or {}).get("explicit_preferences") or {}
+        inferred = (profile or {}).get("inferred_preferences") or {}
+        preferred_banks = list(explicit.get("preferred_banks") or [])
+        high_topics = list(inferred.get("high_interest_topics") or [])
+        low_topics = list(inferred.get("low_interest_topics") or [])
+        if preferred_banks:
+            setattr(safe_ctx, "preferred_banks", preferred_banks)
+        if high_topics:
+            setattr(safe_ctx, "inferred_high_interest_topics", high_topics)
+        if low_topics:
+            setattr(safe_ctx, "inferred_low_interest_topics", low_topics)
     except Exception:  # noqa: BLE001
         pass
 
