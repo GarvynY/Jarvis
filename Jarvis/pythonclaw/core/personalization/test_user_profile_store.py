@@ -344,6 +344,50 @@ class TestFeedbackEventsPhase10D(unittest.TestCase):
             self.assertEqual(len(due), 1)
             self.assertEqual(due[0]["trigger_type"], "threshold")
 
+    def test_summarized_context_feedback_does_not_retrigger_threshold(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = self._db_path(tmp)
+            old_feedback_id = store_news_feedback_context(
+                "667",
+                article_title="RBA old news",
+                article_summary="RBA old summary",
+                tags=["RBA利率"],
+                db_path=db_path,
+            )
+            for _ in range(_store.NEWS_FEEDBACK_SUMMARY_TRIGGER_COUNT):
+                log_feedback_event(
+                    "667",
+                    "useful",
+                    topic="RBA利率",
+                    category="news_tag",
+                    metadata={"news_feedback_id": str(old_feedback_id)},
+                    db_path=db_path,
+                )
+            self.assertEqual(mark_news_feedback_contexts_summarized([old_feedback_id], db_path=db_path), 1)
+
+            new_feedback_id = store_news_feedback_context(
+                "667",
+                article_title="RBA new news",
+                article_summary="RBA new summary",
+                tags=["RBA利率"],
+                db_path=db_path,
+            )
+            log_feedback_event(
+                "667",
+                "useful",
+                topic="RBA利率",
+                category="news_tag",
+                metadata={"news_feedback_id": str(new_feedback_id)},
+                db_path=db_path,
+            )
+
+            status = get_news_feedback_rollup_status("667", db_path=db_path)
+            due = get_due_news_feedback_contexts("667", db_path=db_path)
+
+            self.assertEqual(status["feedback_count"], 1)
+            self.assertFalse(status["threshold_reached"])
+            self.assertEqual(due, [])
+
     def test_preference_declaration_lifecycle(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db_path = self._db_path(tmp)

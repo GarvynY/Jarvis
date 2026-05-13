@@ -326,9 +326,10 @@ class TelegramBot:
                     pending,
                     title="待确认的隐式偏好：",
                     empty="- 暂无待确认声明",
+                    limit=3,
                 )
             )
-            for item in pending[:5]:
+            for item in pending[:3]:
                 declaration_id = item.get("id")
                 declaration = str(item.get("declaration") or "").strip()
                 if not declaration_id or not declaration:

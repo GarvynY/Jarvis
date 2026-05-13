@@ -148,6 +148,104 @@ class TestPreferenceAgentMVP(unittest.TestCase):
             self.assertTrue(result.ok)
             self.assertEqual(result.attempts, 2)
             self.assertEqual(len(calls), 2)
+            self.assertEqual(result.declarations_created, 0)
+            self.assertEqual(_store.get_due_news_feedback_contexts("123", db_path=db_path), [])
+
+    def test_preference_agent_filters_low_evidence_declaration(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = self._db_path(tmp)
+            context_id = self._seed_due_context(db_path)
+
+            def fake_llm(_prompt: str, _system: str, _max_tokens: int):
+                return json.dumps({
+                    "declarations": [
+                        {
+                            "declaration": "用户可能短期关注 RBA。",
+                            "confidence_hint": "medium",
+                            "evidence_count": 1,
+                            "source_context_ids": [str(context_id)],
+                        }
+                    ],
+                    "rejected_patterns": [],
+                }, ensure_ascii=False), {}
+
+            result = _agent.run_preference_agent_for_user(
+                "123",
+                db_path=str(db_path),
+                llm_call=fake_llm,
+            )
+
+            self.assertTrue(result.ok)
+            self.assertEqual(result.declarations_created, 0)
+            self.assertEqual(_store.list_preference_declarations("123", status="pending", db_path=db_path), [])
+            self.assertEqual(_store.get_due_news_feedback_contexts("123", db_path=db_path), [])
+
+    def test_preference_agent_skips_duplicate_declaration_key(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = self._db_path(tmp)
+            first_context_id = self._seed_due_context(db_path)
+
+            def first_llm(_prompt: str, _system: str, _max_tokens: int):
+                return json.dumps({
+                    "declarations": [
+                        {
+                            "declaration": "用户更偏好有因果链和数据支撑的深度分析。",
+                            "confidence_hint": "high",
+                            "evidence_count": 20,
+                            "source_context_ids": [str(first_context_id)],
+                        }
+                    ],
+                    "rejected_patterns": [],
+                }, ensure_ascii=False), {}
+
+            first = _agent.run_preference_agent_for_user(
+                "123",
+                db_path=str(db_path),
+                llm_call=first_llm,
+            )
+            self.assertEqual(first.declarations_created, 1)
+
+            second_context_id = self._seed_due_context(db_path)
+
+            def second_llm(_prompt: str, _system: str, _max_tokens: int):
+                return json.dumps({
+                    "declarations": [
+                        {
+                            "declaration": "用户不喜欢逻辑太浅、泛泛而谈的新闻分析。",
+                            "confidence_hint": "high",
+                            "evidence_count": 20,
+                            "source_context_ids": [str(second_context_id)],
+                        }
+                    ],
+                    "rejected_patterns": [],
+                }, ensure_ascii=False), {}
+
+            second = _agent.run_preference_agent_for_user(
+                "123",
+                db_path=str(db_path),
+                llm_call=second_llm,
+            )
+
+            self.assertTrue(second.ok)
+            self.assertEqual(second.declarations_created, 0)
+            declarations = _store.list_preference_declarations("123", status="pending", db_path=db_path)
+            self.assertEqual(len(declarations), 1)
+            self.assertEqual(declarations[0]["metadata"]["preference_key"], "analysis_depth")
+
+    def test_prompt_caps_declarations_at_three_points(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = self._db_path(tmp)
+            self._seed_due_context(db_path)
+            prompts = []
+
+            def fake_llm(prompt: str, _system: str, _max_tokens: int):
+                prompts.append(prompt)
+                return json.dumps({"declarations": [], "rejected_patterns": []}, ensure_ascii=False), {}
+
+            _agent.run_preference_agent_for_user("123", db_path=str(db_path), llm_call=fake_llm)
+
+            self.assertIn("最多3小点", prompts[0])
+            self.assertIn("最多输出 3 条 declarations", prompts[0])
 
     def test_preference_agent_no_due_context_no_llm_call(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -116,7 +116,7 @@ MAX_NEWS_CONTEXT_SUMMARY_BYTES = 4096
 MAX_NEWS_CONTEXT_URL_BYTES = 1024
 MAX_NEWS_CONTEXT_TIMESTAMP_BYTES = 128
 NEWS_FEEDBACK_CONTEXT_TTL_DAYS = 3
-NEWS_FEEDBACK_SUMMARY_TRIGGER_COUNT = 10
+NEWS_FEEDBACK_SUMMARY_TRIGGER_COUNT = 20
 NEWS_FEEDBACK_IDLE_LOG_DAYS = 7
 NEWS_FEEDBACK_TAG_CATEGORIES = {"news_tag", "news_article_quality"}
 
@@ -1174,7 +1174,7 @@ def get_news_feedback_rollup_status(
             LEFT JOIN feedback_events fe
               ON fe.user_id = nf.user_id
              AND json_extract(fe.metadata_json, '$.news_feedback_id') = CAST(nf.id AS TEXT)
-            WHERE nf.user_id = ? AND nf.expires_at > ?
+            WHERE nf.user_id = ? AND nf.expires_at > ? AND nf.summarized_at IS NULL
             GROUP BY nf.id
             """,
             (user["id"], _now()),
@@ -1233,6 +1233,7 @@ def get_due_news_feedback_contexts(
             """,
             (user["id"],),
         ).fetchall()
+        unsummarized_context_ids = {str(row["id"]) for row in rows}
         feedback_rows = conn.execute(
             """
             SELECT metadata_json, event_type, topic, category, created_at
@@ -1247,6 +1248,8 @@ def get_due_news_feedback_contexts(
         metadata = _json_loads(row["metadata_json"], {}) or {}
         context_id = str(metadata.get("news_feedback_id") or "")
         if not context_id:
+            continue
+        if context_id not in unsummarized_context_ids:
             continue
         feedback_by_context.setdefault(context_id, []).append(
             {

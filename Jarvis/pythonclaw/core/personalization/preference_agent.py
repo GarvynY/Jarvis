@@ -13,6 +13,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
 from ... import config
@@ -20,6 +21,8 @@ from ..rate_limit import call_with_backoff
 from .user_profile_store import (
     create_preference_declaration,
     get_due_news_feedback_contexts,
+    get_user_profile,
+    list_preference_declarations,
     mark_news_feedback_contexts_summarized,
 )
 
@@ -27,11 +30,14 @@ logger = logging.getLogger(__name__)
 
 MAX_CONTEXTS_PER_RUN = 10
 MAX_FEEDBACK_EVENTS_PER_RUN = 20
-MAX_DECLARATIONS_PER_RUN = 5
+MAX_DECLARATIONS_PER_RUN = 3
 MAX_DECLARATION_CHARS = 120
 MAX_PATTERN_CHARS = 120
+MIN_PENDING_EVIDENCE_COUNT = 3
+PENDING_DECLARATION_COOLDOWN_HOURS = 24
 REPAIR_RETRIES = 2
 CONFIDENCE_HINTS = {"low", "medium", "high"}
+PENDING_CONFIDENCE_HINTS = {"medium", "high"}
 
 _SENSITIVE_PATTERNS = (
     re.compile(r"https?://\S+", re.I),
@@ -129,13 +135,17 @@ def _build_preference_prompt(contexts: list[dict[str, Any]]) -> str:
         "- 只基于输入中的新闻标题、摘要、标签和反馈事件判断。\n"
         "- 不要推断身份、财务状况、健康、政治立场、地址、账号等敏感信息。\n"
         "- 不要把单次偶然反馈写成确定偏好。\n"
+        "- 只有来自至少3次不同反馈、且适合长期影响推送策略的稳定偏好，才放入 declarations。\n"
+        "- 低置信或临时信号不要放入 declarations，可在 rejected_patterns 说明。\n"
+        "- 合并同类表达；例如“不喜欢逻辑太浅”“希望分析更深入”“不喜欢泛泛而谈”应合并为一条偏好。\n"
+        "- declarations 必须集中总结为最多3小点，避免拆成多条细碎声明。\n"
         "- 如果样本少或由 expired 触发，声明要更保守，confidence_hint 优先 low。\n"
         "- 只输出 JSON object，不要 Markdown，不要解释。\n\n"
         "输出 Schema：\n"
         '{"declarations":[{"declaration":"不超过120字的中文偏好声明","confidence_hint":"low|medium|high","evidence_count":3,"source_context_ids":["1"]}],'
         '"rejected_patterns":[{"pattern":"不超过120字的反例或质量问题","reason":"old|shallow|irrelevant|known|mixed"}]}\n\n'
         f"最多输出 {MAX_DECLARATIONS_PER_RUN} 条 declarations。"
-        "如果没有足够证据，declarations 返回空数组。\n\n"
+        "如果没有足够证据或只是短期信号，declarations 返回空数组。\n\n"
         f"输入数据：\n{payload}"
     )
 
@@ -270,6 +280,110 @@ def _run_json_llm_with_repair(
     raise ValueError(f"PreferenceAgent JSON validation failed: {last_error}")
 
 
+def _normalise_declaration_key(text: str) -> str:
+    lowered = str(text or "").strip().lower()
+    if any(marker in lowered for marker in ("逻辑", "因果", "数据", "证据", "深度", "深入", "泛泛", "太浅", "支撑")):
+        return "analysis_depth"
+    if any(marker in lowered for marker in ("可操作", "行动", "建议", "换汇时点", "操作")):
+        return "actionability"
+    if any(marker in lowered for marker in ("rba", "利率", "央行")):
+        return "rba_rates"
+    if any(marker in lowered for marker in ("中东", "油价", "能源")):
+        return "geopolitics_energy"
+    tokens = re.findall(r"[\w\u4e00-\u9fff]{2,}", lowered)
+    return "general:" + "|".join(tokens[:6])
+
+
+def _parse_dt(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        text = str(value)
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        parsed = datetime.fromisoformat(text)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed
+    except ValueError:
+        return None
+
+
+def _has_recent_pending_declaration(
+    telegram_user_id: int | str,
+    *,
+    db_path: str | None = None,
+) -> bool:
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=PENDING_DECLARATION_COOLDOWN_HOURS)
+    for item in list_preference_declarations(telegram_user_id, status="pending", db_path=db_path):
+        created = _parse_dt(item.get("created_at"))
+        if created and created >= cutoff:
+            return True
+    return False
+
+
+def _explicit_preference_values(profile: dict[str, Any]) -> set[str]:
+    explicit = profile.get("explicit_preferences") or {}
+    values: set[str] = set()
+    for key in ("preferred_summary_style", "alert_preference", "purpose"):
+        value = explicit.get(key)
+        if value not in (None, "", []):
+            values.add(str(value).strip().lower())
+    for key in ("preferred_topics", "preferred_banks"):
+        for value in explicit.get(key) or []:
+            if value not in (None, "", []):
+                values.add(str(value).strip().lower())
+    return values
+
+
+def _conflicts_with_explicit_preferences(
+    declaration: str,
+    explicit_values: set[str],
+) -> bool:
+    text = str(declaration or "").lower()
+    if "不" not in text and "较低" not in text and "避免" not in text:
+        return False
+    return any(value and value in text for value in explicit_values)
+
+
+def _merge_or_create_preference_declaration(
+    telegram_user_id: int | str,
+    declaration: str,
+    *,
+    evidence_count: int,
+    metadata: dict[str, Any],
+    db_path: str | None = None,
+) -> bool:
+    preference_key = _normalise_declaration_key(declaration)
+    metadata["preference_key"] = preference_key
+
+    for status in ("pending", "confirmed"):
+        for existing in list_preference_declarations(telegram_user_id, status=status, db_path=db_path):
+            existing_metadata = existing.get("metadata") or {}
+            existing_key = existing_metadata.get("preference_key") or _normalise_declaration_key(
+                existing.get("declaration") or ""
+            )
+            if existing_key == preference_key:
+                logger.info(
+                    "PreferenceAgent skipped duplicate declaration user_id=%s key=%s status=%s",
+                    telegram_user_id,
+                    preference_key,
+                    status,
+                )
+                return False
+
+    create_preference_declaration(
+        telegram_user_id,
+        declaration,
+        evidence_count=evidence_count,
+        source="news_feedback",
+        metadata=metadata,
+        status="pending",
+        db_path=db_path,
+    )
+    return True
+
+
 def run_preference_agent_for_user(
     telegram_user_id: int | str,
     *,
@@ -307,26 +421,38 @@ def run_preference_agent_for_user(
 
     created = 0
     rejected_patterns = payload.get("rejected_patterns") or []
+    cooldown_active = _has_recent_pending_declaration(telegram_user_id, db_path=db_path)
+    explicit_values = _explicit_preference_values(get_user_profile(telegram_user_id, db_path=db_path))
     for item in payload.get("declarations") or []:
+        if item["evidence_count"] < MIN_PENDING_EVIDENCE_COUNT:
+            continue
+        if item["confidence_hint"] not in PENDING_CONFIDENCE_HINTS:
+            continue
+        if cooldown_active and created == 0:
+            continue
+        if _conflicts_with_explicit_preferences(item["declaration"], explicit_values):
+            continue
         metadata = {
             "confidence_hint": item["confidence_hint"],
             "source_context_ids": item["source_context_ids"],
             "trigger_types": trigger_types,
             "rejected_patterns": rejected_patterns,
+            "mvp_gate": {
+                "min_evidence_count": MIN_PENDING_EVIDENCE_COUNT,
+                "cooldown_hours": PENDING_DECLARATION_COOLDOWN_HOURS,
+            },
         }
-        create_preference_declaration(
+        if not _merge_or_create_preference_declaration(
             telegram_user_id,
             item["declaration"],
             evidence_count=item["evidence_count"],
-            source="news_feedback",
             metadata=metadata,
-            status="pending",
             db_path=db_path,
-        )
+        ):
+            continue
         created += 1
 
-    if created:
-        mark_news_feedback_contexts_summarized(context_ids, db_path=db_path)
+    mark_news_feedback_contexts_summarized(context_ids, db_path=db_path)
 
     return PreferenceAgentResult(
         ok=True,
@@ -336,4 +462,3 @@ def run_preference_agent_for_user(
         token_usage=token_usage,
         trigger_types=trigger_types,
     )
-
