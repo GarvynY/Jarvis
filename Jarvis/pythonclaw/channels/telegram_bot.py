@@ -62,6 +62,7 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+from telegram.request import HTTPXRequest
 
 from .. import config
 from ._telegram_helpers import (
@@ -1606,7 +1607,22 @@ class TelegramBot:
     ]
 
     def build_application(self) -> Application:
-        app = Application.builder().token(self._token).build()
+        request = HTTPXRequest(
+            connect_timeout=10.0,
+            read_timeout=30.0,
+            write_timeout=10.0,
+            pool_timeout=10.0,
+        )
+        app = (
+            Application.builder()
+            .token(self._token)
+            .request(request)
+            .get_updates_request(HTTPXRequest(
+                connect_timeout=10.0,
+                read_timeout=30.0,
+            ))
+            .build()
+        )
         app.add_handler(CommandHandler("start", self._cmd_start))
         app.add_handler(CommandHandler("reset", self._cmd_reset))
         app.add_handler(CommandHandler("status", self._cmd_status))

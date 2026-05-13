@@ -111,6 +111,10 @@ MAX_EVENT_TEXT_BYTES = 256
 MAX_METADATA_STRING_BYTES = 1024
 MAX_TOPICS_PER_FIELD = 20
 MAX_BANKS_PER_FIELD = 10
+MAX_NEWS_CONTEXT_TITLE_BYTES = 1024
+MAX_NEWS_CONTEXT_SUMMARY_BYTES = 4096
+MAX_NEWS_CONTEXT_URL_BYTES = 1024
+MAX_NEWS_CONTEXT_TIMESTAMP_BYTES = 128
 NEWS_FEEDBACK_CONTEXT_TTL_DAYS = 3
 NEWS_FEEDBACK_SUMMARY_TRIGGER_COUNT = 10
 NEWS_FEEDBACK_IDLE_LOG_DAYS = 7
@@ -1025,9 +1029,19 @@ def store_news_feedback_context(
     context needed to interpret a short callback token; it is not returned by
     ``get_user_profile()`` and is not sent to LLM prompts.
     """
-    title = _validate_event_text(article_title, path="article_title") or ""
-    summary = _validate_event_text(article_summary, path="article_summary") or ""
-    url = _validate_event_text(article_url, path="article_url")
+    title = str(article_title or "").strip()
+    summary = str(article_summary or "").strip()
+    url = str(article_url or "").strip() if article_url is not None else None
+    _reject_sensitive_string(
+        title, path="article_title", max_bytes=MAX_NEWS_CONTEXT_TITLE_BYTES
+    )
+    _reject_sensitive_string(
+        summary, path="article_summary", max_bytes=MAX_NEWS_CONTEXT_SUMMARY_BYTES
+    )
+    if url:
+        _reject_sensitive_string(
+            url, path="article_url", max_bytes=MAX_NEWS_CONTEXT_URL_BYTES
+        )
     clean_tags = _validate_topic_list(tags or [], path="news_feedback_tags")
     if not clean_tags:
         raise ValueError("news_feedback_context requires at least one tag")
@@ -1035,11 +1049,40 @@ def store_news_feedback_context(
     for index, item in enumerate(articles or []):
         if not isinstance(item, dict):
             raise ValueError(f"articles[{index}] must be a dict")
+        item_title = str(item.get("title") or "").strip()
+        item_summary = str(item.get("summary") or "").strip()
+        item_url = str(item.get("url") or "").strip() if item.get("url") is not None else None
+        item_published = (
+            str(item.get("published") or "").strip()
+            if item.get("published") is not None else None
+        )
+        _reject_sensitive_string(
+            item_title,
+            path=f"articles[{index}].title",
+            max_bytes=MAX_NEWS_CONTEXT_TITLE_BYTES,
+        )
+        _reject_sensitive_string(
+            item_summary,
+            path=f"articles[{index}].summary",
+            max_bytes=MAX_NEWS_CONTEXT_SUMMARY_BYTES,
+        )
+        if item_url:
+            _reject_sensitive_string(
+                item_url,
+                path=f"articles[{index}].url",
+                max_bytes=MAX_NEWS_CONTEXT_URL_BYTES,
+            )
+        if item_published:
+            _reject_sensitive_string(
+                item_published,
+                path=f"articles[{index}].published",
+                max_bytes=MAX_NEWS_CONTEXT_TIMESTAMP_BYTES,
+            )
         clean_item = {
-            "title": _validate_event_text(item.get("title"), path=f"articles[{index}].title"),
-            "summary": _validate_event_text(item.get("summary"), path=f"articles[{index}].summary"),
-            "url": _validate_event_text(item.get("url"), path=f"articles[{index}].url"),
-            "published": _validate_event_text(item.get("published"), path=f"articles[{index}].published"),
+            "title": item_title,
+            "summary": item_summary,
+            "url": item_url,
+            "published": item_published,
             "tags": _validate_topic_list(item.get("tags") or [], path=f"articles[{index}].tags"),
         }
         clean_articles.append({

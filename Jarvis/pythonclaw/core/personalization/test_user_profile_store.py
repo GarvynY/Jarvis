@@ -196,16 +196,17 @@ class TestFeedbackEventsPhase10D(unittest.TestCase):
     def test_news_feedback_context_stores_tags_with_three_day_ttl(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db_path = self._db_path(tmp)
+            long_summary = "RBA 利率信号可能支撑澳元。" * 20
             feedback_id = store_news_feedback_context(
                 "111",
                 article_title="RBA signals higher rates",
-                article_summary="RBA 利率信号可能支撑澳元。",
+                article_summary=long_summary,
                 article_url="https://example.com/rba",
                 tags=["RBA利率", "澳元走强"],
                 articles=[
                     {
                         "title": "RBA signals higher rates",
-                        "summary": "RBA 利率信号可能支撑澳元。",
+                        "summary": long_summary,
                         "url": "https://example.com/rba",
                         "published": "2026-05-12T00:00:00Z",
                         "tags": ["RBA利率", "澳元走强"],
@@ -219,6 +220,8 @@ class TestFeedbackEventsPhase10D(unittest.TestCase):
             self.assertIsNotNone(row)
             self.assertEqual(row["tags"], ["RBA利率", "澳元走强"])
             self.assertEqual(row["articles"][0]["title"], "RBA signals higher rates")
+            self.assertEqual(row["article_summary"], long_summary)
+            self.assertEqual(row["articles"][0]["summary"], long_summary)
             self.assertEqual(row["articles"][0]["tags"], ["RBA利率", "澳元走强"])
             self.assertIn("T", row["expires_at"])
             self.assertNotEqual(row["created_at"][:10], row["expires_at"][:10])

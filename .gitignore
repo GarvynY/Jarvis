@@ -17,6 +17,12 @@ CLAUDE.md
 # codex
 .codex
 
+# qwen
+.qwen
+
+# agent
+.agents
+
 # OS
 .DS_Store
 Thumbs.db
