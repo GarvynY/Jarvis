@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import importlib.util
 import io
 import json
@@ -133,6 +134,12 @@ if TYPE_CHECKING:
     from ..session_manager import SessionManager
 
 logger = logging.getLogger(__name__)
+
+
+def _callback_idempotency_key(callback_query_id: str | None) -> str:
+    """Return a safe deterministic key for Telegram callback de-duplication."""
+    digest = hashlib.sha256(str(callback_query_id or "").encode()).hexdigest()[:24]
+    return f"tg_callback_{digest}"
 
 class TelegramBot:
     """
@@ -448,11 +455,6 @@ class TelegramBot:
             await query.answer("未知反馈类型。")
             return
 
-        try:
-            await query.answer("已收到，正在处理...")
-        except Exception:
-            pass
-
         from ..core.personalization import log_feedback_event, update_inferred_preferences_from_feedback
 
         try:
@@ -465,7 +467,7 @@ class TelegramBot:
                 section_title=section_title,
                 category=category,
                 message_id=str(query.message.message_id) if query.message else None,
-                idempotency_key=f"tg_callback:{query.id}",
+                idempotency_key=_callback_idempotency_key(query.id),
                 metadata={"source": f"inline_button:{source}"},
             )
         except Exception:
@@ -482,7 +484,11 @@ class TelegramBot:
         try:
             await query.edit_message_reply_markup(reply_markup=None)
         except Exception:
-            pass
+            logger.warning(
+                "[Telegram] Failed to remove inline feedback keyboard msg_id=%s",
+                query.message.message_id if query.message else "?",
+                exc_info=True,
+            )
 
         label = _FEEDBACK_TYPE_LABELS[event_type]
         source_label = _FB_SOURCE_LABELS.get(source, source)
@@ -583,18 +589,13 @@ class TelegramBot:
             return
 
         try:
-            await query.answer("已收到，正在处理...")
-        except Exception:
-            pass
-
-        try:
             log_feedback_event(
                 query.from_user.id,
                 event_type,
                 topic=topic,
                 category=category,
                 message_id=message_id,
-                idempotency_key=f"tg_callback:{query.id}",
+                idempotency_key=_callback_idempotency_key(query.id),
                 metadata=metadata,
             )
         except Exception:
@@ -608,7 +609,11 @@ class TelegramBot:
         try:
             await query.edit_message_reply_markup(reply_markup=None)
         except Exception:
-            pass
+            logger.warning(
+                "[Telegram] Failed to remove news feedback keyboard msg_id=%s",
+                query.message.message_id if query.message else "?",
+                exc_info=True,
+            )
 
         try:
             update_inferred_preferences_from_feedback(query.from_user.id)
