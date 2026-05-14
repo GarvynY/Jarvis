@@ -157,6 +157,7 @@ ADMIN_HTML = """<!doctype html>
     let manifest = { articles: [] };
     let current = null;
     let pendingPdf = null;
+    let imageInsertState = null;
     const $ = (id) => document.getElementById(id);
     const CATS = ['ai-news', 'ai-thinking', 'ai-technology', 'jarvis'];
     const CAT_LABELS = { 'jarvis': 'Jarvis', 'ai-news': 'AI动态', 'ai-thinking': 'AI产品思考', 'ai-technology': 'AI产品技术' };
@@ -242,10 +243,31 @@ ADMIN_HTML = """<!doctype html>
     function fileAltText(fileName) {
       return String(fileName || "image").replace(/\\.[^.]+$/, "").replace(/[-_]+/g, " ").trim() || "image";
     }
-    function insertAtCursor(text) {
+    function captureEditorPosition() {
       const editor = $("body");
-      const start = editor.selectionStart ?? editor.value.length;
-      const end = editor.selectionEnd ?? editor.value.length;
+      return {
+        start: editor.selectionStart ?? editor.value.length,
+        end: editor.selectionEnd ?? editor.value.length,
+        editorScrollTop: editor.scrollTop,
+        windowScrollX: window.scrollX,
+        windowScrollY: window.scrollY
+      };
+    }
+    function restoreEditorScroll(state) {
+      if (!state) return;
+      const editor = $("body");
+      editor.scrollTop = state.editorScrollTop;
+      window.scrollTo(state.windowScrollX, state.windowScrollY);
+      requestAnimationFrame(() => {
+        editor.scrollTop = state.editorScrollTop;
+        window.scrollTo(state.windowScrollX, state.windowScrollY);
+      });
+    }
+    function insertAtCursor(text, positionState) {
+      const editor = $("body");
+      const state = positionState || captureEditorPosition();
+      const start = state.start ?? editor.value.length;
+      const end = state.end ?? editor.value.length;
       const before = editor.value.slice(0, start);
       const after = editor.value.slice(end);
       const prefix = before && !before.endsWith("\\n") ? "\\n\\n" : "";
@@ -254,6 +276,7 @@ ADMIN_HTML = """<!doctype html>
       const next = (before + prefix + text).length;
       editor.focus();
       editor.setSelectionRange(next, next);
+      restoreEditorScroll(state);
     }
     async function extractPdfText(file) {
       const pdfjs = window.pdfjsLib;
@@ -498,6 +521,7 @@ ADMIN_HTML = """<!doctype html>
         $("status").textContent = "PDF 条目不能插入图片";
         return;
       }
+      imageInsertState = captureEditorPosition();
       $("imageInput").click();
     };
     $("imageInput").onchange = async (e) => {
@@ -515,11 +539,12 @@ ADMIN_HTML = """<!doctype html>
             alt: fileAltText(file.name)
           })
         });
-        insertAtCursor(saved.markdown || `![${fileAltText(file.name)}](${saved.url})`);
+        insertAtCursor(saved.markdown || `![${fileAltText(file.name)}](${saved.url})`, imageInsertState);
         $("status").textContent = "图片已插入，请保存文章";
       } catch (error) {
         $("status").textContent = formatError(error);
       } finally {
+        imageInsertState = null;
         e.target.value = "";
       }
     };

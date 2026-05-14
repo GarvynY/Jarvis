@@ -24,12 +24,15 @@ PASSWORD = "20260422GY"
 WEB_ROOT = "/var/www/garvynlabs"
 
 
-def make_tar_bytes(source_dir: Path) -> bytes:
+def make_tar_bytes(source_dir: Path, *, exclude_top_dirs: set[str] | None = None) -> bytes:
+    exclude_top_dirs = exclude_top_dirs or set()
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tar:
         for path in sorted(source_dir.rglob("*")):
             if path.is_file():
                 arcname = path.relative_to(source_dir)
+                if arcname.parts and arcname.parts[0] in exclude_top_dirs:
+                    continue
                 tar.add(str(path), arcname=str(arcname))
     return buf.getvalue()
 
@@ -57,8 +60,8 @@ def main() -> None:
     sftp = ssh.open_sftp()
 
     # ── pack and upload ───────────────────────────────────────────────────
-    print("Packing web/public ...")
-    web_tar = make_tar_bytes(WEB_PUBLIC)
+    print("Packing web/public (excluding content) ...")
+    web_tar = make_tar_bytes(WEB_PUBLIC, exclude_top_dirs={"content"})
     print(f"  {len(web_tar)//1024} KB -> /tmp/garvynlabs-web.tar.gz")
     upload_bytes(sftp, web_tar, "/tmp/garvynlabs-web.tar.gz")
 
@@ -76,6 +79,12 @@ def main() -> None:
 
     run(ssh, f"mkdir -p {WEB_ROOT}")
     run(ssh, f"tar xzf /tmp/garvynlabs-web.tar.gz -C {WEB_ROOT}")
+    run(ssh, f"mkdir -p {WEB_ROOT}/content")
+    run(
+        ssh,
+        f"test -f {WEB_ROOT}/content/manifest.json || "
+        f"printf '%s\\n' '{{\"articles\":[],\"updatedAt\":\"\"}}' > {WEB_ROOT}/content/manifest.json",
+    )
     print("  [ok] web files deployed")
 
     run(ssh, "mkdir -p /opt/GarvynLabs/api")

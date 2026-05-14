@@ -155,6 +155,7 @@ Admin 后端提供少量内部 API：
 ## 部署
 
 部署脚本读取仓库根目录的 `.env.deploy`，同步前台静态文件和 admin 服务到 VPS，并重启 `garvynlabs-admin`。
+部署默认不会同步 `apps/web/public/content/` 里的样本文章，避免生产服务器上已删除的样本内容在后续部署时被重新补回。首次空服务器只会创建空的 `content/manifest.json`，之后文章应通过 admin 后台管理。
 
 ```bash
 cd GarvynLabs
@@ -163,7 +164,8 @@ bash deploy/scripts/deploy-static.sh
 
 部署脚本会执行：
 
-- 同步 `apps/web/public/` 到 `/var/www/garvynlabs`。
+- 同步 `apps/web/public/` 中除 `content/` 以外的前台静态文件到 `/var/www/garvynlabs`。
+- 如果远端没有 `content/manifest.json`，创建空 manifest；不会补种样本文章。
 - 同步 `apps/api/server.py` 到远端 admin 目录。
 - 写入或更新 systemd 服务。
 - `systemctl restart garvynlabs-admin`。

@@ -15,7 +15,6 @@ USER="${DEPLOY_USER:-root}"
 WEB_ROOT="${WEB_ROOT:-/var/www/garvynlabs}"
 ARCHIVE="/tmp/garvynlabs-web.tar.gz"
 API_ARCHIVE="/tmp/garvynlabs-api.tar.gz"
-CONTENT_ARCHIVE="/tmp/garvynlabs-content-seed.tar.gz"
 
 SSH_RUN=(ssh)
 SCP_RUN=(scp)
@@ -33,22 +32,17 @@ if [[ -n "${DEPLOY_PASS:-}" ]]; then
 fi
 
 tar -C "$ROOT_DIR/apps/web/public" --exclude="./content" -czf "$ARCHIVE" .
-tar -C "$ROOT_DIR/apps/web/public" -czf "$CONTENT_ARCHIVE" ./content
 tar -C "$ROOT_DIR/apps/api" -czf "$API_ARCHIVE" .
 "${SCP_RUN[@]}" "$ARCHIVE" "$USER@$HOST:/tmp/garvynlabs-web.tar.gz"
-"${SCP_RUN[@]}" "$CONTENT_ARCHIVE" "$USER@$HOST:/tmp/garvynlabs-content-seed.tar.gz"
 "${SCP_RUN[@]}" "$API_ARCHIVE" "$USER@$HOST:/tmp/garvynlabs-api.tar.gz"
 "${SCP_RUN[@]}" "$ROOT_DIR/deploy/nginx/garvynlabs.conf" "$USER@$HOST:/tmp/garvynlabs.conf"
 
 "${SSH_RUN[@]}" "$USER@$HOST" "set -e
 mkdir -p '$WEB_ROOT'
 tar xzf /tmp/garvynlabs-web.tar.gz -C '$WEB_ROOT'
-if [ -f '$WEB_ROOT/content/manifest.json' ]; then
-  cp '$WEB_ROOT/content/manifest.json' /tmp/garvynlabs-manifest-backup.json
-fi
-tar xzf /tmp/garvynlabs-content-seed.tar.gz -C '$WEB_ROOT' --skip-old-files
-if [ -f /tmp/garvynlabs-manifest-backup.json ]; then
-  cp /tmp/garvynlabs-manifest-backup.json '$WEB_ROOT/content/manifest.json'
+mkdir -p '$WEB_ROOT/content'
+if [ ! -f '$WEB_ROOT/content/manifest.json' ]; then
+  printf '%s\n' '{\"articles\":[],\"updatedAt\":\"\"}' > '$WEB_ROOT/content/manifest.json'
 fi
 mkdir -p /opt/GarvynLabs/api
 tar xzf /tmp/garvynlabs-api.tar.gz -C /opt/GarvynLabs/api
