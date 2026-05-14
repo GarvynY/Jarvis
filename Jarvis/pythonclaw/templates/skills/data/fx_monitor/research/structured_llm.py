@@ -9,9 +9,22 @@ keys, and one or more repair calls with a focused prompt.
 from __future__ import annotations
 
 import json
+import logging
+import os
 import re
 from dataclasses import dataclass, field
 from typing import Any, Callable
+
+_log = logging.getLogger(__name__)
+
+if os.environ.get("FX_AUDIT_DEBUG", ""):
+    _log.setLevel(logging.DEBUG)
+    if not any(h for h in _log.handlers if getattr(h, "_audit", False)):
+        _h = logging.StreamHandler()
+        _h.setLevel(logging.DEBUG)
+        _h.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+        _h._audit = True  # type: ignore[attr-defined]
+        _log.addHandler(_h)
 
 LLMCall = Callable[[str, str, int], tuple[str, dict[str, int]]]
 JSONValidator = Callable[[dict[str, Any]], None]
@@ -101,10 +114,19 @@ def call_json_with_repair(
     last_error: Exception | None = None
 
     for attempt in range(repair_retries + 1):
+        is_repair = attempt > 0
+        _log.debug(
+            "[AUDIT][structured_llm] attempt=%d/%d repair=%s prompt_len=%d",
+            attempt + 1, repair_retries + 1, is_repair, len(current_prompt),
+        )
         text, usage = call_llm(current_prompt, system, max_tokens)
         last_text = text or ""
         for key in ("prompt_tokens", "completion_tokens"):
             total_usage[key] += int((usage or {}).get(key, 0) or 0)
+        _log.debug(
+            "[AUDIT][structured_llm] attempt=%d response_len=%d",
+            attempt + 1, len(last_text),
+        )
 
         try:
             if not last_text:
@@ -121,6 +143,10 @@ def call_json_with_repair(
             )
         except Exception as exc:  # noqa: BLE001
             last_error = exc
+            _log.info(
+                "[AUDIT][structured_llm] attempt=%d parse_error: %s: %s",
+                attempt + 1, type(exc).__name__, exc,
+            )
             if attempt >= repair_retries:
                 break
             current_prompt = build_repair_prompt(

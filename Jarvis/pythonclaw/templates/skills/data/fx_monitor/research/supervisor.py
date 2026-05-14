@@ -57,6 +57,15 @@ except ImportError:
 
 _log = logging.getLogger(__name__)
 
+if os.environ.get("FX_AUDIT_DEBUG", ""):
+    _log.setLevel(logging.DEBUG)
+    if not any(h for h in _log.handlers if getattr(h, "_audit", False)):
+        _h = logging.StreamHandler()
+        _h.setLevel(logging.DEBUG)
+        _h.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+        _h._audit = True  # type: ignore[attr-defined]
+        _log.addHandler(_h)
+
 # ── Constants ─────────────────────────────────────────────────────────────────
 
 _LLM_MODEL      = "deepseek-chat"
@@ -388,8 +397,22 @@ async def _run_llm_with_json_retries(
     """Call the supervisor LLM and retry JSON repair up to two times."""
     if context_pack is not None and context_pack.items:
         system, user = _build_prompt_from_context_pack(task, preset, context_pack)
+        prompt_path = "context_pack"
     else:
         system, user = _build_prompt(task, preset, outputs)
+        prompt_path = "agent_output"
+
+    _log.info(
+        "[AUDIT][supervisor][task=%s] prompt_path=%s system_len=%d user_len=%d",
+        task.task_id, prompt_path, len(system), len(user),
+    )
+    _log.debug(
+        "[AUDIT][supervisor][task=%s] system_prompt:\n%s", task.task_id, system,
+    )
+    _log.debug(
+        "[AUDIT][supervisor][task=%s] user_prompt:\n%s", task.task_id, user,
+    )
+
     schema_hint = (
         "{\n"
         '  "conclusion": "...",\n'
@@ -414,6 +437,23 @@ async def _run_llm_with_json_retries(
                 schema_hint=schema_hint,
             ),
         )
+
+    _log.info(
+        "[AUDIT][supervisor][task=%s] llm_result ok=%s attempts=%d "
+        "prompt_tokens=%d completion_tokens=%d response_len=%d",
+        task.task_id, result.ok, result.attempts,
+        result.token_usage.get("prompt_tokens", 0),
+        result.token_usage.get("completion_tokens", 0),
+        len(result.text),
+    )
+    if result.error:
+        _log.warning(
+            "[AUDIT][supervisor][task=%s] llm_error: %s",
+            task.task_id, result.error,
+        )
+    _log.debug(
+        "[AUDIT][supervisor][task=%s] raw_response:\n%s", task.task_id, result.text,
+    )
 
     if not result.ok or result.data is None:
         return None
