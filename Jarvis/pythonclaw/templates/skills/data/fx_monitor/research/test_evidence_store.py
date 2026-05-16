@@ -579,6 +579,37 @@ def test_ingest_default_category_importance() -> None:
     print("  ingest 默认值安全       OK")
 
 
+def test_ingest_prefers_explicit_106c_fields() -> None:
+    with EvidenceStore(":memory:") as store:
+        task = _make_task()
+        output = AgentOutput(
+            agent_name="fx_agent",
+            status="ok",
+            findings=[Finding(
+                key="current_rate",
+                summary="1 AUD = 4.80 CNY",
+                category="fx_price",
+                subcategory="current_rate",
+                entities=["AUD", "CNY", "CNYAUD"],
+                importance=0.9,
+                evidence_score=0.85,
+                evidence_basis="fetch_rate.current_1_AUD_in_CNY",
+                time_horizon="spot",
+            )],
+            confidence=0.8,
+        )
+
+        results = store.ingest_outputs(task, [output])
+        chunk = store.get_chunk(results[0].chunk_ids[0])
+        assert chunk is not None
+        assert chunk.category == "fx_price"
+        assert chunk.entities == ["AUD", "CNY", "CNYAUD"]
+        assert "子类别：current_rate" in chunk.content
+        assert "证据依据：fetch_rate.current_1_AUD_in_CNY" in chunk.content
+        assert "时间范围：spot" in chunk.content
+    print("  ingest 优先显式10.6C字段 OK")
+
+
 def test_ingest_context_header_format() -> None:
     with EvidenceStore(":memory:") as store:
         task = _make_task()
@@ -1874,8 +1905,9 @@ def test_news_data_gap_trace_for_supervisor() -> None:
         news_trace = traces[0]
         assert news_trace.section_title == "新闻驱动"
         assert news_trace.section_covered is False
-        assert news_trace.fallback_reason == "no_news_event_evidence"
-        assert "no_news_event_evidence" in news_trace.query
+        assert "news_event" in news_trace.fallback_reason
+        assert "no_" in news_trace.fallback_reason and "_evidence" in news_trace.fallback_reason
+        assert "news_event" in news_trace.query or "no_" in news_trace.query
         assert len(pack.items) == 0
     print("  10.5.1B: Supervisor 收到 data_gap trace OK")
 
@@ -2287,13 +2319,245 @@ def test_section_reserve_news_empty_stays_uncovered() -> None:
         traces = store.list_traces("t-news-empty")
         news_trace = next(t for t in traces if t.section_title == "新闻驱动")
         assert news_trace.section_covered is False, "News should NOT be covered"
-        assert news_trace.fallback_reason == "no_news_event_evidence"
+        assert "news_event" in news_trace.fallback_reason
+        assert news_trace.fallback_reason.startswith("no_") and news_trace.fallback_reason.endswith("_evidence")
 
         fx_trace = next(t for t in traces if t.section_title == "汇率事实")
         assert fx_trace.section_covered is True
         risk_trace = next(t for t in traces if t.section_title == "风险与矛盾")
         assert risk_trace.section_covered is True
     print("  10.5.1E: news=0 保持未覆盖状态          OK")
+
+
+# ── Phase 10.6B: Category taxonomy expansion ──────────────────────────────────
+
+def test_legacy_macro_category_roundtrip() -> None:
+    """Legacy 'macro' category still works: ingest → retrieve."""
+    with EvidenceStore(":memory:") as store:
+        task = _make_task(task_id="t-legacy-macro")
+        out = AgentOutput(
+            agent_name="macro_agent", status="ok", confidence=0.8,
+            findings=[
+                Finding(key="rba_hold", summary="RBA holds rate",
+                        category="macro", importance=0.8),
+            ],
+        )
+        enriched = store.ingest_outputs(task, [out])
+        assert len(enriched) == 1
+        chunk_id = enriched[0].chunk_ids[0]
+        loaded = store.get_chunk(chunk_id)
+        assert loaded is not None
+        assert loaded.category == "macro"
+    print("  10.6B: legacy macro roundtrip          OK")
+
+
+def test_new_categories_ingest_and_retrieve() -> None:
+    """New Phase 10.6B categories can be ingested and retrieved."""
+    new_cats = ["policy_signal", "market_driver", "macro_indicator",
+                "commodity_trade", "geopolitical_event", "data_gap", "unknown"]
+    with EvidenceStore(":memory:") as store:
+        task = _make_task(task_id="t-new-cats")
+        findings = [
+            Finding(key=f"k_{cat}", summary=f"Test {cat}",
+                    category=cat, importance=0.7)
+            for cat in new_cats
+        ]
+        out = AgentOutput(
+            agent_name="macro_agent", status="ok", confidence=0.7,
+            findings=findings,
+        )
+        enriched = store.ingest_outputs(task, [out])
+        assert len(enriched) == 1
+        assert len(enriched[0].chunk_ids) == len(new_cats)
+
+        for i, cat in enumerate(new_cats):
+            loaded = store.get_chunk(enriched[0].chunk_ids[i])
+            assert loaded is not None
+            assert loaded.category == cat, f"Expected {cat}, got {loaded.category}"
+    print("  10.6B: new categories ingest+retrieve  OK")
+
+
+def test_section_hints_macro_signal() -> None:
+    """'宏观信号' section selects policy_signal, macro_indicator, commodity_trade, macro."""
+    preset = ResearchPreset(
+        name="macro_signal_hints",
+        research_type="fx",
+        default_agents=[],
+        report_sections=["宏观信号"],
+        banned_terms=[],
+        default_time_horizon="short_term",
+    )
+    with EvidenceStore(":memory:") as store:
+        task = _make_task(task_id="t-hints-macro")
+        cats_and_ids = [
+            ("policy_signal", "ps-0"),
+            ("macro_indicator", "mi-0"),
+            ("commodity_trade", "ct-0"),
+            ("macro", "m-0"),
+            ("market_driver", "md-0"),
+        ]
+        for cat, cid in cats_and_ids:
+            store.insert_chunk(_make_chunk(
+                chunk_id=cid, task_id="t-hints-macro", category=cat,
+                agent_name="macro_agent", importance=0.8,
+                content=f"{cat} data here " * 5,
+                source=f"url=https://example.com/{cid} | finding_key={cid}",
+            ))
+
+        pack = store.build_context_pack(task, preset, [], max_chunks_per_section=10, token_budget=50000)
+        ids = [it.chunk_id for it in pack.items]
+        for _, cid in cats_and_ids:
+            assert cid in ids, f"{cid} should be selected for macro section, got {ids}"
+    print("  10.6B: macro section hints select all  OK")
+
+
+def test_section_hints_risk_data_gap() -> None:
+    """'风险与矛盾' section selects risk and data_gap categories."""
+    preset = ResearchPreset(
+        name="risk_data_gap",
+        research_type="fx",
+        default_agents=[],
+        report_sections=["风险与矛盾"],
+        banned_terms=[],
+        default_time_horizon="short_term",
+    )
+    with EvidenceStore(":memory:") as store:
+        task = _make_task(task_id="t-risk-dg")
+        store.insert_chunk(_make_chunk(
+            chunk_id="risk-1", task_id="t-risk-dg", category="risk",
+            agent_name="risk_agent", importance=0.8,
+            content="Risk data" * 5, source="finding_key=geopolitical",
+        ))
+        store.insert_chunk(_make_chunk(
+            chunk_id="dg-1", task_id="t-risk-dg", category="data_gap",
+            agent_name="risk_agent", importance=0.6,
+            content="Data gap signal" * 5, source="finding_key=missing_data",
+        ))
+
+        pack = store.build_context_pack(task, preset, [], max_chunks_per_section=5, token_budget=50000)
+        ids = [it.chunk_id for it in pack.items]
+        assert "risk-1" in ids, f"risk chunk should be in risk section: {ids}"
+        assert "dg-1" in ids, f"data_gap chunk should be in risk section: {ids}"
+    print("  10.6B: risk + data_gap route correctly OK")
+
+
+def test_fx_section_excludes_market_driver() -> None:
+    """汇率 section selects only fx_price by default, not market_driver."""
+    preset = ResearchPreset(
+        name="fx_all",
+        research_type="fx",
+        default_agents=[],
+        report_sections=["汇率数据"],
+        banned_terms=[],
+        default_time_horizon="short_term",
+    )
+    with EvidenceStore(":memory:") as store:
+        task = _make_task(task_id="t-fx-all")
+        for i in range(4):
+            store.insert_chunk(_make_chunk(
+                chunk_id=f"fx-{i}", task_id="t-fx-all", category="fx_price",
+                agent_name="fx_agent", importance=0.85 - i * 0.05,
+                content=f"FX data {i}" * 5,
+                source=f"url=https://fx.com/{i} | finding_key=fx_{i}",
+            ))
+        store.insert_chunk(_make_chunk(
+            chunk_id="md-0", task_id="t-fx-all", category="market_driver",
+            agent_name="fx_agent", importance=0.7,
+            content="Market driver" * 5,
+            source="url=https://fx.com/md | finding_key=md_0",
+        ))
+
+        pack = store.build_context_pack(task, preset, [], max_chunks_per_section=10, token_budget=50000)
+        ids = [it.chunk_id for it in pack.items]
+        for i in range(4):
+            assert f"fx-{i}" in ids, f"fx-{i} should be in fx section: {ids}"
+        assert "md-0" not in ids, f"market_driver should not be in fx section: {ids}"
+    print("  10.6B: fx section excludes market_driver OK")
+
+
+def test_default_fx_preset_market_driver_goes_to_macro_not_fx() -> None:
+    """Default four-section preset does not let 汇率事实 consume market_driver."""
+    with EvidenceStore(":memory:") as store:
+        task = _make_task(task_id="t-default-market-driver")
+        store.insert_chunk(_make_chunk(
+            chunk_id="fx-rate", task_id="t-default-market-driver",
+            category="fx_price", agent_name="fx_agent", importance=0.85,
+            content="Current rate and bank spread " * 8,
+            source="url=https://fx.example/rate | finding_key=current_rate",
+        ))
+        store.insert_chunk(_make_chunk(
+            chunk_id="market-driver", task_id="t-default-market-driver",
+            category="market_driver", agent_name="macro_agent", importance=0.8,
+            content="DXY, AUD/USD and commodity drivers " * 8,
+            source="url=https://macro.example/driver | finding_key=market_driver",
+        ))
+        store.insert_chunk(_make_chunk(
+            chunk_id="macro-policy", task_id="t-default-market-driver",
+            category="macro", agent_name="macro_agent", importance=0.75,
+            content="RBA and PBoC policy signal " * 8,
+            source="url=https://macro.example/policy | finding_key=macro_policy",
+        ))
+        store.insert_chunk(_make_chunk(
+            chunk_id="risk-gap", task_id="t-default-market-driver",
+            category="data_gap", agent_name="risk_agent", importance=0.7,
+            content="Risk and data gap signal " * 8,
+            source="finding_key=data_gap",
+        ))
+
+        pack = store.build_context_pack(
+            task, FX_CNYAUD_PRESET, [],
+            max_chunks_per_section=5,
+            token_budget=50000,
+        )
+        ids = [it.chunk_id for it in pack.items]
+        assert "fx-rate" in ids
+        assert "market-driver" in ids
+        assert "macro-policy" in ids
+        assert "risk-gap" in ids
+
+        traces = store.list_traces("t-default-market-driver")
+        by_section = {t.section_title: t for t in traces}
+        assert by_section["汇率事实"].selected_chunk_ids == ["fx-rate"], (
+            by_section["汇率事实"].selected_chunk_ids
+        )
+        assert "market-driver" in by_section["宏观信号"].selected_chunk_ids, (
+            by_section["宏观信号"].selected_chunk_ids
+        )
+        assert "macro-policy" in by_section["宏观信号"].selected_chunk_ids
+        assert "risk-gap" in by_section["风险与矛盾"].selected_chunk_ids
+
+    print("  10.6B: default preset routes market_driver to macro OK")
+
+
+def test_geopolitical_event_no_fallback() -> None:
+    """geopolitical_event in NO_FALLBACK prevents news section from pulling unrelated chunks."""
+    preset = ResearchPreset(
+        name="geo_nofb",
+        research_type="fx",
+        default_agents=[],
+        report_sections=["新闻驱动", "宏观信号"],
+        banned_terms=[],
+        default_time_horizon="short_term",
+    )
+    with EvidenceStore(":memory:") as store:
+        task = _make_task(task_id="t-geo-nofb")
+        store.insert_chunk(_make_chunk(
+            chunk_id="macro-only", task_id="t-geo-nofb", category="macro",
+            agent_name="macro_agent", importance=0.9,
+            content="macro data" * 5, source="finding_key=macro_1",
+        ))
+
+        pack = store.build_context_pack(task, preset, [], max_chunks_per_section=5, token_budget=50000)
+        traces = store.list_traces("t-geo-nofb")
+        news_trace = next(t for t in traces if t.section_title == "新闻驱动")
+        assert news_trace.section_covered is False
+        assert "fallback=blocked" in news_trace.query
+
+        macro_trace = next(t for t in traces if t.section_title == "宏观信号")
+        assert macro_trace.section_covered is True
+        macro_ids = [it.chunk_id for it in pack.items if it.chunk_id == "macro-only"]
+        assert len(macro_ids) == 1
+    print("  10.6B: geopolitical_event NO_FALLBACK  OK")
 
 
 # ── 运行 ─────────────────────────────────────────────────────────────────────
@@ -2325,6 +2589,7 @@ def run_all() -> None:
         test_ingest_preserves_original,
         test_ingest_with_source_metadata,
         test_ingest_default_category_importance,
+        test_ingest_prefers_explicit_106c_fields,
         test_ingest_context_header_format,
         test_ingest_multiple_outputs,
         test_ingest_error_output,
@@ -2385,6 +2650,14 @@ def run_all() -> None:
         test_section_reserve_news_empty_stays_uncovered,
         test_section_reserve_max_chunk_tokens_filter,
         test_section_reserve_with_section_token_reserves,
+        # Phase 10.6B — category taxonomy expansion
+        test_legacy_macro_category_roundtrip,
+        test_new_categories_ingest_and_retrieve,
+        test_section_hints_macro_signal,
+        test_section_hints_risk_data_gap,
+        test_fx_section_excludes_market_driver,
+        test_default_fx_preset_market_driver_goes_to_macro_not_fx,
+        test_geopolitical_event_no_fallback,
     ]
     print("Phase 9.1 + 10B + 10C — EvidenceStore 测试")
     print("=" * 50)

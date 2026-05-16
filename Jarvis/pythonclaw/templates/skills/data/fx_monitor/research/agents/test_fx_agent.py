@@ -460,6 +460,35 @@ async def test_no_ambiguous_ticker_direction() -> None:
     print("   PASS")
 
 
+async def test_explicit_category_subcategory_entities() -> None:
+    """10.6C: FX findings expose category/subcategory/entities without fallback."""
+    with _mock_fetch(_MOCK_FULL):
+        output = await FXAgent().run(_make_task(target_rate=4.85))
+
+    expected = {
+        "current_rate": "current_rate",
+        "bank_spread": "bank_spread",
+        "historical_trend": "historical_trend",
+        "recent_range": "recent_range",
+        "target_rate_gap": "target_gap",
+    }
+    by_key = {f.key: f for f in output.findings}
+    for key, subcategory in expected.items():
+        finding = by_key[key]
+        assert finding.category == "fx_price"
+        assert finding.subcategory == subcategory
+        assert finding.importance > 0
+        assert finding.evidence_score is not None
+        assert {"AUD", "CNY", "CNYAUD"}.issubset(set(finding.entities))
+
+    hist = by_key["historical_trend"]
+    assert hist.direction_for_pair == hist.direction
+
+    print("\n-- test_explicit_category_subcategory_entities")
+    print(f"   checked={sorted(expected)}")
+    print("   PASS")
+
+
 # ── Runner ────────────────────────────────────────────────────────────────────
 
 async def main() -> None:
@@ -479,8 +508,9 @@ async def main() -> None:
     await test_cny_per_aud_decrease_direction()
     await test_cny_per_aud_increase_direction()
     await test_no_ambiguous_ticker_direction()
+    await test_explicit_category_subcategory_entities()
     print("\n" + "=" * 60)
-    print("All 14 tests passed.")
+    print("All 15 tests passed.")
 
 
 if __name__ == "__main__":

@@ -423,9 +423,33 @@ async def test_detail_direction_cleared() -> None:
         assert f.direction is None, (
             f"{f.key} should have direction=None, got {f.direction!r}"
         )
+        assert f.category == "macro"
+        assert f.subcategory == "macro_detail"
+        assert f.direction_for_pair is None
 
     print("\n-- test_detail_direction_cleared")
     print(f"   {len(details)} detail findings, all direction=None")
+    print("   PASS")
+
+
+async def test_policy_signals_are_typed() -> None:
+    """10.6C: high-level RBA/PBoC/Fed signals use policy_signal metadata."""
+    with _mock_search_ok(), _mock_llm_ok():
+        output = await MacroAgent().run(_make_task())
+
+    by_key = {f.key: f for f in output.findings}
+    for key in ("macro_rba", "macro_pboc", "macro_usd"):
+        finding = by_key[key]
+        assert finding.category == "policy_signal"
+        assert finding.subcategory
+        assert finding.evidence_basis
+        assert finding.importance > 0
+    assert "RBA" in by_key["macro_rba"].entities
+    assert "PBoC" in by_key["macro_pboc"].entities
+    assert "Fed" in by_key["macro_usd"].entities
+
+    print("\n-- test_policy_signals_are_typed")
+    print("   policy_signal metadata present for macro_rba/macro_pboc/macro_usd")
     print("   PASS")
 
 
@@ -568,13 +592,14 @@ async def main() -> None:
     await test_banned_terms_and_fabricated_findings_sanitized()
     # Phase 10.5.1C — direction stabilisation
     await test_detail_direction_cleared()
+    await test_policy_signals_are_typed()
     await test_macro_usd_weak_evidence()
     await test_rba_pboc_directions_preserved()
     await test_risk_agent_direction_count_stable()
     test_stabilise_directions_unit()
 
     print("\n" + "=" * 60)
-    print("All 15 tests passed.")
+    print("All 16 tests passed.")
 
 
 if __name__ == "__main__":

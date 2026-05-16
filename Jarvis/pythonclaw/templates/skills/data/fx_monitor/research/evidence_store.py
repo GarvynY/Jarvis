@@ -55,13 +55,24 @@ except ImportError:
     fallback_score = None  # type: ignore[assignment]
 
 try:
+    from source_metadata import (
+        SourceMetadata,
+        source_metadata_from_source_ref,
+        source_metadata_from_legacy_string,
+    )
+except ImportError:
+    SourceMetadata = None  # type: ignore[assignment,misc]
+    source_metadata_from_source_ref = None  # type: ignore[assignment]
+    source_metadata_from_legacy_string = None  # type: ignore[assignment]
+
+try:
     from conflict_detector import detect_conflicts, apply_conflict_boost, ConflictSummary
 except ImportError:
     detect_conflicts = None  # type: ignore[assignment]
     apply_conflict_boost = None  # type: ignore[assignment]
     ConflictSummary = None  # type: ignore[assignment,misc]
 
-_SCHEMA_VERSION = 5
+_SCHEMA_VERSION = 6
 
 _DDL = """\
 CREATE TABLE IF NOT EXISTS evidence_chunks (
@@ -87,7 +98,8 @@ CREATE TABLE IF NOT EXISTS evidence_chunks (
     score_source_quality REAL NOT NULL DEFAULT 0.0,
     score_user_relevance REAL NOT NULL DEFAULT 0.0,
     score_conflict_value REAL NOT NULL DEFAULT 0.0,
-    score_reason TEXT NOT NULL DEFAULT ''
+    score_reason TEXT NOT NULL DEFAULT '',
+    source_metadata_json TEXT NOT NULL DEFAULT '{}'
 );
 
 CREATE INDEX IF NOT EXISTS idx_chunks_task     ON evidence_chunks(task_id);
@@ -192,6 +204,8 @@ class EvidenceStore:
             self._migrate_to_v4(cur)
         if current_version < 5:
             self._migrate_to_v5(cur)
+        if current_version < 6:
+            self._migrate_to_v6(cur)
         if row is None:
             cur.execute(
                 "INSERT INTO schema_version (version) VALUES (?)",
@@ -268,6 +282,18 @@ class EvidenceStore:
         except Exception:
             pass
 
+    def _migrate_to_v6(self, cur: Any) -> None:
+        """Add source_metadata_json column to evidence_chunks."""
+        try:
+            cur.execute(
+                "ALTER TABLE evidence_chunks ADD COLUMN source_metadata_json TEXT NOT NULL DEFAULT '{}'"
+            )
+        except Exception as exc:
+            if "duplicate column" in str(exc).lower() or "already exists" in str(exc).lower():
+                pass
+            else:
+                _log.warning("_migrate_to_v6 non-duplicate error (ignored): %s", exc)
+
     def close(self) -> None:
         self._conn.close()
 
@@ -287,8 +313,9 @@ class EvidenceStore:
                 used_in_brief, created_at, ttl_policy, token_estimate,
                 attention_score, composite_score, score_importance,
                 score_confidence, score_recency, score_source_quality,
-                score_user_relevance, score_conflict_value, score_reason)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                score_user_relevance, score_conflict_value, score_reason,
+                source_metadata_json)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 chunk.chunk_id,
                 chunk.task_id,
@@ -313,6 +340,7 @@ class EvidenceStore:
                 chunk.score_user_relevance,
                 chunk.score_conflict_value,
                 chunk.score_reason,
+                chunk.source_metadata_json,
             ),
         )
         self._conn.commit()
@@ -499,10 +527,14 @@ class EvidenceStore:
     # ── 摄取 ─────────────────────────────────────────────────────────────────
 
     _AGENT_CATEGORY_DEFAULTS: dict[str, str] = {
-        "fx_agent":    "fx_price",
-        "news_agent":  "news_event",
-        "macro_agent": "macro",
-        "risk_agent":  "risk",
+        "fx_agent":              "fx_price",
+        "news_agent":            "news_event",
+        "macro_agent":           "macro",
+        "risk_agent":            "risk",
+        "market_drivers_agent":  "market_driver",
+        "policy_signal_agent":   "policy_signal",
+        "commodity_agent":       "commodity_trade",
+        "macro_indicator_agent": "macro_indicator",
     }
 
     def ingest_outputs(
@@ -532,7 +564,9 @@ class EvidenceStore:
                 )
                 if finding.key:
                     source_label = f"{source_label} | finding_key={finding.key}" if source_label else f"finding_key={finding.key}"
-                entities = list(task.focus_assets) if task.focus_assets else []
+                entities = list(finding.entities) if finding.entities else (
+                    list(task.focus_assets) if task.focus_assets else []
+                )
 
                 content = self._build_context_content(
                     task=task,
@@ -548,6 +582,21 @@ class EvidenceStore:
                 )
                 importance = finding.importance if finding.importance > 0 else output.confidence
 
+                source_meta_json = "{}"
+                if source_metadata_from_source_ref is not None:
+                    src_ref = None
+                    if finding.source_ids:
+                        for sid in finding.source_ids:
+                            if sid in source_map:
+                                src_ref = source_map[sid]
+                                break
+                    elif output.sources:
+                        src_ref = output.sources[0]
+                    if src_ref is not None:
+                        source_meta_json = source_metadata_from_source_ref(src_ref).to_json()
+                    elif source_label:
+                        source_meta_json = source_metadata_from_legacy_string(source_label).to_json()
+
                 chunk = EvidenceChunk(
                     task_id=task.task_id,
                     preset_name=task.preset_name,
@@ -559,6 +608,7 @@ class EvidenceStore:
                     confidence=output.confidence,
                     entities=entities,
                     token_estimate=len(content),
+                    source_metadata_json=source_meta_json,
                 )
                 self.insert_chunk(chunk)
                 chunk_ids.append(chunk.chunk_id)
@@ -637,15 +687,34 @@ class EvidenceStore:
             "[/Context]",
             finding.summary,
         ]
+        if finding.subcategory:
+            lines.insert(5, f"子类别：{finding.subcategory}")
+        if finding.evidence_basis:
+            lines.append(f"证据依据：{finding.evidence_basis}")
+        if finding.time_horizon:
+            lines.append(f"时间范围：{finding.time_horizon}")
+        direction_parts = []
+        if finding.direction_for_aud:
+            direction_parts.append(f"AUD={finding.direction_for_aud}")
+        if finding.direction_for_cny:
+            direction_parts.append(f"CNY={finding.direction_for_cny}")
+        if finding.direction_for_pair:
+            direction_parts.append(f"PAIR={finding.direction_for_pair}")
+        if direction_parts:
+            lines.append(f"方向拆分：{', '.join(direction_parts)}")
         return "\n".join(lines)
 
     # ── ContextPack 构建 ──────────────────────────────────────────────────────
 
     _SECTION_CATEGORY_HINTS: dict[str, list[str]] = {
+        # Keep market_driver out of FX fact sections. Market drivers explain
+        # why FX may move, so they belong to macro/market-driver analysis.
+        # Including them here lets the first section consume them via global
+        # dedup before "宏观信号" can use them.
         "汇率": ["fx_price"],
-        "新闻": ["news_event"],
-        "宏观": ["macro"],
-        "风险": ["risk"],
+        "新闻": ["news_event", "geopolitical_event"],
+        "宏观": ["policy_signal", "macro_indicator", "market_driver", "commodity_trade", "macro"],
+        "风险": ["risk", "data_gap"],
         "估值": ["valuation_absolute", "valuation_relative"],
         "财务": ["revenue_quality", "margin_quality", "cash_flow", "balance_sheet"],
         "竞争": ["competitive_moat", "market_position"],
@@ -653,16 +722,16 @@ class EvidenceStore:
         "监管": ["regulatory"],
         "催化": ["catalyst"],
         "rate": ["fx_price"],
-        "news": ["news_event"],
-        "macro": ["macro"],
-        "risk": ["risk"],
+        "news": ["news_event", "geopolitical_event"],
+        "macro": ["policy_signal", "macro_indicator", "market_driver", "commodity_trade", "macro"],
+        "risk": ["risk", "data_gap"],
     }
 
     # Categories that must NOT fall back to task_only when empty.
     # Rationale: task_only retrieval pulls unrelated chunks (macro, risk)
     # into the section, consuming them via global dedup and starving
     # downstream sections that actually need them.
-    _NO_FALLBACK_CATEGORIES: frozenset[str] = frozenset({"news_event"})
+    _NO_FALLBACK_CATEGORIES: frozenset[str] = frozenset({"news_event", "geopolitical_event"})
 
     @classmethod
     def _infer_categories(cls, section_title: str) -> list[str]:
@@ -1333,6 +1402,7 @@ class EvidenceStore:
             score_user_relevance=float(row["score_user_relevance"]),
             score_conflict_value=float(row["score_conflict_value"]),
             score_reason=row["score_reason"],
+            source_metadata_json=row["source_metadata_json"] if "source_metadata_json" in row.keys() else "{}",
         )
 
     @staticmethod

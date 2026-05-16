@@ -39,9 +39,10 @@ if str(_RESEARCH_DIR) not in sys.path:
 if str(_FX_MONITOR_DIR) not in sys.path:
     sys.path.insert(0, str(_FX_MONITOR_DIR))
 
-from schema import ResearchTask, SafeUserContext, AgentOutput, FX_CNYAUD_PRESET  # noqa: E402
+from schema import ResearchTask, SafeUserContext, AgentOutput, FX_CNYAUD_PRESET, Finding  # noqa: E402
 from agents.news_agent import (  # noqa: E402
     NewsAgent, _build_news_output, _collect_and_analyse, _NEWS_CACHE_FILE,
+    _news_finding,
 )
 
 
@@ -243,9 +244,81 @@ async def test_llm_ok() -> None:
         f"Expected non-trivial summary, got: {output.summary}"
     )
     json.dumps(output.to_dict(), ensure_ascii=False)
+    for f in output.findings:
+        assert f.category == "news_event"
+        assert f.subcategory
+        assert f.evidence_basis
+        assert {"AUD", "CNY", "CNYAUD"}.issubset(set(f.entities))
 
     print("\n-- test_llm_ok")
     _print_output(output)
+    print("   PASS")
+
+
+async def test_directional_news_sets_split_fields() -> None:
+    """10.6C fix: high-confidence AUD news fills legacy and split directions."""
+    finding = _news_finding(
+        idx=0,
+        article=_EXAMPLE_ARTICLES[0],
+        direction="bullish_aud",
+        confidence=0.60,
+    )
+
+    assert finding is not None
+    assert finding.direction == "bullish_aud"
+    assert finding.direction_for_aud == "bullish"
+    assert finding.direction_for_cny == "bearish"
+    assert finding.direction_for_pair == "bullish_aud"
+
+    print("\n-- test_directional_news_sets_split_fields")
+    print("   bullish_aud -> AUD=bullish, CNY=bearish, pair=bullish_aud")
+    print("   PASS")
+
+
+async def test_low_confidence_news_direction_fields_none() -> None:
+    """10.6C fix: low-confidence news does not carry directional fields."""
+    finding = _news_finding(
+        idx=0,
+        article={
+            "title": "General market headline mentions Australia",
+            "url": "https://example.com/weak",
+            "published": "Fri, 02 May 2026 08:00:00 +0000",
+            "snippet": "Broad market commentary without specific CNY/AUD evidence.",
+            "keyword": "general markets",
+        },
+        direction="bullish_aud",
+        confidence=0.40,
+    )
+
+    assert finding is not None
+    assert finding.direction is None
+    assert finding.direction_for_aud is None
+    assert finding.direction_for_cny is None
+    assert finding.direction_for_pair is None
+
+    print("\n-- test_low_confidence_news_direction_fields_none")
+    print("   low confidence clears legacy and split directional fields")
+    print("   PASS")
+
+
+async def test_news_direction_serialization_roundtrip() -> None:
+    """10.6C fix: legacy direction and split fields survive Finding round-trip."""
+    finding = _news_finding(
+        idx=0,
+        article=_EXAMPLE_ARTICLES[1],
+        direction="bearish_aud",
+        confidence=0.60,
+    )
+    assert finding is not None
+
+    restored = Finding.from_dict(finding.to_dict())
+    assert restored.direction == "bearish_aud"
+    assert restored.direction_for_aud == "bearish"
+    assert restored.direction_for_cny == "bullish"
+    assert restored.direction_for_pair == "bearish_aud"
+
+    print("\n-- test_news_direction_serialization_roundtrip")
+    print("   direction and direction_for_* fields round-trip through Finding JSON")
     print("   PASS")
 
 
@@ -414,6 +487,37 @@ async def test_stale_cache_no_recent_news() -> None:
     assert any("news_monitor_refresh_empty" in m for m in output.missing_data)
 
     print("\n-- test_stale_cache_no_recent_news")
+    _print_output(output)
+    print("   PASS")
+
+
+async def test_no_high_relevance_news_returns_empty() -> None:
+    """10.6C: weak/unrelated news is not converted into news_event findings."""
+    unrelated = [
+        {
+            "title": "Local sports team announces new stadium design",
+            "url": "https://example.com/unrelated/1",
+            "published": "Fri, 02 May 2026 08:00:00 +0000",
+            "snippet": "The story focuses only on venue financing and ticket allocation.",
+            "keyword": "sports",
+        },
+        {
+            "title": "Technology company unveils consumer device",
+            "url": "https://example.com/unrelated/2",
+            "published": "Fri, 02 May 2026 09:00:00 +0000",
+            "snippet": "The launch focuses on hardware pricing and retail availability.",
+            "keyword": "technology",
+        },
+    ]
+    with _mock_cache_ok(unrelated), _mock_llm_ok():
+        output = await NewsAgent().run(_make_task())
+
+    assert output.status == "partial"
+    assert output.findings == []
+    assert output.confidence == 0.0
+    assert "no_high_relevance_news" in output.missing_data
+
+    print("\n-- test_no_high_relevance_news_returns_empty")
     _print_output(output)
     print("   PASS")
 
@@ -627,6 +731,9 @@ async def main() -> None:
     await test_cache_missing()
     await test_cache_empty()
     await test_llm_ok()
+    await test_directional_news_sets_split_fields()
+    await test_low_confidence_news_direction_fields_none()
+    await test_news_direction_serialization_roundtrip()
     await test_llm_fallback()
     await test_sourceref_fields()
     await test_conflict_risk()
@@ -635,6 +742,7 @@ async def main() -> None:
     await test_banned_terms_sanitized()
     await test_stale_cache_refreshes()
     await test_stale_cache_no_recent_news()
+    await test_no_high_relevance_news_returns_empty()
     # Phase 10.5.2 tests
     await test_research_mode_returns_all_despite_seen()
     await test_research_mode_does_not_modify_seen_urls()
@@ -643,7 +751,7 @@ async def main() -> None:
     await test_news_agent_fallback_uses_research_mode()
 
     print("\n" + "=" * 60)
-    print("All 16 tests passed.")
+    print("All 20 tests passed.")
 
 
 if __name__ == "__main__":

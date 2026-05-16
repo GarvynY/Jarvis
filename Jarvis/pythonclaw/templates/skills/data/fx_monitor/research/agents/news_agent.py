@@ -88,6 +88,12 @@ _BANNED_TERMS: tuple[str, ...] = (
     "应该买", "应该卖", "最佳时机",
 )
 _SAFE_REPLACEMENT = "（已移除确定性建议）"
+_NEWS_ENTITIES_DEFAULT: list[str] = ["AUD", "CNY", "CNYAUD"]
+_HIGH_RELEVANCE_TERMS: tuple[str, ...] = (
+    "aud", "australian dollar", "aussie dollar", "cny", "yuan", "renminbi",
+    "rba", "reserve bank of australia", "pboc", "people's bank of china",
+    "usd/cny", "usd/cnh", "iron ore", "china demand", "australia china",
+)
 
 
 # ── Blocking helpers (mockable module-level functions) ────────────────────────
@@ -182,6 +188,139 @@ def _news_cache_stale(
     if article_ages and min(article_ages) > _ARTICLE_MAX_AGE_HOURS:
         return True, f"news_articles_stale:{min(article_ages):.0f}h"
     return False, None
+
+
+def _article_text(article: dict[str, Any]) -> str:
+    return " ".join(
+        str(article.get(k, "") or "")
+        for k in ("title", "snippet", "keyword")
+    ).lower()
+
+
+def _is_high_relevance_article(article: dict[str, Any]) -> bool:
+    text = _article_text(article)
+    if any(term in text for term in _HIGH_RELEVANCE_TERMS):
+        return True
+    return ("china" in text and "australia" in text) or ("澳" in text and "人民币" in text)
+
+
+def _filter_relevant_articles(articles: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [a for a in articles if _is_high_relevance_article(a)]
+
+
+def _infer_event_type(article: dict[str, Any]) -> str:
+    text = _article_text(article)
+    if any(term in text for term in ("rba", "reserve bank", "pboc", "central bank", "fed", "federal reserve")):
+        return "central_bank"
+    if any(term in text for term in ("iron ore", "commodity", "commodities")):
+        return "commodity"
+    if any(term in text for term in ("tariff", "trade war", "trade tensions", "exports")):
+        return "trade_policy"
+    if any(term in text for term in ("conflict", "crisis", "geopolitical")):
+        return "geopolitical"
+    if any(term in text for term in ("gdp", "inflation", "jobs", "growth")):
+        return "macro_data"
+    return "market_news"
+
+
+def _infer_entities(article: dict[str, Any]) -> list[str]:
+    text = _article_text(article)
+    entities: list[str] = []
+    checks = [
+        ("rba", "RBA"),
+        ("reserve bank", "RBA"),
+        ("pboc", "PBoC"),
+        ("people's bank", "PBoC"),
+        ("fed", "Fed"),
+        ("federal reserve", "Fed"),
+        ("usd", "USD"),
+        ("dollar", "USD"),
+        ("aud", "AUD"),
+        ("australian dollar", "AUD"),
+        ("aussie dollar", "AUD"),
+        ("australia", "AUD"),
+        ("cny", "CNY"),
+        ("yuan", "CNY"),
+        ("renminbi", "CNY"),
+        ("china", "CNY"),
+        ("iron ore", "Iron ore"),
+    ]
+    for needle, entity in checks:
+        if needle in text and entity not in entities:
+            entities.append(entity)
+    for entity in _NEWS_ENTITIES_DEFAULT:
+        if entity not in entities:
+            entities.append(entity)
+    return entities
+
+
+def _direction_fields(
+    direction: str | None,
+    confidence: float,
+) -> dict[str, str | None]:
+    if confidence < 0.55:
+        return {
+            "direction": None,
+            "direction_for_aud": None,
+            "direction_for_cny": None,
+            "direction_for_pair": None,
+        }
+    if direction == "bullish_aud":
+        return {
+            "direction": direction,
+            "direction_for_aud": "bullish",
+            "direction_for_cny": "bearish",
+            "direction_for_pair": direction,
+        }
+    if direction == "bearish_aud":
+        return {
+            "direction": direction,
+            "direction_for_aud": "bearish",
+            "direction_for_cny": "bullish",
+            "direction_for_pair": direction,
+        }
+    if direction == "neutral":
+        return {
+            "direction": direction,
+            "direction_for_aud": "neutral",
+            "direction_for_cny": "neutral",
+            "direction_for_pair": direction,
+        }
+    return {
+        "direction": None,
+        "direction_for_aud": None,
+        "direction_for_cny": None,
+        "direction_for_pair": None,
+    }
+
+
+def _news_finding(
+    *,
+    idx: int,
+    article: dict[str, Any],
+    direction: str | None,
+    confidence: float,
+) -> Finding | None:
+    title = article.get("title", "").strip()
+    if not title:
+        return None
+    event_type = _infer_event_type(article)
+    direction_payload = _direction_fields(direction, confidence)
+    return Finding(
+        key=f"news_{idx}",
+        summary=title,
+        direction=direction_payload.pop("direction"),
+        evidence_score=confidence,
+        category="news_event",
+        subcategory=event_type,
+        entities=_infer_entities(article),
+        importance=0.65 if confidence >= 0.55 else 0.5,
+        source_ids=[article.get("url", "")] if article.get("url") else [],
+        time_sensitivity="realtime",
+        time_horizon="news_cycle",
+        evidence_basis=f"event_type={event_type}; high_relevance_news_cache",
+        **direction_payload,
+    )
 
 
 # _call_llm is imported from llm_bridge (Anthropic → DeepSeek fallback)
@@ -281,12 +420,15 @@ def _parse_llm_response(
                         direction = str(item.get("direction", "neutral"))
                         if direction not in ("bullish_aud", "bearish_aud", "neutral"):
                             direction = "neutral"
-                        findings.append(Finding(
-                            key=f"news_{idx}",
-                            summary=title,
-                            direction=direction,
-                            source_ids=[art.get("url", "")] if art.get("url") else [],
-                        ))
+                        confidence = 0.6 if _is_high_relevance_article(art) else 0.4
+                        finding = _news_finding(
+                            idx=idx,
+                            article=art,
+                            direction=direction if confidence >= 0.55 else None,
+                            confidence=confidence,
+                        )
+                        if finding:
+                            findings.append(finding)
                 return findings[:_MAX_FINDINGS], risks, summary, unsafe_removed
         except Exception:
             pass
@@ -297,12 +439,16 @@ def _parse_llm_response(
         title = art.get("title", "").strip()
         if not title:
             continue
-        findings.append(Finding(
-            key=f"news_{i}",
-            summary=title,
-            direction=_heuristic_direction(title),
-            source_ids=[art.get("url", "")] if art.get("url") else [],
-        ))
+        direction = _heuristic_direction(title)
+        confidence = 0.55 if direction in ("bullish_aud", "bearish_aud") else 0.45
+        finding = _news_finding(
+            idx=i,
+            article=art,
+            direction=direction if confidence >= 0.55 else None,
+            confidence=confidence,
+        )
+        if finding:
+            findings.append(finding)
     return findings, [], f"基于 {len(findings)} 条新闻（LLM分析不可用，使用关键词启发式）", False
 
 
@@ -347,6 +493,15 @@ def _collect_and_analyse() -> dict[str, Any]:
             articles = refreshed
             updated_at = refresh_at
             cache_error = None
+
+    articles = _filter_relevant_articles(articles)
+    if not articles:
+        return {
+            "articles": [], "llm_text": "", "tokens": {},
+            "cache_error": None,
+            "updated_at": updated_at,
+            "no_high_relevance_news": True,
+        }
 
     prompt = _build_llm_prompt(articles)
     result = call_json_with_repair(
@@ -415,6 +570,21 @@ def _build_news_output(
     tokens: dict      = raw.get("tokens", {})
     updated_at: str   = raw.get("updated_at", now_iso())
     retrieved_at: str = now_iso()
+
+    if raw.get("no_high_relevance_news"):
+        return AgentOutput(
+            agent_name=agent_name,
+            status="partial",
+            summary="暂无高度相关的 CNY/AUD 新闻，新闻信号未纳入本次研究",
+            findings=[],
+            sources=[],
+            as_of=updated_at or retrieved_at,
+            confidence=0.0,
+            missing_data=["no_high_relevance_news"],
+            latency_ms=latency_ms,
+            token_usage={},
+            regulatory_flags=[],
+        )
 
     # ── LLM unavailable note ──────────────────────────────────────────────
     llm_used = bool(llm_text and tokens)

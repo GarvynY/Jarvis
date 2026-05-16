@@ -64,6 +64,10 @@ _HIGH_VOLATILITY_STD: float = 0.003
 _MAX_CONFIDENCE: float = 0.85
 _CACHE_TTL_SECONDS: float = 180.0
 _FETCH_CACHE: dict[tuple[str, int], tuple[float, dict[str, Any]]] = {}
+_FX_ENTITIES: list[str] = ["AUD", "CNY", "CNYAUD"]
+_MARKET_RATE_URL = "https://open.er-api.com/v6/latest/CNY"
+_BANK_RATE_URL = "https://www.usdrate.top/"
+_HISTORY_URL = "https://finance.yahoo.com/quote/CNYAUD=X/"
 
 
 def _aud_cny_direction_from_cny_per_aud_change(
@@ -98,6 +102,62 @@ def _fetch_rate_cached(period: str = "90d") -> dict[str, Any]:
     data = copy.deepcopy(data)
     data["_cache"] = {"hit": False, "ttl_seconds": _CACHE_TTL_SECONDS}
     return data
+
+
+def _direction_fields(direction: str | None) -> dict[str, str | None]:
+    """Map pair-level rule output into conservative entity-level hints."""
+    if direction == "bullish_aud":
+        return {
+            "direction_for_aud": "bullish",
+            "direction_for_cny": "bearish",
+            "direction_for_pair": direction,
+        }
+    if direction == "bearish_aud":
+        return {
+            "direction_for_aud": "bearish",
+            "direction_for_cny": "bullish",
+            "direction_for_pair": direction,
+        }
+    if direction == "neutral":
+        return {
+            "direction_for_aud": "neutral",
+            "direction_for_cny": "neutral",
+            "direction_for_pair": direction,
+        }
+    return {
+        "direction_for_aud": None,
+        "direction_for_cny": None,
+        "direction_for_pair": None,
+    }
+
+
+def _fx_finding(
+    *,
+    key: str,
+    summary: str,
+    subcategory: str,
+    direction: str | None = None,
+    importance: float = 0.8,
+    source_ids: list[str] | None = None,
+    time_sensitivity: str = "realtime",
+    time_horizon: str = "spot",
+    evidence_basis: str = "",
+) -> Finding:
+    return Finding(
+        key=key,
+        summary=summary,
+        direction=direction,
+        evidence_score=_MAX_CONFIDENCE,
+        category="fx_price",
+        subcategory=subcategory,
+        entities=list(_FX_ENTITIES),
+        importance=importance,
+        source_ids=source_ids or [],
+        time_sensitivity=time_sensitivity,
+        time_horizon=time_horizon,
+        evidence_basis=evidence_basis,
+        **_direction_fields(direction),
+    )
 
 
 def _sanitise_pair(pair: str) -> str:
@@ -218,10 +278,13 @@ def _build_output(
                 parts.append(
                     f"市场中间价 {market_cny_per_aud:.4f} CNY/AUD，银行加价 +{spread:.4f}"
                 )
-            findings.append(Finding(
+            findings.append(_fx_finding(
                 key="current_rate",
                 summary="；".join(parts),
-                direction=None,
+                subcategory="current_rate",
+                importance=0.9,
+                source_ids=[_MARKET_RATE_URL, _BANK_RATE_URL],
+                evidence_basis="fetch_rate.current_1_AUD_in_CNY",
             ))
 
         # ── Sources ───────────────────────────────────────────────────────────
@@ -230,14 +293,14 @@ def _build_output(
         if rt_source and rt_source != "unavailable":
             sources.append(SourceRef(
                 title="CNY/AUD 市场实时汇率",
-                url="https://open.er-api.com/v6/latest/CNY",
+                url=_MARKET_RATE_URL,
                 source=rt_source,
                 retrieved_at=retrieved_at,
             ))
         if bank_source and "unavailable" not in bank_source.lower():
             sources.append(SourceRef(
                 title="中国银行 AUD 牌价（10家）",
-                url="https://www.usdrate.top/",
+                url=_BANK_RATE_URL,
                 source=bank_source,
                 retrieved_at=retrieved_at,
             ))
@@ -261,10 +324,13 @@ def _build_output(
                 parts.append(f"买入中位 {buy_mid:.4f}")
             if spread_pct is not None:
                 parts.append(f"买卖价差 {spread_pct:.3f}%")
-            findings.append(Finding(
+            findings.append(_fx_finding(
                 key="bank_spread",
                 summary="，".join(parts),
-                direction=None,
+                subcategory="bank_spread",
+                importance=0.85,
+                source_ids=[_BANK_RATE_URL],
+                evidence_basis="fetch_rate.bank_exchange_rates.summary",
             ))
         else:
             missing.append("bank_quotes")
@@ -321,14 +387,20 @@ def _build_output(
         if vol_std:
             parts.append(f"日收盘价格波动σ={vol_std:.4f}（CNY/AUD）")
 
-        findings.append(Finding(
+        findings.append(_fx_finding(
             key="historical_trend",
             summary="；".join(parts),
             direction=direction,
+            subcategory="historical_trend",
+            importance=0.8,
+            source_ids=[_HISTORY_URL],
+            time_sensitivity="quarterly",
+            time_horizon="90d",
+            evidence_basis="fetch_rate.stats.period_change_cny_per_aud_pct",
         ))
         sources.append(SourceRef(
             title="CNY/AUD 历史数据（90日）",
-            url="https://finance.yahoo.com/quote/CNYAUD=X/",
+            url=_HISTORY_URL,
             source="yfinance CNYAUD=X",
             retrieved_at=retrieved_at,
         ))
@@ -351,13 +423,17 @@ def _build_output(
             r_hi    = max(vals)
             r_lo    = min(vals)
             r_range = round(r_hi - r_lo, 4)
-            findings.append(Finding(
+            findings.append(_fx_finding(
                 key="recent_range",
                 summary=(
                     f"近5个交易日区间：{r_lo:.4f}–{r_hi:.4f} CNY/AUD"
                     f"（振幅 {r_range:.4f}）"
                 ),
-                direction=None,
+                subcategory="recent_range",
+                importance=0.75,
+                source_ids=[_HISTORY_URL],
+                time_horizon="5d",
+                evidence_basis="fetch_rate.recent_history",
             ))
     else:
         missing.append("recent_range")
@@ -374,10 +450,13 @@ def _build_output(
             gap_desc = f"当前汇率高于目标 +{gap:.4f}（+{gap_pct:.2f}%）"
         else:
             gap_desc = f"当前汇率低于目标 {gap:.4f}（{gap_pct:.2f}%）"
-        findings.append(Finding(
+        findings.append(_fx_finding(
             key="target_rate_gap",
             summary=f"目标汇率 {target:.4f} CNY/AUD：{gap_desc}",
-            direction=None,
+            subcategory="target_gap",
+            importance=0.75,
+            source_ids=[_MARKET_RATE_URL, _BANK_RATE_URL],
+            evidence_basis="safe_user_context.target_rate_vs_current_rate",
         ))
 
     # ── Confidence (capped at _MAX_CONFIDENCE = 0.85) ────────────────────────

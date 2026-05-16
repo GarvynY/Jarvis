@@ -172,9 +172,41 @@ async def test_partial_agents() -> None:
 
     keys = {f.key for f in output.findings}
     assert "data_gap_partial_agents" in keys, f"Expected data_gap_partial_agents. Got: {keys}"
+    gap = next(f for f in output.findings if f.key == "data_gap_partial_agents")
+    assert gap.category == "data_gap"
+    assert gap.subcategory == "partial_agents"
 
     print("\n-- test_partial_agents")
     _print_output(output)
+    print("   PASS")
+
+
+async def test_106c_risk_output_types() -> None:
+    """10.6C: risk and data-gap findings carry explicit routing metadata."""
+    partial_out = AgentOutput(
+        agent_name="news_agent",
+        status="partial",
+        summary="partial news",
+        confidence=0.3,
+        missing_data=["no_high_relevance_news"],
+    )
+    phase1 = [
+        _ok_output("fx_agent", ["bullish_aud"]),
+        _ok_output("macro_agent", ["bearish_aud"]),
+        partial_out,
+    ]
+    output = await RiskAgent().run(_make_task(), phase1)
+    by_key = {f.key: f for f in output.findings}
+
+    assert by_key["signal_contradiction"].category == "risk"
+    assert by_key["signal_contradiction"].subcategory == "contradiction"
+    assert by_key["data_gap_partial_agents"].category == "data_gap"
+    assert by_key["low_confidence_outputs"].category == "data_gap"
+    assert by_key["dominant_signal"].category == "risk"
+    assert by_key["signal_contradiction"].evidence_basis
+
+    print("\n-- test_106c_risk_output_types")
+    print("   contradiction/risk/data_gap metadata present")
     print("   PASS")
 
 
@@ -377,6 +409,7 @@ async def main() -> None:
     await test_no_contradiction_bearish()
     await test_failed_agents()
     await test_partial_agents()
+    await test_106c_risk_output_types()
     await test_empty_phase1()
     await test_low_confidence_risk()
     await test_confidence_capped()
@@ -387,7 +420,7 @@ async def main() -> None:
     await test_macro_data_allows_one_week()
     await test_missing_source_timestamp()
     print("\n" + "=" * 60)
-    print("All 13 tests passed.")
+    print("All 14 tests passed.")
 
 
 if __name__ == "__main__":

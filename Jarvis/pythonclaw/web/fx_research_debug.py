@@ -36,6 +36,11 @@ def phase10_chunk_debug(chunk: Any) -> dict[str, Any]:
             "conflict_value": _round_score(getattr(chunk, "score_conflict_value", 0.0)),
         },
         "score_reason": getattr(chunk, "score_reason", "") or "",
+        "source_metadata": (
+            chunk.source_debug_info()
+            if hasattr(chunk, "source_debug_info")
+            else {}
+        ),
         "text_preview": text[:220],
     }
 

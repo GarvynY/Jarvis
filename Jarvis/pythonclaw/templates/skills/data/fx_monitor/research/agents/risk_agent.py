@@ -28,6 +28,7 @@ _STALE_SOURCE_HOURS = 48.0
 _STALE_SOURCE_HOURS_BY_AGENT = {
     "macro_agent": 24.0 * 7,
 }
+_RISK_ENTITIES: list[str] = ["AUD", "CNY", "CNYAUD"]
 
 
 def _parse_iso(value: str | None) -> datetime | None:
@@ -46,6 +47,58 @@ def _age_hours(value: str | None, now: datetime) -> float | None:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return max(0.0, (now - dt.astimezone(timezone.utc)).total_seconds() / 3600.0)
+
+
+def _direction_fields(direction: str | None) -> dict[str, str | None]:
+    if direction == "bullish_aud":
+        return {
+            "direction_for_aud": "bullish",
+            "direction_for_cny": "bearish",
+            "direction_for_pair": direction,
+        }
+    if direction == "bearish_aud":
+        return {
+            "direction_for_aud": "bearish",
+            "direction_for_cny": "bullish",
+            "direction_for_pair": direction,
+        }
+    if direction == "neutral":
+        return {
+            "direction_for_aud": "neutral",
+            "direction_for_cny": "neutral",
+            "direction_for_pair": direction,
+        }
+    return {
+        "direction_for_aud": None,
+        "direction_for_cny": None,
+        "direction_for_pair": None,
+    }
+
+
+def _risk_finding(
+    *,
+    key: str,
+    summary: str,
+    direction: str | None = "neutral",
+    category: str = "risk",
+    subcategory: str = "",
+    importance: float = 0.7,
+    evidence_basis: str = "",
+) -> Finding:
+    return Finding(
+        key=key,
+        summary=summary,
+        direction=direction,
+        evidence_score=0.65,
+        category=category,
+        subcategory=subcategory,
+        entities=list(_RISK_ENTITIES),
+        importance=importance,
+        time_sensitivity="realtime",
+        time_horizon="run_level",
+        evidence_basis=evidence_basis,
+        **_direction_fields(direction),
+    )
 
 
 class RiskAgent:
@@ -88,10 +141,13 @@ class RiskAgent:
                 missing.append(f"{output.agent_name}: {item}")
 
             if output.findings and not output.sources:
-                findings.append(Finding(
+                findings.append(_risk_finding(
                     key=f"missing_sources_{output.agent_name}",
                     summary=f"{output.agent_name} 返回了发现项但没有提供来源引用。",
                     direction="neutral",
+                    category="data_gap",
+                    subcategory="missing_sources",
+                    evidence_basis=f"source_agent={output.agent_name}; reason=no_source_refs",
                 ))
                 missing.append(f"missing_sources:{output.agent_name}")
 
@@ -109,6 +165,14 @@ class RiskAgent:
                             f"{src.title or src.source or 'source'}"
                         ),
                         direction="neutral",
+                        evidence_score=0.65,
+                        category="data_gap",
+                        subcategory="missing_source_timestamp",
+                        entities=list(_RISK_ENTITIES),
+                        importance=0.65,
+                        time_sensitivity="realtime",
+                        time_horizon="run_level",
+                        evidence_basis=f"source_agent={output.agent_name}; reason=missing_timestamp",
                     ))
                     missing.append(f"missing_source_timestamp:{output.agent_name}")
                     continue
@@ -118,16 +182,25 @@ class RiskAgent:
             stale = [(label, age) for label, age in ages if age > stale_threshold]
             if stale:
                 label, age = max(stale, key=lambda item: item[1])
-                findings.append(Finding(
+                findings.append(_risk_finding(
                     key=f"stale_data_{output.agent_name}",
                     summary=(
                         f"{output.agent_name} 存在可能过期的数据：{label} "
                         f"约 {age:.0f} 小时前。"
                     ),
                     direction="neutral",
+                    category="data_gap",
+                    subcategory="stale_data",
+                    evidence_basis=f"source_agent={output.agent_name}; age_hours={age:.0f}; threshold_hours={stale_threshold:.0f}",
                 ))
                 risks.append(f"{output.agent_name} 数据可能过期，需复核最新来源")
                 missing.append(f"stale_data:{output.agent_name}")
+
+        direction_agents = [
+            o.agent_name
+            for o in phase1_outputs
+            if any(f.direction and f.direction != "neutral" for f in o.findings)
+        ]
 
         direction_counts = Counter(
             f.direction
@@ -139,13 +212,17 @@ class RiskAgent:
 
         # ── Contradiction detection ───────────────────────────────────────────
         if bullish > 0 and bearish > 0:
-            findings.append(Finding(
+            findings.append(_risk_finding(
                 key="signal_contradiction",
                 summary=(
                     f"多空信号矛盾：{bullish} 个指标偏多 AUD，{bearish} 个偏空 AUD。"
                     "当前方向不明确，不宜仅凭单一信号判断。"
                 ),
                 direction="neutral",
+                category="risk",
+                subcategory="contradiction",
+                importance=0.85,
+                evidence_basis=f"source_agents={','.join(direction_agents)}; bullish={bullish}; bearish={bearish}",
             ))
 
         # ── Agent failure / data-gap findings ────────────────────────────────
@@ -154,17 +231,23 @@ class RiskAgent:
 
         if failed:
             missing.extend(failed)
-            findings.append(Finding(
+            findings.append(_risk_finding(
                 key="data_gap_failed_agents",
                 summary=f"以下数据源不可用，研究可能不完整：{', '.join(failed)}",
                 direction="neutral",
+                category="data_gap",
+                subcategory="failed_agents",
+                evidence_basis=f"source_agents={','.join(failed)}; reason=agent_error",
             ))
         if partial:
             missing.extend(partial)
-            findings.append(Finding(
+            findings.append(_risk_finding(
                 key="data_gap_partial_agents",
                 summary=f"以下数据源部分缺失：{', '.join(partial)}",
                 direction="neutral",
+                category="data_gap",
+                subcategory="partial_agents",
+                evidence_basis=f"source_agents={','.join(partial)}; reason=agent_partial",
             ))
 
         # ── Low-confidence warning ────────────────────────────────────────────
@@ -183,42 +266,57 @@ class RiskAgent:
             if o.confidence < 0.4
         ]
         if low_conf_agents:
-            findings.append(Finding(
+            findings.append(_risk_finding(
                 key="low_confidence_outputs",
                 summary=f"以下代理置信度偏低：{', '.join(low_conf_agents)}",
                 direction="neutral",
+                category="data_gap",
+                subcategory="low_confidence_outputs",
+                evidence_basis=f"source_agents={','.join(low_conf_agents)}; reason=confidence_below_40pct",
             ))
 
         # ── Dominant trend summary ────────────────────────────────────────────
         if bullish > bearish and bullish > 0:
-            findings.append(Finding(
+            findings.append(_risk_finding(
                 key="dominant_signal",
                 summary=(
                     f"多数指标（{bullish}/{bullish + bearish}）偏向 AUD 走强，"
                     "但不构成操作建议"
                 ),
                 direction="bullish_aud",
+                category="risk",
+                subcategory="dominant_signal",
+                evidence_basis=f"source_agents={','.join(direction_agents)}; bullish={bullish}; bearish={bearish}",
             ))
         elif bearish > bullish and bearish > 0:
-            findings.append(Finding(
+            findings.append(_risk_finding(
                 key="dominant_signal",
                 summary=(
                     f"多数指标（{bearish}/{bullish + bearish}）偏向 AUD 走弱，"
                     "但不构成操作建议"
                 ),
                 direction="bearish_aud",
+                category="risk",
+                subcategory="dominant_signal",
+                evidence_basis=f"source_agents={','.join(direction_agents)}; bullish={bullish}; bearish={bearish}",
             ))
         elif not all_findings:
-            findings.append(Finding(
+            findings.append(_risk_finding(
                 key="no_data",
                 summary="所有上游代理均未返回有效数据，风险分析无法完成",
                 direction="neutral",
+                category="data_gap",
+                subcategory="no_data",
+                evidence_basis="reason=no_upstream_findings",
             ))
         else:
-            findings.append(Finding(
+            findings.append(_risk_finding(
                 key="dominant_signal",
                 summary="当前信号方向不明确，多空力量相对均衡",
                 direction="neutral",
+                category="risk",
+                subcategory="dominant_signal",
+                evidence_basis=f"source_agents={','.join(direction_agents)}; bullish={bullish}; bearish={bearish}",
             ))
 
         status = "ok" if phase1_outputs else "error"

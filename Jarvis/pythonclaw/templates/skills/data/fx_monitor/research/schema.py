@@ -176,9 +176,18 @@ class FindingCategory(str, Enum):
     """
     # ── Core taxonomy (Phase 9+) ────────────────────────────────────────────
     FX_PRICE            = "fx_price"           # spot / historical / trend
-    MACRO               = "macro"              # CPI, rates, GDP, central bank
+    MACRO               = "macro"              # CPI, rates, GDP, central bank (legacy)
     NEWS_EVENT          = "news_event"         # news-driven signal
     RISK                = "risk"               # generic risk / contradiction
+
+    # ── Phase 10.6B — expanded FX/macro research categories ─────────────────
+    POLICY_SIGNAL       = "policy_signal"      # central bank decisions, rate guidance
+    MARKET_DRIVER       = "market_driver"      # broad market-moving factors
+    MACRO_INDICATOR     = "macro_indicator"    # GDP, CPI, PMI, employment data
+    COMMODITY_TRADE     = "commodity_trade"    # iron ore, oil, trade flows
+    GEOPOLITICAL_EVENT  = "geopolitical_event" # war, sanctions, territorial disputes
+    DATA_GAP            = "data_gap"           # missing or unavailable data signal
+    UNKNOWN             = "unknown"            # unclassified
 
     # ── Equity fundamentals (Phase 10) ───────────────────────────────────────
     REVENUE_QUALITY     = "revenue_quality"   # revenue growth & quality
@@ -656,6 +665,7 @@ class EvidenceChunk:
     score_user_relevance: float = 0.0
     score_conflict_value: float = 0.0
     score_reason: str = ""
+    source_metadata_json: str = "{}"
 
     def __post_init__(self) -> None:
         validate_confidence(self.importance)
@@ -664,6 +674,23 @@ class EvidenceChunk:
 
     def to_dict(self) -> dict[str, Any]:
         return to_dict(self)
+
+    def source_debug_info(self) -> dict[str, Any]:
+        """Return structured source metadata fields for debug/observability."""
+        try:
+            d = json.loads(self.source_metadata_json) if self.source_metadata_json else {}
+        except (json.JSONDecodeError, TypeError):
+            d = {}
+        if not isinstance(d, dict):
+            d = {}
+        return {
+            "domain": d.get("domain", ""),
+            "provider": d.get("provider", ""),
+            "source_type": d.get("source_type", "unknown"),
+            "source_tier": d.get("source_tier", 0),
+            "quality_reason": d.get("quality_reason", ""),
+            "is_aggregator": d.get("is_aggregator", False),
+        }
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "EvidenceChunk":
@@ -691,6 +718,7 @@ class EvidenceChunk:
             score_user_relevance=float(d.get("score_user_relevance", 0.0)),
             score_conflict_value=float(d.get("score_conflict_value", 0.0)),
             score_reason=d.get("score_reason", ""),
+            source_metadata_json=d.get("source_metadata_json", "{}"),
         )
 
 
@@ -924,6 +952,27 @@ class Finding:
     # AttentionLayer uses this to deprioritise stale realtime signals
     # in deferred deep-dive runs.
 
+    # ── Phase 10.6C additions ────────────────────────────────────────────────
+    subcategory: str = ""
+    # Optional agent-provided finer type within category, e.g. current_rate,
+    # bank_spread, contradiction. Empty preserves old Finding payloads.
+
+    entities: list[str] = field(default_factory=list)
+    # Explicit entities mentioned by this finding. EvidenceStore falls back to
+    # task.focus_assets for older findings that leave this empty.
+
+    direction_for_aud: str | None = None
+    direction_for_cny: str | None = None
+    direction_for_pair: str | None = None
+    # Conservative per-entity direction hints. Agents should only populate these
+    # when a rule or explicit source-backed signal exists.
+
+    time_horizon: str = ""
+    # Free-text horizon bucket used for observability/routing only.
+
+    evidence_basis: str = ""
+    # Short description of the source/rule basis supporting the finding.
+
     def __post_init__(self) -> None:
         if self.evidence_score is not None:
             validate_confidence(self.evidence_score)   # reuses [0,1] range check
@@ -953,6 +1002,13 @@ class Finding:
             importance=float(d.get("importance", 0.0)),
             source_ids=list(d.get("source_ids") or []),
             time_sensitivity=d.get("time_sensitivity", "quarterly"),
+            subcategory=d.get("subcategory", ""),
+            entities=list(d.get("entities") or []),
+            direction_for_aud=d.get("direction_for_aud"),
+            direction_for_cny=d.get("direction_for_cny"),
+            direction_for_pair=d.get("direction_for_pair"),
+            time_horizon=d.get("time_horizon", ""),
+            evidence_basis=d.get("evidence_basis", ""),
         )
 
 

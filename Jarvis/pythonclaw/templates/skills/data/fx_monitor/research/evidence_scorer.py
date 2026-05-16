@@ -31,6 +31,15 @@ try:
 except ImportError:
     from .schema import EvidenceChunk as _EC, SafeUserContext as _SUC, now_iso  # type: ignore[no-redef]
 
+try:
+    from source_metadata import SourceMetadata, tier_to_quality_score
+except ImportError:
+    try:
+        from .source_metadata import SourceMetadata, tier_to_quality_score  # type: ignore[no-redef]
+    except ImportError:
+        SourceMetadata = None  # type: ignore[assignment,misc]
+        tier_to_quality_score = None  # type: ignore[assignment]
+
 
 # ── Weights ──────────────────────────────────────────────────────────────────
 
@@ -396,7 +405,11 @@ def compute_recency_score(
 
 
 def compute_source_quality_score(chunk: _EC) -> float:
-    """Deterministic source quality using URL/domain/title before provider label.
+    """Deterministic source quality using structured metadata first, legacy fallback.
+
+    Priority:
+      1. If chunk.source_metadata_json is valid and has source_tier → use tier_to_quality_score
+      2. Otherwise, fall back to URL/domain/title heuristic (legacy path)
 
     Returns representative bands:
         0.95 — official central bank / regulator / government / bank board
@@ -407,6 +420,18 @@ def compute_source_quality_score(chunk: _EC) -> float:
         0.40 — provider-only labels such as google_news_rss without URL/title
         0.20 — empty source metadata
     """
+    # Phase 10.6A: prefer structured SourceMetadata
+    if SourceMetadata is not None and tier_to_quality_score is not None:
+        raw_meta = getattr(chunk, "source_metadata_json", None) or "{}"
+        if raw_meta and raw_meta != "{}":
+            try:
+                meta = SourceMetadata.from_json(raw_meta)
+                if meta.source_type != "unknown" or meta.source_tier != 3:
+                    return tier_to_quality_score(meta.source_tier)
+            except Exception:
+                pass
+
+    # Legacy fallback path
     url, title, source = _source_fields(chunk)
     domain = _domain_from_url(url)
     text = " ".join(part for part in (title, source) if part).strip()

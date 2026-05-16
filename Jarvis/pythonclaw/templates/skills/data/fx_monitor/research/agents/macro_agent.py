@@ -103,6 +103,119 @@ _DIRECTIONAL_KEYS: frozenset[str] = frozenset({
 _CACHE_TTL_SECONDS: float = 180.0
 _COLLECT_CACHE: dict[tuple[int, int], tuple[float, dict[str, Any]]] = {}
 
+_MACRO_ENTITY_MAP: dict[str, list[str]] = {
+    "macro_rba": ["RBA", "AUD", "CNY", "CNYAUD"],
+    "macro_pboc": ["PBoC", "CNY", "AUD", "CNYAUD"],
+    "macro_usd": ["Fed", "USD", "AUD", "CNY", "CNYAUD"],
+    "macro_trade": ["AUD", "CNY", "China", "Australia", "CNYAUD"],
+}
+
+_MACRO_SUBCATEGORY_MAP: dict[str, str] = {
+    "macro_rba": "rba_policy",
+    "macro_pboc": "pboc_policy",
+    "macro_usd": "fed_usd_policy",
+    "macro_trade": "trade_macro",
+}
+
+
+def _direction_fields(direction: str | None) -> dict[str, str | None]:
+    if direction == "bullish_aud":
+        return {
+            "direction_for_aud": "bullish",
+            "direction_for_cny": "bearish",
+            "direction_for_pair": direction,
+        }
+    if direction == "bearish_aud":
+        return {
+            "direction_for_aud": "bearish",
+            "direction_for_cny": "bullish",
+            "direction_for_pair": direction,
+        }
+    if direction == "neutral":
+        return {
+            "direction_for_aud": "neutral",
+            "direction_for_cny": "neutral",
+            "direction_for_pair": direction,
+        }
+    return {
+        "direction_for_aud": None,
+        "direction_for_cny": None,
+        "direction_for_pair": None,
+    }
+
+
+def _macro_signal_finding(
+    *,
+    key: str,
+    summary: str,
+    direction: str | None,
+    source_ids: list[str],
+) -> Finding:
+    category = "policy_signal" if key in {"macro_rba", "macro_pboc", "macro_usd"} else "macro"
+    return Finding(
+        key=key,
+        summary=summary,
+        direction=direction,
+        evidence_score=0.7 if source_ids else 0.45,
+        category=category,
+        subcategory=_MACRO_SUBCATEGORY_MAP.get(key, ""),
+        entities=list(_MACRO_ENTITY_MAP.get(key, ["AUD", "CNY", "CNYAUD"])),
+        importance=0.8 if key in {"macro_rba", "macro_pboc", "macro_usd"} else 0.65,
+        source_ids=source_ids,
+        time_sensitivity="quarterly",
+        time_horizon="policy_cycle",
+        evidence_basis=f"{key} from {len(source_ids)} matched macro source(s)",
+        **_direction_fields(direction),
+    )
+
+
+def _infer_macro_detail_entities(result: dict[str, Any]) -> list[str]:
+    text = " ".join(str(result.get(k, "") or "") for k in ("query", "title", "snippet")).lower()
+    entities: list[str] = []
+    checks = [
+        ("rba", "RBA"),
+        ("reserve bank", "RBA"),
+        ("pboc", "PBoC"),
+        ("people's bank", "PBoC"),
+        ("fed", "Fed"),
+        ("federal reserve", "Fed"),
+        ("usd", "USD"),
+        ("dollar", "USD"),
+        ("aud", "AUD"),
+        ("australia", "AUD"),
+        ("cny", "CNY"),
+        ("yuan", "CNY"),
+        ("china", "CNY"),
+    ]
+    for needle, entity in checks:
+        if needle in text and entity not in entities:
+            entities.append(entity)
+    for entity in ("AUD", "CNY", "CNYAUD"):
+        if entity not in entities:
+            entities.append(entity)
+    return entities
+
+
+def _copy_finding_with_direction(f: Finding, direction: str | None) -> Finding:
+    return Finding(
+        key=f.key,
+        summary=f.summary,
+        direction=direction,
+        evidence_score=f.evidence_score,
+        attention_score=f.attention_score,
+        category=f.category,
+        importance=f.importance,
+        source_ids=f.source_ids,
+        time_sensitivity=f.time_sensitivity,
+        subcategory=f.subcategory,
+        entities=f.entities,
+        direction_for_aud=_direction_fields(direction)["direction_for_aud"],
+        direction_for_cny=_direction_fields(direction)["direction_for_cny"],
+        direction_for_pair=_direction_fields(direction)["direction_for_pair"],
+        time_horizon=f.time_horizon,
+        evidence_basis=f.evidence_basis,
+    )
+
 
 # ── Search layer (mockable) ───────────────────────────────────────────────────
 
@@ -332,11 +445,12 @@ def _parse_llm_response(
                     if direction == "unknown":
                         continue
                     direction = _safe_direction(direction)
-                    findings.append(Finding(
+                    source_ids = _source_ids_for_signal(field)
+                    findings.append(_macro_signal_finding(
                         key=key,
                         summary=f"{label}: {direction.replace('_', ' ')}",
                         direction=direction,
-                        source_ids=_source_ids_for_signal(field),
+                        source_ids=source_ids,
                     ))
 
                 # Detail findings are news headlines — they carry no independent
@@ -349,7 +463,15 @@ def _parse_llm_response(
                         key=f"macro_detail_{i}",
                         summary=title[:220],
                         direction=None,
+                        evidence_score=0.55,
+                        category="macro",
+                        subcategory="macro_detail",
+                        entities=_infer_macro_detail_entities(r),
+                        importance=0.55,
                         source_ids=[r.get("url", "")] if r.get("url") else [],
+                        time_sensitivity="quarterly",
+                        time_horizon="news_cycle",
+                        evidence_basis="macro search result title/snippet",
                     ))
 
                 return findings[:_MAX_FINDINGS], risks, summary, data_gaps, unsafe_removed
@@ -365,7 +487,15 @@ def _parse_llm_response(
                 key=f"macro_raw_{i}",
                 summary=title,
                 direction=None,
+                evidence_score=0.45,
+                category="macro",
+                subcategory="raw_search_result",
+                entities=_infer_macro_detail_entities(r),
+                importance=0.45,
                 source_ids=[r.get("url", "")] if r.get("url") else [],
+                time_sensitivity="quarterly",
+                time_horizon="news_cycle",
+                evidence_basis="raw macro search result; LLM unavailable",
             ))
     summary = f"基于 {len(results)} 条搜索结果（LLM分析不可用）"
     return findings, [], summary, [], False
@@ -400,13 +530,7 @@ def _stabilise_directions(
     for f in findings:
         if f.key not in _DIRECTIONAL_KEYS:
             if f.direction is not None:
-                f = Finding(
-                    key=f.key, summary=f.summary, direction=None,
-                    category=f.category, importance=f.importance,
-                    source_ids=f.source_ids,
-                    time_sensitivity=f.time_sensitivity,
-                    evidence_score=f.evidence_score,
-                )
+                f = _copy_finding_with_direction(f, None)
             stable.append(f)
             continue
 
@@ -419,13 +543,7 @@ def _stabilise_directions(
                 direction = None
                 extra_gaps.append("macro_usd_no_source_evidence")
 
-        stable.append(Finding(
-            key=f.key, summary=f.summary, direction=direction,
-            category=f.category, importance=f.importance,
-            source_ids=f.source_ids,
-            time_sensitivity=f.time_sensitivity,
-            evidence_score=f.evidence_score,
-        ))
+        stable.append(_copy_finding_with_direction(f, direction))
     return stable, extra_gaps
 
 
