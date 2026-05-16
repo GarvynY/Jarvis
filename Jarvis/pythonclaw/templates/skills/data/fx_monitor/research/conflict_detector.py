@@ -75,16 +75,49 @@ class ConflictSummary:
     conflicts: list[ConflictPair] = field(default_factory=list)
     conflict_count: int = 0
     conflicting_chunk_ids: set[str] = field(default_factory=set)
+    raw_conflict_count: int = 0
+    excluded_conflict_count: int = 0
+
+    @property
+    def reportable_conflict_count(self) -> int:
+        return self.conflict_count
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "conflicts": [c.to_dict() for c in self.conflicts],
             "conflict_count": self.conflict_count,
+            "raw_conflict_count": self.raw_conflict_count,
+            "reportable_conflict_count": self.reportable_conflict_count,
+            "excluded_conflict_count": self.excluded_conflict_count,
             "conflicting_chunk_ids": sorted(self.conflicting_chunk_ids),
         }
 
 
 # ── Core detection ──────────────────────────────────────────────────────────
+
+def _is_conflict_eligible(finding: EvidenceFinding) -> bool:
+    """Check if a finding is eligible to participate in conflict detection.
+
+    Low-confidence news from aggregators should not inflate conflict counts
+    or trigger conflict boosts on other findings.
+    """
+    category = getattr(finding, "category", "") or ""
+    evidence_score = getattr(finding, "evidence_score", None)
+    importance = getattr(finding, "importance", 0.5) or 0.5
+
+    if category == "news_event":
+        if evidence_score is not None and evidence_score < 0.3:
+            return False
+        if importance < 0.4:
+            return False
+    return True
+
+
+def _dedup_key(cp: ConflictPair) -> tuple[str, str, str]:
+    """Deterministic dedup key: sorted IDs + rule."""
+    ids = sorted([cp.finding_id_a, cp.finding_id_b])
+    return (ids[0], ids[1], cp.rule)
+
 
 def detect_conflicts(
     findings: list[EvidenceFinding],
@@ -99,17 +132,22 @@ def detect_conflicts(
             entity-overlap conflict detection.
 
     Returns:
-        ConflictSummary with all detected conflict pairs.
+        ConflictSummary with all detected conflict pairs (deduplicated).
     """
     if not findings or len(findings) < 2:
         return ConflictSummary()
 
-    directed = [f for f in findings if f.direction and f.direction not in ("neutral", "mixed", "unknown")]
+    directed = [
+        f for f in findings
+        if f.direction and f.direction not in ("neutral", "mixed", "unknown")
+        and _is_conflict_eligible(f)
+    ]
     if len(directed) < 2:
         return ConflictSummary()
 
     conflicts: list[ConflictPair] = []
     seen_pairs: set[tuple[str, str]] = set()
+    seen_dedup_keys: set[tuple[str, str, str]] = set()
 
     for i, fa in enumerate(directed):
         for fb in directed[i + 1:]:
@@ -124,7 +162,7 @@ def detect_conflicts(
             if fa.category and fa.category == fb.category:
                 chunk_a = fa.chunk_ids[0] if fa.chunk_ids else ""
                 chunk_b = fb.chunk_ids[0] if fb.chunk_ids else ""
-                conflicts.append(ConflictPair(
+                cp = ConflictPair(
                     finding_id_a=fa.finding_id,
                     finding_id_b=fb.finding_id,
                     chunk_id_a=chunk_a,
@@ -134,7 +172,11 @@ def detect_conflicts(
                     direction_b=fb.direction or "",
                     rule="same_category_opposite_direction",
                     confidence=0.9,
-                ))
+                )
+                dk = _dedup_key(cp)
+                if dk not in seen_dedup_keys:
+                    conflicts.append(cp)
+                    seen_dedup_keys.add(dk)
                 seen_pairs.add(pair_key)
                 continue
 
@@ -149,7 +191,7 @@ def detect_conflicts(
                 if ents_a & ents_b:
                     chunk_a = fa.chunk_ids[0] if fa.chunk_ids else ""
                     chunk_b = fb.chunk_ids[0] if fb.chunk_ids else ""
-                    conflicts.append(ConflictPair(
+                    cp = ConflictPair(
                         finding_id_a=fa.finding_id,
                         finding_id_b=fb.finding_id,
                         chunk_id_a=chunk_a,
@@ -159,7 +201,11 @@ def detect_conflicts(
                         direction_b=fb.direction or "",
                         rule="shared_entity_opposite_direction",
                         confidence=0.7,
-                    ))
+                    )
+                    dk = _dedup_key(cp)
+                    if dk not in seen_dedup_keys:
+                        conflicts.append(cp)
+                        seen_dedup_keys.add(dk)
                     seen_pairs.add(pair_key)
 
     conflicting_ids: set[str] = set()
@@ -185,15 +231,23 @@ def apply_conflict_boost(
     summary: ConflictSummary,
     *,
     boost: float = CONFLICT_BOOST,
+    ineligible_chunk_ids: set[str] | None = None,
 ) -> dict[str, float]:
     """Boost composite scores for chunks involved in conflicts.
 
     Conflicting evidence deserves higher visibility so the supervisor
     can present both sides to the user.
 
+    Chunks in ineligible_chunk_ids are skipped (e.g. weak news that
+    should not receive or produce conflict boost).
+
     Modifies score_map in-place and returns it.
     """
+    skip = ineligible_chunk_ids or set()
     for chunk_id in summary.conflicting_chunk_ids:
+        if chunk_id in skip:
+            _log.debug("conflict_boost: skip ineligible %s", chunk_id)
+            continue
         if chunk_id in score_map:
             old = score_map[chunk_id]
             score_map[chunk_id] = min(1.0, round(old + boost, 4))

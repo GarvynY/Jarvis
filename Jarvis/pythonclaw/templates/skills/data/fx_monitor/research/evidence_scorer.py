@@ -183,6 +183,15 @@ _TOPIC_CATEGORY_BOOSTS: tuple[tuple[tuple[str, ...], dict[str, float], tuple[str
     ),
 )
 
+_DIRECT_FX_NEWS_TERMS: tuple[str, ...] = (
+    " aud ", "aud/", "/aud", "australian dollar", "aussie dollar",
+    " cny ", "cny/", "/cny", "yuan", "renminbi",
+    "rba", "reserve bank of australia", "pboc", "people's bank of china",
+    "fed ", "federal reserve", "fomc",
+    "australia", "china trade", "iron ore",
+    "aud/usd", "usd/cny", "usd/cnh", "cny/aud",
+)
+
 _QUALITY_NEGATIVE_PATTERNS: tuple[str, ...] = (
     "逻辑太浅",
     "shallow",
@@ -507,8 +516,16 @@ def compute_user_relevance_score(
     negative_terms = inferred_low_terms
 
     category = (getattr(chunk, "category", "") or "").lower()
+    subcategory = (getattr(chunk, "subcategory", "") or "").lower()
+    chunk_source = str(getattr(chunk, "source", "") or "").lower()
+    is_target_rate_gap = (
+        subcategory == "target_rate_gap"
+        or "finding_key=target_rate_gap" in chunk_source
+    )
     if category == "fx_price" and (purpose in {"living", "tuition", "remittance"} or target_rate is not None):
         base = max(base, 0.5)
+        if is_target_rate_gap:
+            base = max(base, 0.85)
 
     if category and category in prefs_lower:
         base = 0.8
@@ -532,6 +549,11 @@ def compute_user_relevance_score(
     )
     if topic_boost:
         base = max(base, topic_boost)
+
+    # Cap generic news that doesn't directly mention focus currencies/central banks
+    if category == "news_event" and base > 0.6:
+        if not _text_has_any(chunk_text, _DIRECT_FX_NEWS_TERMS):
+            base = min(base, 0.6)
 
     feedback_score = None
     if category_feedback_summary and category:

@@ -81,9 +81,9 @@ _MAX_COMPLETION_TOKENS = 1800
 _MAX_CHUNKS_PER_SECTION = 5
 _MAX_CHUNK_TOKENS = 1200
 _SECTION_TOKEN_RESERVES: dict[str, int] = {
-    "fx_price":   1800,
+    "fx_price":   2200,
     "news_event":  800,
-    "macro":      2200,
+    "macro":      2000,
     "risk":       1000,
 }
 

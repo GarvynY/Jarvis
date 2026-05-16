@@ -43,7 +43,7 @@ except ImportError:
         from agent_audit import audit_agent_start, audit_agent_event, audit_agent_end, audit_agent_error  # type: ignore[no-redef]
 
 
-_ENABLE_MARKET_DRIVERS_AGENT: bool = False
+_ENABLE_MARKET_DRIVERS_AGENT: bool = True
 
 _ALL_ITEM_KEYS: list[str] = [
     "fx.aud_usd",

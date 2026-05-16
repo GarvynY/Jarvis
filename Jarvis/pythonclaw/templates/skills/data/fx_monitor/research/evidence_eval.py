@@ -58,7 +58,20 @@ def summarize_retrieval_traces(
     )
     total_available = sum(t.total_chunks for t in traces)
     sections_covered = sum(1 for t in traces if getattr(t, "section_covered", False) or t.retrieved_count > 0)
-    conflict_count = sum(getattr(t, "conflict_count", 0) for t in traces)
+
+    # Deduplicate conflict pairs across sections to get reportable count.
+    seen_conflict_keys: set[tuple[str, str, str]] = set()
+    raw_conflict_count = 0
+    for t in traces:
+        raw_conflict_count += int(getattr(t, "conflict_count", 0) or 0)
+        for cp in (getattr(t, "conflict_pairs", None) or []):
+            if isinstance(cp, dict):
+                dk = tuple(sorted([cp.get("finding_id_a", ""), cp.get("finding_id_b", "")])) + (cp.get("rule", ""),)
+            else:
+                dk = tuple(sorted([getattr(cp, "finding_id_a", ""), getattr(cp, "finding_id_b", "")])) + (getattr(cp, "rule", ""),)
+            seen_conflict_keys.add(dk)
+
+    reportable_conflict_count = len(seen_conflict_keys) if seen_conflict_keys else raw_conflict_count
 
     ratios: list[float] = []
     for t in traces:
@@ -71,7 +84,9 @@ def summarize_retrieval_traces(
         "total_retrieved": total_retrieved,
         "total_available": total_available,
         "sections_covered": sections_covered,
-        "conflict_count": conflict_count,
+        "conflict_count": reportable_conflict_count,
+        "raw_conflict_count": raw_conflict_count,
+        "reportable_conflict_count": reportable_conflict_count,
         "avg_noise_reduction": avg_noise,
     }
 

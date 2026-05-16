@@ -373,7 +373,17 @@ def build_run_metrics(
         or int(getattr(trace, "retrieved_count", 0) or 0) > 0
     )
     fallback_count = sum(1 for trace in traces if getattr(trace, "fallback_reason", ""))
-    conflict_count = sum(int(getattr(trace, "conflict_count", 0) or 0) for trace in traces)
+    # Deduplicate conflict pairs across sections for reportable count
+    _seen_conflict_keys: set[tuple[str, str, str]] = set()
+    raw_conflict_count = sum(int(getattr(trace, "conflict_count", 0) or 0) for trace in traces)
+    for trace in traces:
+        for cp in (getattr(trace, "conflict_pairs", None) or []):
+            if isinstance(cp, dict):
+                dk = tuple(sorted([cp.get("finding_id_a", ""), cp.get("finding_id_b", "")])) + (cp.get("rule", ""),)
+            else:
+                dk = tuple(sorted([getattr(cp, "finding_id_a", ""), getattr(cp, "finding_id_b", "")])) + (getattr(cp, "rule", ""),)
+            _seen_conflict_keys.add(dk)
+    conflict_count = len(_seen_conflict_keys) if _seen_conflict_keys else raw_conflict_count
     boosted_ids: set[str] = set()
     for trace in traces:
         boosted_ids.update(getattr(trace, "boosted_chunk_ids", []) or [])

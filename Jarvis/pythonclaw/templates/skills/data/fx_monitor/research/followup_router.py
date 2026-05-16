@@ -38,7 +38,7 @@ MAX_FOLLOWUP_AGENTS: int = 2
 FOLLOWUP_TIMEOUT_SECONDS: int = 30
 MAX_RECOMMENDATIONS: int = 6
 
-_HIGH_CONFLICT_THRESHOLD = 2
+_HIGH_CONFLICT_THRESHOLD = 2  # reportable_conflict_count > 1 triggers followup
 _HIGH_IMPORTANCE_THRESHOLD = 0.75
 _LOW_CONFIDENCE_THRESHOLD = 0.45
 _STALE_HOURS_DEFAULT = 72.0
@@ -95,10 +95,17 @@ def _target_category(output: AgentOutput, finding: Finding | None = None) -> str
 
 
 def _conflict_count(conflict_summary: Any) -> int:
+    """Extract reportable (deduplicated) conflict count."""
     if conflict_summary is None:
         return 0
     if isinstance(conflict_summary, dict):
+        reportable = conflict_summary.get("reportable_conflict_count")
+        if reportable is not None:
+            return int(reportable)
         return int(conflict_summary.get("conflict_count") or len(conflict_summary.get("conflict_pairs") or []))
+    reportable = getattr(conflict_summary, "reportable_conflict_count", None)
+    if reportable is not None:
+        return int(reportable)
     value = getattr(conflict_summary, "conflict_count", None)
     if value is not None:
         return int(value)

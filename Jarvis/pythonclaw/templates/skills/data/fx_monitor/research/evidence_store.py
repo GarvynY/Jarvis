@@ -577,9 +577,10 @@ class EvidenceStore:
                     as_of=output.as_of,
                 )
 
-                category = finding.category or self._AGENT_CATEGORY_DEFAULTS.get(
+                raw_cat = finding.category or self._AGENT_CATEGORY_DEFAULTS.get(
                     output.agent_name, "",
                 )
+                category = raw_cat.value if hasattr(raw_cat, "value") else raw_cat
                 importance = finding.importance if finding.importance > 0 else output.confidence
 
                 source_meta_json = "{}"
@@ -680,7 +681,7 @@ class EvidenceStore:
             f"任务：{task.task_id}",
             f"预设：{task.preset_name}",
             f"代理：{agent_name}",
-            f"类别：{finding.category or '未分类'}",
+            f"类别：{finding.category.value if hasattr(finding.category, 'value') else finding.category or '未分类'}",
             f"实体：{', '.join(entities) if entities else '无'}",
             f"来源：{source_label or '未知'}",
             f"检索时间：{as_of}",
@@ -833,6 +834,7 @@ class EvidenceStore:
         use_scorer = compute_evidence_score is not None
         scoring_method = "composite" if use_scorer else "legacy"
         total_conflict_count = 0
+        global_conflict_dedup_keys: set[tuple[str, str, str]] = set()
         scored_chunks: dict[str, EvidenceChunk] = {}
 
         # ── Pool-level conflict pre-scan ─────────────────────────────────────
@@ -1082,12 +1084,35 @@ class EvidenceStore:
                                 effective_summary = None
 
                             if effective_summary and effective_summary.conflict_count > 0:
-                                section_conflict_count = effective_summary.conflict_count
-                                total_conflict_count += section_conflict_count
+                                # Deduplicate conflicts globally across sections
+                                unique_in_section = 0
+                                for cp in effective_summary.conflicts:
+                                    dk = (
+                                        *sorted([cp.finding_id_a, cp.finding_id_b]),
+                                        cp.rule,
+                                    )
+                                    if dk not in global_conflict_dedup_keys:
+                                        global_conflict_dedup_keys.add(dk)
+                                        unique_in_section += 1
+                                section_conflict_count = unique_in_section
+                                total_conflict_count += unique_in_section
+
+                                # Identify ineligible chunks (weak news: aggregator + low confidence)
+                                ineligible_cids: set[str] = set()
+                                for c in deduped:
+                                    if (c.category == "news_event"
+                                            and c.confidence < 0.3):
+                                        ineligible_cids.add(c.chunk_id)
+                                    elif (c.category == "news_event"
+                                          and c.confidence < 0.5
+                                          and "aggregator" in (c.source or "").lower()):
+                                        ineligible_cids.add(c.chunk_id)
+
                                 before_scores = dict(score_map)
                                 apply_conflict_boost(
                                     score_map, effective_summary,
                                     boost=_CONFLICT_SELECTION_BOOST,
+                                    ineligible_chunk_ids=ineligible_cids,
                                 )
                                 boosted_chunk_ids = sorted(
                                     cid for cid in effective_summary.conflicting_chunk_ids

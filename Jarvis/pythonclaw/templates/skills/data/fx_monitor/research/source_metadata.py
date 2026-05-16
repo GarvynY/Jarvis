@@ -112,6 +112,12 @@ _MARKET_DATA_DOMAINS: tuple[str, ...] = (
     "xe.com",
 )
 
+_MARKET_DATA_TIER3_DOMAINS: tuple[str, ...] = (
+    "open.er-api.com",
+    "exchangerate-api.com",
+    "api.exchangerate.host",
+)
+
 _BROKER_BLOG_DOMAINS: tuple[str, ...] = (
     "marketpulse.com",
     "investing.com",
@@ -346,6 +352,10 @@ def infer_source_type_and_tier(metadata: "SourceMetadata") -> "SourceMetadata":
             source_type = "market_data_api"
             source_tier = 2
             reason = f"market_data_domain:{domain}"
+        elif _domain_matches(domain, _MARKET_DATA_TIER3_DOMAINS):
+            source_type = "market_data_api"
+            source_tier = 3
+            reason = f"exchange_rate_api_domain:{domain}"
         elif _domain_matches(domain, _PREMIUM_MEDIA_DOMAINS):
             source_type = "mainstream_financial_media"
             source_tier = 2

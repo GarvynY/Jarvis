@@ -323,7 +323,7 @@ class ResearchPreset:
 FX_CNYAUD_PRESET = ResearchPreset(
     name="fx_cnyaud",
     research_type="fx",
-    default_agents=["fx_agent", "news_agent", "macro_agent"],
+    default_agents=["fx_agent", "news_agent", "macro_agent", "market_drivers_agent"],
     report_sections=["汇率事实", "新闻驱动", "宏观信号", "风险与矛盾"],
     banned_terms=[
         "建议买入", "建议卖出", "换汇时机", "立即操作",
