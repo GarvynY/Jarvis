@@ -137,10 +137,56 @@ def test_phase10_debug_payload_reports_store_failure() -> None:
     assert payload["selected_chunks"] == []
 
 
+_get_query_plan_summary = _MODULE._get_query_plan_summary
+
+
+def test_query_plan_summary_returns_budget_stats() -> None:
+    summary = _get_query_plan_summary("test-task-id")
+    assert isinstance(summary, dict), f"Expected dict, got {type(summary)}"
+    assert summary["total_buckets"] == 15
+    assert summary["active_buckets"] < 15
+    assert summary["budget_mode"] == "normal"
+    assert summary["budget_limited"] is True
+    assert "buckets" in summary
+    for item in summary["buckets"]:
+        assert "bucket_name" in item, f"Missing bucket_name: {item}"
+        assert "agent_name" in item, f"Missing agent_name: {item}"
+        assert "category" in item, f"Missing category: {item}"
+        assert "max_results" in item, f"Missing max_results: {item}"
+        assert "enabled" in item, f"Missing enabled: {item}"
+
+
+def test_query_plan_summary_no_raw_queries() -> None:
+    summary = _get_query_plan_summary("test-task-id")
+    for item in summary["buckets"]:
+        assert "queries" not in item, f"Raw queries exposed: {item}"
+        assert "source_preference" not in item, f"source_preference exposed: {item}"
+
+
+def test_query_plan_summary_no_user_data_leak() -> None:
+    summary = _get_query_plan_summary("test-task-id")
+    serialized = str(summary)
+    assert "4.85" not in serialized, "target_rate leaked"
+    assert "tuition" not in serialized, "purpose leaked"
+
+
+def test_query_plan_in_debug_payload() -> None:
+    _Store.chunks = {}
+    payload = build_phase10_debug_payload("task-plan", [_Trace()], _Store)
+    assert "query_plan" in payload
+    assert isinstance(payload["query_plan"], dict)
+    assert payload["query_plan"]["total_buckets"] == 15
+    assert payload["query_plan"]["budget_limited"] is True
+
+
 def run_all() -> None:
     tests = [
         test_phase10_debug_payload_includes_selected_score_breakdown,
         test_phase10_debug_payload_reports_store_failure,
+        test_query_plan_summary_returns_budget_stats,
+        test_query_plan_summary_no_raw_queries,
+        test_query_plan_summary_no_user_data_leak,
+        test_query_plan_in_debug_payload,
     ]
     print("Web Phase 10 debug helper tests")
     print("=" * 40)

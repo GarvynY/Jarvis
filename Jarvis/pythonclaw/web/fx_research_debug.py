@@ -5,6 +5,36 @@ from __future__ import annotations
 from typing import Any
 
 
+def _ensure_research_path() -> None:
+    """Ensure research directory is importable."""
+    import sys
+    from pathlib import Path
+    _research = str(
+        Path(__file__).resolve().parent.parent
+        / "templates" / "skills" / "data" / "fx_monitor" / "research"
+    )
+    if _research not in sys.path:
+        sys.path.insert(0, _research)
+
+
+def _get_query_plan_summary(task_id: str) -> dict[str, Any]:
+    """Load query plan debug summary. Returns {} only if module is missing."""
+    _ensure_research_path()
+    try:
+        from query_planner import build_query_plan, query_plan_debug_summary
+        from schema import ResearchTask
+    except ImportError as exc:
+        import logging
+        logging.getLogger(__name__).warning(
+            "query_planner import failed: %s", exc
+        )
+        return {}
+
+    task = ResearchTask(task_id=task_id, preset_name="fx_cnyaud")
+    plan = build_query_plan(task)
+    return query_plan_debug_summary(plan)
+
+
 def _round_score(value: Any) -> float:
     """Return a compact JSON-safe score for debug output."""
     try:
@@ -123,4 +153,5 @@ def build_phase10_debug_payload(
             "boosted_chunk_ids": sorted(boosted_ids),
         },
         "retrieval_traces": trace_rows,
+        "query_plan": _get_query_plan_summary(task_id),
     }
