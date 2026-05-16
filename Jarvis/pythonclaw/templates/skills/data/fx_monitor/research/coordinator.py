@@ -41,6 +41,7 @@ try:
     )
     from .runner import LocalAsyncRunner
     from .agents import FXAgent, MacroAgent, NewsAgent, RiskAgent
+    from .agents import MarketDriversAgent, _ENABLE_MARKET_DRIVERS_AGENT
     from .evidence_store import EvidenceStore
 except ImportError:
     from schema import (  # type: ignore[no-redef]
@@ -49,6 +50,7 @@ except ImportError:
     )
     from runner import LocalAsyncRunner  # type: ignore[no-redef]
     from agents import FXAgent, MacroAgent, NewsAgent, RiskAgent  # type: ignore[no-redef]
+    from agents import MarketDriversAgent, _ENABLE_MARKET_DRIVERS_AGENT  # type: ignore[no-redef]
     from evidence_store import EvidenceStore  # type: ignore[no-redef]
 
 # Module-level import so tests can patch coordinator.build_safe_user_context.
@@ -80,6 +82,9 @@ AGENT_REGISTRY: dict[str, type] = {
     "macro_agent": MacroAgent,
     # "sentiment_agent": SentimentAgent,   ← future
 }
+
+if _ENABLE_MARKET_DRIVERS_AGENT:
+    AGENT_REGISTRY["market_drivers_agent"] = MarketDriversAgent
 
 # ── DeepSeek pricing (USD per token) ──────────────────────────────────────────
 # Official deepseek-chat pricing, USD per 1M tokens:

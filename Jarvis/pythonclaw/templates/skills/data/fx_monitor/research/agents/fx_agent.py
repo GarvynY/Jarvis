@@ -34,8 +34,10 @@ from fetch_rate import fetch_rate as _fetch_rate  # noqa: E402
 
 try:
     from ..schema import AgentOutput, Finding, ResearchTask, SourceRef, now_iso
+    from ..agent_audit import audit_agent_start, audit_agent_end, audit_agent_error
 except ImportError:
     from schema import AgentOutput, Finding, ResearchTask, SourceRef, now_iso  # type: ignore[no-redef]
+    from agent_audit import audit_agent_start, audit_agent_end, audit_agent_error  # type: ignore[no-redef]
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -199,6 +201,8 @@ class FXAgent:
     async def run(self, task: ResearchTask) -> AgentOutput:
         """Fetch live CNY/AUD rate data and return structured findings."""
         t0 = time.monotonic()
+        task_id = getattr(task, "task_id", "")
+        audit_agent_start(self.agent_name, task_id)
 
         # ── Guard: unsupported or missing focus_pair ──────────────────────────
         pair = (task.focus_pair or "").strip()
@@ -236,17 +240,28 @@ class FXAgent:
                 executor, _fetch_rate_cached, "90d"
             )
         except Exception as exc:
+            latency_ms = int((time.monotonic() - t0) * 1000)
+            audit_agent_error(self.agent_name, task_id, str(exc), latency_ms=latency_ms)
             return AgentOutput.make_error(
                 self.agent_name,
                 error=f"fetch_rate failed: {exc}",
-                latency_ms=int((time.monotonic() - t0) * 1000),
+                latency_ms=latency_ms,
             )
         finally:
             if "executor" in locals():
                 executor.shutdown(wait=False, cancel_futures=True)
 
         latency_ms = int((time.monotonic() - t0) * 1000)
-        return _build_output(data, task, latency_ms, self.agent_name)
+        output = _build_output(data, task, latency_ms, self.agent_name)
+        audit_agent_end(
+            self.agent_name, task_id, output.status,
+            latency_ms=latency_ms,
+            pair=safe_pair,
+            finding_count=len(output.findings),
+            source_count=len(output.sources),
+            missing_count=len(output.missing_data),
+        )
+        return output
 
 
 # ── Output builder (pure function — no I/O, no LLM) ──────────────────────────

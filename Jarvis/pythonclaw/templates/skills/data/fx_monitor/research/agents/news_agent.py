@@ -46,10 +46,12 @@ try:
     from ..schema import AgentOutput, Finding, ResearchTask, SourceRef, now_iso
     from ..llm_bridge import call_llm as _call_llm
     from ..structured_llm import call_json_with_repair, parse_json_object
+    from ..agent_audit import audit_agent_start, audit_agent_end, audit_agent_error
 except ImportError:
     from schema import AgentOutput, Finding, ResearchTask, SourceRef, now_iso  # type: ignore[no-redef]
     from llm_bridge import call_llm as _call_llm  # type: ignore[no-redef]
     from structured_llm import call_json_with_repair, parse_json_object  # type: ignore[no-redef]
+    from agent_audit import audit_agent_start, audit_agent_end, audit_agent_error  # type: ignore[no-redef]
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -678,6 +680,8 @@ class NewsAgent:
     async def run(self, task: ResearchTask) -> AgentOutput:
         """Read news cache, call LLM, return structured findings."""
         t0 = time.monotonic()
+        task_id = getattr(task, "task_id", "")
+        audit_agent_start(self.agent_name, task_id)
 
         try:
             loop = asyncio.get_running_loop()
@@ -690,14 +694,25 @@ class NewsAgent:
                 _collect_and_analyse,
             )
         except Exception as exc:
+            latency_ms = int((time.monotonic() - t0) * 1000)
+            audit_agent_error(self.agent_name, task_id, str(exc), latency_ms=latency_ms)
             return AgentOutput.make_error(
                 self.agent_name,
                 error=f"news agent failed: {exc}",
-                latency_ms=int((time.monotonic() - t0) * 1000),
+                latency_ms=latency_ms,
             )
         finally:
             if "executor" in locals():
                 executor.shutdown(wait=False, cancel_futures=True)
 
         latency_ms = int((time.monotonic() - t0) * 1000)
-        return _build_news_output(raw, task, latency_ms, self.agent_name)
+        output = _build_news_output(raw, task, latency_ms, self.agent_name)
+        audit_agent_end(
+            self.agent_name, task_id, output.status,
+            latency_ms=latency_ms,
+            finding_count=len(output.findings),
+            source_count=len(output.sources),
+            article_count=len(raw.get("articles", [])),
+            cache_error=raw.get("cache_error"),
+        )
+        return output

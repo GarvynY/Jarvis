@@ -21,8 +21,10 @@ from datetime import datetime, timezone
 
 try:
     from ..schema import AgentOutput, Finding, ResearchTask, now_iso
+    from ..agent_audit import audit_agent_start, audit_agent_end, audit_agent_error
 except ImportError:
     from schema import AgentOutput, Finding, ResearchTask, now_iso  # type: ignore[no-redef]
+    from agent_audit import audit_agent_start, audit_agent_end, audit_agent_error  # type: ignore[no-redef]
 
 _STALE_SOURCE_HOURS = 48.0
 _STALE_SOURCE_HOURS_BY_AGENT = {
@@ -122,6 +124,13 @@ class RiskAgent:
     ) -> AgentOutput:
         """Synthesise risks and contradictions from Phase-1 outputs."""
         t0 = time.monotonic()
+        task_id = getattr(task, "task_id", "")
+        input_finding_count = sum(len(o.findings) for o in phase1_outputs)
+        audit_agent_start(
+            self.agent_name, task_id,
+            input_agent_count=len(phase1_outputs),
+            input_finding_count=input_finding_count,
+        )
         retrieved_at = now_iso()
         now_dt = datetime.now(timezone.utc)
         findings: list[Finding] = []
@@ -320,6 +329,16 @@ class RiskAgent:
             ))
 
         status = "ok" if phase1_outputs else "error"
+        latency_ms = int((time.monotonic() - t0) * 1000)
+
+        contradiction_count = 1 if (bullish > 0 and bearish > 0) else 0
+        audit_agent_end(
+            self.agent_name, task_id, status,
+            latency_ms=latency_ms,
+            finding_count=len(findings),
+            contradiction_count=contradiction_count,
+            data_gap_count=len([f for f in findings if f.category == "data_gap"]),
+        )
 
         return AgentOutput(
             agent_name=self.agent_name,
@@ -331,7 +350,7 @@ class RiskAgent:
             confidence=min(avg_confidence, 0.70),
             risks=list(dict.fromkeys(risks)),   # deduplicate, preserve order
             missing_data=list(dict.fromkeys(missing)),
-            latency_ms=int((time.monotonic() - t0) * 1000),
+            latency_ms=latency_ms,
             token_usage={},
             regulatory_flags=[],
         )
