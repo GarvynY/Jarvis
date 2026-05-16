@@ -15,6 +15,7 @@ Provides:
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
@@ -126,10 +127,45 @@ class QueryPlan:
         return json.dumps(self.to_dict(), ensure_ascii=False)
 
 
+# ── focus_pair normalization ───────────────────────────────────────────────────
+
+_PAIR_SLASH_RE = re.compile(r"^[A-Z]{3}/[A-Z]{3}$")
+_PAIR_CONCAT_RE = re.compile(r"^[A-Z]{6}$")
+
+_PRESET_DEFAULT_PAIRS: dict[str, str] = {
+    "fx_cnyaud": "CNY/AUD",
+}
+
+
+def normalize_focus_pair(raw: str | None, preset_name: str = "") -> str:
+    """Normalize and validate focus_pair, returning a safe 'XXX/YYY' string.
+
+    Accepts:
+      - 'CNY/AUD' (already canonical)
+      - 'CNYAUD' or 'AUDCNY' (6 uppercase letters → split at 3)
+
+    Rejects anything else (free text, injections, punctuation beyond '/').
+    Falls back to preset default or 'CNY/AUD'.
+    """
+    fallback = _PRESET_DEFAULT_PAIRS.get(preset_name, "CNY/AUD")
+    if not raw:
+        return fallback
+
+    cleaned = raw.strip().upper()
+
+    if _PAIR_SLASH_RE.match(cleaned):
+        return cleaned
+
+    if _PAIR_CONCAT_RE.match(cleaned):
+        return f"{cleaned[:3]}/{cleaned[3:]}"
+
+    return fallback
+
+
 # ── fx_cnyaud bucket definitions ──────────────────────────────────────────────
 
 def _fx_cnyaud_buckets(task: ResearchTask) -> list[QueryBucket]:
-    pair = task.focus_pair or "CNY/AUD"
+    pair = normalize_focus_pair(task.focus_pair, task.preset_name)
     assets = task.focus_assets or ["CNY", "AUD"]
 
     return [
