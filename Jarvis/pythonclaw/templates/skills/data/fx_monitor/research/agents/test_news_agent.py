@@ -25,15 +25,19 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 import unittest.mock
 from pathlib import Path
 
 _HERE         = Path(__file__).parent
 _RESEARCH_DIR = _HERE.parent
+_FX_MONITOR_DIR = _RESEARCH_DIR.parent
 
 if str(_RESEARCH_DIR) not in sys.path:
     sys.path.insert(0, str(_RESEARCH_DIR))
+if str(_FX_MONITOR_DIR) not in sys.path:
+    sys.path.insert(0, str(_FX_MONITOR_DIR))
 
 from schema import ResearchTask, SafeUserContext, AgentOutput, FX_CNYAUD_PRESET  # noqa: E402
 from agents.news_agent import (  # noqa: E402
@@ -414,10 +418,209 @@ async def test_stale_cache_no_recent_news() -> None:
     print("   PASS")
 
 
+# ── Phase 10.5.2 — research vs notify mode tests ────────────────────────────
+
+async def test_research_mode_returns_all_despite_seen() -> None:
+    """Research mode (ignore_seen=True) returns articles even when all URLs are in seen_urls."""
+    from news_monitor import check_news, _load_state, _save_state, STATE_FILE
+    import tempfile, shutil
+
+    backup = None
+    if os.path.exists(STATE_FILE):
+        backup = STATE_FILE + ".bak"
+        shutil.copy2(STATE_FILE, backup)
+
+    try:
+        fake_urls = ["https://example.com/seen-1", "https://example.com/seen-2"]
+        _save_state({"seen_urls": fake_urls})
+
+        fake_articles = [
+            {"title": "A", "url": "https://example.com/seen-1", "published": "", "snippet": ""},
+            {"title": "B", "url": "https://example.com/seen-2", "published": "", "snippet": ""},
+            {"title": "C", "url": "https://example.com/new-3", "published": "", "snippet": ""},
+        ]
+
+        import news_monitor as _nm
+        with unittest.mock.patch.object(_nm, "_fetch_google_news_rss", return_value=fake_articles):
+            result = check_news(
+                keywords=["test"], mark_seen=False, ignore_seen=True,
+            )
+
+        assert "all_articles" in result, "Research mode must return all_articles"
+        assert result["total_all"] == 3, f"Expected 3 all_articles, got {result['total_all']}"
+        assert result["total_new"] == 1, f"Expected 1 new article, got {result['total_new']}"
+    finally:
+        if backup:
+            shutil.move(backup, STATE_FILE)
+        elif os.path.exists(STATE_FILE):
+            os.remove(STATE_FILE)
+
+    print("\n-- test_research_mode_returns_all_despite_seen")
+    print(f"   all_articles={result['total_all']}  new_articles={result['total_new']}")
+    print("   PASS")
+
+
+async def test_research_mode_does_not_modify_seen_urls() -> None:
+    """Research mode (mark_seen=False) must NOT add any URLs to seen_urls."""
+    from news_monitor import check_news, _load_state, _save_state, STATE_FILE
+    import shutil
+
+    backup = None
+    if os.path.exists(STATE_FILE):
+        backup = STATE_FILE + ".bak"
+        shutil.copy2(STATE_FILE, backup)
+
+    try:
+        original_seen = ["https://example.com/old-1"]
+        _save_state({"seen_urls": original_seen})
+
+        fake_articles = [
+            {"title": "New", "url": "https://example.com/brand-new", "published": "", "snippet": ""},
+        ]
+
+        import news_monitor as _nm
+        with unittest.mock.patch.object(_nm, "_fetch_google_news_rss", return_value=fake_articles):
+            check_news(keywords=["test"], mark_seen=False, ignore_seen=True)
+
+        state_after = _load_state()
+        assert "https://example.com/brand-new" not in state_after["seen_urls"], \
+            "Research mode must not add URLs to seen_urls"
+        assert state_after["seen_urls"] == original_seen, \
+            f"seen_urls was modified: {state_after['seen_urls']}"
+    finally:
+        if backup:
+            shutil.move(backup, STATE_FILE)
+        elif os.path.exists(STATE_FILE):
+            os.remove(STATE_FILE)
+
+    print("\n-- test_research_mode_does_not_modify_seen_urls")
+    print("   seen_urls unchanged after research mode call")
+    print("   PASS")
+
+
+async def test_research_mode_updates_cache() -> None:
+    """Research mode always writes cache even if all articles were previously seen."""
+    from news_monitor import check_news, _save_state, _load_recent_cache, \
+        STATE_FILE, RECENT_CACHE_FILE
+    import shutil
+
+    state_backup = None
+    cache_backup = None
+    if os.path.exists(STATE_FILE):
+        state_backup = STATE_FILE + ".bak"
+        shutil.copy2(STATE_FILE, state_backup)
+    if os.path.exists(RECENT_CACHE_FILE):
+        cache_backup = RECENT_CACHE_FILE + ".bak"
+        shutil.copy2(RECENT_CACHE_FILE, cache_backup)
+
+    try:
+        _save_state({"seen_urls": ["https://example.com/s1"]})
+        if os.path.exists(RECENT_CACHE_FILE):
+            os.remove(RECENT_CACHE_FILE)
+
+        fake_articles = [
+            {"title": "Seen", "url": "https://example.com/s1", "published": "", "snippet": ""},
+        ]
+
+        import news_monitor as _nm
+        with unittest.mock.patch.object(_nm, "_fetch_google_news_rss", return_value=fake_articles):
+            check_news(keywords=["test"], mark_seen=False, ignore_seen=True)
+
+        cached = _load_recent_cache()
+        assert len(cached) == 1, f"Expected 1 cached article, got {len(cached)}"
+        assert cached[0]["title"] == "Seen"
+
+        with open(RECENT_CACHE_FILE, encoding="utf-8") as f:
+            cache_data = json.load(f)
+        assert "updated_at" in cache_data, "Cache must have updated_at timestamp"
+    finally:
+        if state_backup:
+            shutil.move(state_backup, STATE_FILE)
+        elif os.path.exists(STATE_FILE):
+            os.remove(STATE_FILE)
+        if cache_backup:
+            shutil.move(cache_backup, RECENT_CACHE_FILE)
+        elif os.path.exists(RECENT_CACHE_FILE):
+            os.remove(RECENT_CACHE_FILE)
+
+    print("\n-- test_research_mode_updates_cache")
+    print(f"   cache written with {len(cached)} article(s), updated_at present")
+    print("   PASS")
+
+
+async def test_notify_mode_still_filters_seen() -> None:
+    """Notify mode (default) still filters seen URLs and marks new ones."""
+    from news_monitor import check_news, _load_state, _save_state, STATE_FILE
+    import shutil
+
+    backup = None
+    if os.path.exists(STATE_FILE):
+        backup = STATE_FILE + ".bak"
+        shutil.copy2(STATE_FILE, backup)
+
+    try:
+        _save_state({"seen_urls": ["https://example.com/already-seen"]})
+
+        fake_articles = [
+            {"title": "Old", "url": "https://example.com/already-seen", "published": "", "snippet": ""},
+            {"title": "Fresh", "url": "https://example.com/fresh", "published": "", "snippet": ""},
+        ]
+
+        import news_monitor as _nm
+        with unittest.mock.patch.object(_nm, "_fetch_google_news_rss", return_value=fake_articles):
+            result = check_news(keywords=["test"], mark_seen=True, ignore_seen=False)
+
+        assert result["total_new"] == 1, f"Expected 1 new, got {result['total_new']}"
+        assert result["new_articles"][0]["title"] == "Fresh"
+        assert "all_articles" not in result, "Notify mode should not include all_articles"
+
+        state_after = _load_state()
+        assert "https://example.com/fresh" in state_after["seen_urls"], \
+            "Notify mode must mark new URLs as seen"
+    finally:
+        if backup:
+            shutil.move(backup, STATE_FILE)
+        elif os.path.exists(STATE_FILE):
+            os.remove(STATE_FILE)
+
+    print("\n-- test_notify_mode_still_filters_seen")
+    print(f"   new_articles={result['total_new']} (correctly filtered)")
+    print("   PASS")
+
+
+async def test_news_agent_fallback_uses_research_mode() -> None:
+    """news_agent _refresh_news_via_monitor calls check_news with ignore_seen=True."""
+    import agents.news_agent as _mod
+
+    with unittest.mock.patch("news_monitor.check_news") as mock_check:
+        mock_check.return_value = {
+            "all_articles": _EXAMPLE_ARTICLES[:2],
+            "new_articles": [],
+            "fetched_at_utc": "2026-05-16T12:00:00Z",
+            "total_new": 0,
+            "total_all": 2,
+            "has_breaking": False,
+            "data_source": "test",
+            "checked_keywords": ["test"],
+        }
+        articles, error, updated_at = _mod._refresh_news_via_monitor()
+
+    mock_check.assert_called_once_with(mark_seen=False, ignore_seen=True)
+    assert len(articles) == 2, f"Expected 2 articles from all_articles, got {len(articles)}"
+    assert error is None
+    assert updated_at == "2026-05-16T12:00:00Z"
+
+    print("\n-- test_news_agent_fallback_uses_research_mode")
+    print(f"   check_news called with: {mock_check.call_args}")
+    print(f"   returned {len(articles)} articles from all_articles")
+    print("   PASS")
+
+
 # ── Runner ────────────────────────────────────────────────────────────────────
 
 async def main() -> None:
     print("Phase 9 Step 3b -- NewsAgent tests (mocked cache + LLM)")
+    print("Phase 10.5.2 -- Research vs Notify mode tests")
     print(f"Cache path: {_NEWS_CACHE_FILE}")
     print("=" * 60)
 
@@ -432,9 +635,15 @@ async def main() -> None:
     await test_banned_terms_sanitized()
     await test_stale_cache_refreshes()
     await test_stale_cache_no_recent_news()
+    # Phase 10.5.2 tests
+    await test_research_mode_returns_all_despite_seen()
+    await test_research_mode_does_not_modify_seen_urls()
+    await test_research_mode_updates_cache()
+    await test_notify_mode_still_filters_seen()
+    await test_news_agent_fallback_uses_research_mode()
 
     print("\n" + "=" * 60)
-    print("All 11 tests passed.")
+    print("All 16 tests passed.")
 
 
 if __name__ == "__main__":

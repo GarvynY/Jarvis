@@ -845,6 +845,7 @@ class RetrievalTrace:
     conflict_pairs: list[dict[str, Any]] = field(default_factory=list)
     boosted_chunk_ids: list[str] = field(default_factory=list)
     scoring_method: str = ""             # Phase 10 — "composite" or "legacy"
+    fallback_reason: str = ""            # Phase 10.5.1B — why section has no data
 
     def __post_init__(self) -> None:
         for i, score in enumerate(self.top_scores):
@@ -871,6 +872,7 @@ class RetrievalTrace:
             conflict_pairs=list(d.get("conflict_pairs") or []),
             boosted_chunk_ids=list(d.get("boosted_chunk_ids") or []),
             scoring_method=d.get("scoring_method", ""),
+            fallback_reason=d.get("fallback_reason", ""),
         )
 
 

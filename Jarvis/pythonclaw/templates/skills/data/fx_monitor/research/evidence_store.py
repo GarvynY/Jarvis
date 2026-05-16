@@ -55,12 +55,13 @@ except ImportError:
     fallback_score = None  # type: ignore[assignment]
 
 try:
-    from conflict_detector import detect_conflicts, apply_conflict_boost
+    from conflict_detector import detect_conflicts, apply_conflict_boost, ConflictSummary
 except ImportError:
     detect_conflicts = None  # type: ignore[assignment]
     apply_conflict_boost = None  # type: ignore[assignment]
+    ConflictSummary = None  # type: ignore[assignment,misc]
 
-_SCHEMA_VERSION = 4
+_SCHEMA_VERSION = 5
 
 _DDL = """\
 CREATE TABLE IF NOT EXISTS evidence_chunks (
@@ -135,7 +136,8 @@ CREATE TABLE IF NOT EXISTS retrieval_traces (
     conflict_count INTEGER NOT NULL DEFAULT 0,
     conflict_pairs_json TEXT NOT NULL DEFAULT '[]',
     boosted_chunk_ids_json TEXT NOT NULL DEFAULT '[]',
-    scoring_method  TEXT NOT NULL DEFAULT ''
+    scoring_method  TEXT NOT NULL DEFAULT '',
+    fallback_reason TEXT NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS idx_traces_task ON retrieval_traces(task_id);
@@ -188,6 +190,8 @@ class EvidenceStore:
             self._migrate_to_v3(cur)
         if current_version < 4:
             self._migrate_to_v4(cur)
+        if current_version < 5:
+            self._migrate_to_v5(cur)
         if row is None:
             cur.execute(
                 "INSERT INTO schema_version (version) VALUES (?)",
@@ -254,6 +258,15 @@ class EvidenceStore:
                 )
             except Exception:
                 pass
+
+    def _migrate_to_v5(self, cur: Any) -> None:
+        """Add fallback_reason column to retrieval_traces."""
+        try:
+            cur.execute(
+                "ALTER TABLE retrieval_traces ADD COLUMN fallback_reason TEXT NOT NULL DEFAULT ''"
+            )
+        except Exception:
+            pass
 
     def close(self) -> None:
         self._conn.close()
@@ -348,8 +361,8 @@ class EvidenceStore:
                 top_scores_json, latency_ms, timestamp, section_title,
                 selected_chunk_ids_json, section_covered, score_distribution_json,
                 conflict_count, conflict_pairs_json, boosted_chunk_ids_json,
-                scoring_method)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                scoring_method, fallback_reason)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 trace.trace_id,
                 task_id,
@@ -367,6 +380,7 @@ class EvidenceStore:
                 json.dumps(trace.conflict_pairs, ensure_ascii=False),
                 json.dumps(trace.boosted_chunk_ids, ensure_ascii=False),
                 trace.scoring_method,
+                trace.fallback_reason,
             ),
         )
         self._conn.commit()
@@ -516,6 +530,8 @@ class EvidenceStore:
                 source_label = self._resolve_source(
                     finding.source_ids, output.sources, source_map,
                 )
+                if finding.key:
+                    source_label = f"{source_label} | finding_key={finding.key}" if source_label else f"finding_key={finding.key}"
                 entities = list(task.focus_assets) if task.focus_assets else []
 
                 content = self._build_context_content(
@@ -642,6 +658,12 @@ class EvidenceStore:
         "risk": ["risk"],
     }
 
+    # Categories that must NOT fall back to task_only when empty.
+    # Rationale: task_only retrieval pulls unrelated chunks (macro, risk)
+    # into the section, consuming them via global dedup and starving
+    # downstream sections that actually need them.
+    _NO_FALLBACK_CATEGORIES: frozenset[str] = frozenset({"news_event"})
+
     @classmethod
     def _infer_categories(cls, section_title: str) -> list[str]:
         title_lower = section_title.lower()
@@ -673,6 +695,10 @@ class EvidenceStore:
 
         Provider-only labels such as google_news_rss are deliberately not used
         as evidence identity keys.
+
+        When finding_key is present in the source string, it is appended to
+        url_key so that structured agent findings sharing the same data-source
+        URL are not incorrectly collapsed into one.
         """
         text = (source or "").strip()
         if not text:
@@ -688,6 +714,14 @@ class EvidenceStore:
                 url = m_url.group(0).rstrip("。.,;")
 
         url_key = EvidenceStore._normalise_url(url)
+
+        finding_key = ""
+        m_fk = re.search(r"\bfinding_key=([^|,;\s]+)", text, flags=re.IGNORECASE)
+        if m_fk:
+            finding_key = m_fk.group(1).strip().lower()
+        if url_key and finding_key:
+            url_key = f"{url_key}#fk={finding_key}"
+
         domain = urlparse(url if re.match(r"^https?://", url or "", re.I) else f"https://{url}").netloc.lower() if url else ""
         if domain.startswith("www."):
             domain = domain[4:]
@@ -715,7 +749,9 @@ class EvidenceStore:
         outputs: list[AgentOutput],  # MVP 未使用；预留给后续嵌入向量/agent 权重扩展
         *,
         max_chunks_per_section: int = 5,
-        token_budget: int = 6000,
+        token_budget: int = 7500,
+        max_chunk_tokens: int = 1200,
+        section_token_reserves: dict[str, int] | None = None,
         safe_user_context: SafeUserContext | None = None,
     ) -> ContextPack:
         total_chunks_in_db = self.count_chunks(task.task_id)
@@ -730,15 +766,45 @@ class EvidenceStore:
         total_conflict_count = 0
         scored_chunks: dict[str, EvidenceChunk] = {}
 
+        # ── Pool-level conflict pre-scan ─────────────────────────────────────
+        # Detect conflicts across ALL task findings before per-section selection.
+        # This ensures cross-section conflicts (e.g. macro_rba vs macro_pboc
+        # in different sections) are caught reliably.
+        pool_conflicting_ids: set[str] = set()
+        pool_conflict_summary: ConflictSummary | None = None
+        if detect_conflicts is not None:
+            try:
+                all_task_findings = self._query_all_directed_findings(task.task_id)
+                if len(all_task_findings) >= 2:
+                    all_chunk_ids = []
+                    for f in all_task_findings:
+                        all_chunk_ids.extend(f.chunk_ids)
+                    chunk_entities_pool: dict[str, list[str]] = {}
+                    if all_chunk_ids:
+                        for cid in all_chunk_ids:
+                            c = self.get_chunk(cid)
+                            if c and c.entities:
+                                chunk_entities_pool[cid] = c.entities
+                    pool_conflict_summary = detect_conflicts(
+                        all_task_findings, chunk_entities=chunk_entities_pool,
+                    )
+                    pool_conflicting_ids = pool_conflict_summary.conflicting_chunk_ids
+            except Exception:
+                _log.warning("pool-level conflict detection failed", exc_info=True)
+
+        # ── Phase 1: reserve best chunk per section ─────────────────────────
+        # Pre-scan every section to find its top-1 candidate, then reserve
+        # token budget so that later greedy fill cannot starve any section.
+        section_prepared: list[dict[str, Any]] = []
+        reserved_tokens = 0
+        reserved_chunk_ids: set[str] = set()
+        phase1_seen_urls: set[str] = set()
+
         for section_title in preset.report_sections:
-            if tokens_used >= token_budget:
-                break
-
-            t0 = time.monotonic()
             categories = self._infer_categories(section_title)
-
             candidates: list[EvidenceChunk] = []
             candidate_ids: set[str] = set()
+            fallback_reason = ""
             filter_desc_parts: list[str] = [f"task_id={task.task_id}"]
 
             if categories:
@@ -752,20 +818,116 @@ class EvidenceStore:
                             candidate_ids.add(c.chunk_id)
                             candidates.append(c)
                 filter_desc_parts.append(f"categories={categories}")
-            pre_dedup_count = len(candidates)
 
             if not candidates:
-                candidates = self.query_chunks(
-                    task.task_id,
-                    top_k=max_chunks_per_section * 3,
+                blocked = set(categories) & self._NO_FALLBACK_CATEGORIES if categories else set()
+                if blocked:
+                    fallback_reason = f"no_{'_'.join(sorted(blocked))}_evidence"
+                    filter_desc_parts.append(f"fallback=blocked({fallback_reason})")
+                else:
+                    candidates = self.query_chunks(
+                        task.task_id,
+                        top_k=max_chunks_per_section * 3,
+                    )
+                    filter_desc_parts.append("fallback=task_only")
+
+            pre_dedup_count = len(candidates)
+
+            # Section-level reserve limit from config
+            section_reserve = 0
+            if section_token_reserves and categories:
+                for cat in categories:
+                    if cat in section_token_reserves:
+                        section_reserve = section_token_reserves[cat]
+                        break
+
+            deduped: list[EvidenceChunk] = []
+            local_keys: set[str] = set()
+            for c in candidates:
+                if c.chunk_id in reserved_chunk_ids:
+                    continue
+                if max_chunk_tokens and c.token_estimate > max_chunk_tokens:
+                    continue
+                url_key, title_domain_key, _provider = self._source_identity(c.source)
+                if url_key and url_key in phase1_seen_urls:
+                    continue
+                local_key = url_key or title_domain_key
+                if local_key and local_key in local_keys:
+                    continue
+                deduped.append(c)
+                if local_key:
+                    local_keys.add(local_key)
+
+            # Score candidates to find the best one for reservation
+            section_score_map: dict[str, float] = {}
+            if use_scorer:
+                try:
+                    for c in deduped:
+                        es = compute_evidence_score(c, safe_user_context)
+                        section_score_map[c.chunk_id] = es.composite_score
+                        c.composite_score = es.composite_score
+                        c.attention_score = es.attention_score
+                        c.score_importance = es.importance
+                        c.score_confidence = es.confidence
+                        c.score_recency = es.recency_score
+                        c.score_source_quality = es.source_quality_score
+                        c.score_user_relevance = es.user_relevance_score
+                        c.score_conflict_value = es.conflict_value
+                        c.score_reason = es.reason
+                        scored_chunks[c.chunk_id] = c
+                    deduped.sort(
+                        key=lambda c: section_score_map.get(c.chunk_id, 0.0),
+                        reverse=True,
+                    )
+                except Exception:
+                    deduped.sort(
+                        key=lambda c: (c.importance, c.confidence, c.created_at),
+                        reverse=True,
+                    )
+            else:
+                deduped.sort(
+                    key=lambda c: (c.importance, c.confidence, c.created_at),
+                    reverse=True,
                 )
-                filter_desc_parts.append("fallback=task_only")
-                pre_dedup_count = len(candidates)
+
+            best: EvidenceChunk | None = deduped[0] if deduped else None
+            if best is not None:
+                reserved_chunk_ids.add(best.chunk_id)
+                reserved_tokens += best.token_estimate
+                url_key_best, _, _ = self._source_identity(best.source)
+                if url_key_best:
+                    phase1_seen_urls.add(url_key_best)
+
+            section_prepared.append({
+                "section_title": section_title,
+                "candidates_all": candidates,
+                "pre_dedup_count": pre_dedup_count,
+                "filter_desc_parts": filter_desc_parts,
+                "fallback_reason": fallback_reason,
+                "reserved_chunk": best,
+                "section_reserve": section_reserve,
+            })
+
+        # ── Phase 2: greedy fill with reserved budget protection ─────────
+        for sec in section_prepared:
+            section_title = sec["section_title"]
+            if tokens_used >= token_budget:
+                break
+
+            t0 = time.monotonic()
+            candidates = sec["candidates_all"]
+            pre_dedup_count = sec["pre_dedup_count"]
+            filter_desc_parts = sec["filter_desc_parts"]
+            fallback_reason = sec["fallback_reason"]
+            reserved_chunk: EvidenceChunk | None = sec["reserved_chunk"]
+            section_reserve: int = sec["section_reserve"]
 
             deduped: list[EvidenceChunk] = []
             local_keys: set[str] = set()
             for c in candidates:
                 if c.chunk_id in seen_chunk_ids:
+                    continue
+                if max_chunk_tokens and c.token_estimate > max_chunk_tokens:
                     continue
                 url_key, title_domain_key, _provider = self._source_identity(c.source)
                 if url_key and url_key in seen_urls:
@@ -773,7 +935,6 @@ class EvidenceStore:
                 local_key = url_key or title_domain_key
                 if local_key and local_key in local_keys:
                     continue
-
                 deduped.append(c)
                 if local_key:
                     local_keys.add(local_key)
@@ -785,63 +946,101 @@ class EvidenceStore:
             if use_scorer:
                 try:
                     for c in deduped:
-                        es = compute_evidence_score(c, safe_user_context)
-                        score_map[c.chunk_id] = es.composite_score
-                        c.composite_score = es.composite_score
-                        c.attention_score = es.attention_score
-                        c.score_importance = es.importance
-                        c.score_confidence = es.confidence
-                        c.score_recency = es.recency_score
-                        c.score_source_quality = es.source_quality_score
-                        c.score_user_relevance = es.user_relevance_score
-                        c.score_conflict_value = es.conflict_value
-                        c.score_reason = es.reason
-                        scored_chunks[c.chunk_id] = c
+                        if c.chunk_id in scored_chunks:
+                            sc = scored_chunks[c.chunk_id]
+                            score_map[c.chunk_id] = sc.composite_score
+                            c.composite_score = sc.composite_score
+                            c.attention_score = sc.attention_score
+                            c.score_importance = sc.score_importance
+                            c.score_confidence = sc.score_confidence
+                            c.score_recency = sc.score_recency
+                            c.score_source_quality = sc.score_source_quality
+                            c.score_user_relevance = sc.score_user_relevance
+                            c.score_conflict_value = sc.score_conflict_value
+                            c.score_reason = sc.score_reason
+                        else:
+                            es = compute_evidence_score(c, safe_user_context)
+                            score_map[c.chunk_id] = es.composite_score
+                            c.composite_score = es.composite_score
+                            c.attention_score = es.attention_score
+                            c.score_importance = es.importance
+                            c.score_confidence = es.confidence
+                            c.score_recency = es.recency_score
+                            c.score_source_quality = es.source_quality_score
+                            c.score_user_relevance = es.user_relevance_score
+                            c.score_conflict_value = es.conflict_value
+                            c.score_reason = es.reason
+                            scored_chunks[c.chunk_id] = c
 
-                    if detect_conflicts is not None and len(deduped) >= 2:
+                    # Conflict detection: combine pool-level + section-level results
+                    if detect_conflicts is not None and len(deduped) >= 1:
                         try:
-                            candidate_chunk_ids = [c.chunk_id for c in deduped]
-                            findings = self._query_findings_by_chunks(
-                                candidate_chunk_ids, task.task_id,
-                            )
-                            if len(findings) >= 2:
-                                chunk_entities: dict[str, list[str]] = {
-                                    c.chunk_id: c.entities
-                                    for c in deduped
-                                    if c.entities
-                                }
-                                summary = detect_conflicts(
-                                    findings, chunk_entities=chunk_entities,
+                            # Pool-level conflicts for chunks in THIS section
+                            section_cids = {c.chunk_id for c in deduped}
+                            pool_hits_here = pool_conflicting_ids & section_cids
+
+                            # Section-level detection (original logic)
+                            section_summary: ConflictSummary | None = None
+                            if len(deduped) >= 2:
+                                candidate_chunk_ids = [c.chunk_id for c in deduped]
+                                findings = self._query_findings_by_chunks(
+                                    candidate_chunk_ids, task.task_id,
                                 )
-                                section_conflict_count = summary.conflict_count
+                                if len(findings) >= 2:
+                                    chunk_entities: dict[str, list[str]] = {
+                                        c.chunk_id: c.entities
+                                        for c in deduped
+                                        if c.entities
+                                    }
+                                    section_summary = detect_conflicts(
+                                        findings, chunk_entities=chunk_entities,
+                                    )
+
+                            # Merge: use section-level if it found conflicts,
+                            # otherwise fall back to pool-level for this section's chunks
+                            if section_summary and section_summary.conflict_count > 0:
+                                effective_summary = section_summary
+                            elif pool_hits_here and pool_conflict_summary:
+                                effective_summary = ConflictSummary(
+                                    conflicts=[
+                                        cp for cp in pool_conflict_summary.conflicts
+                                        if cp.chunk_id_a in section_cids or cp.chunk_id_b in section_cids
+                                    ],
+                                    conflict_count=len(pool_hits_here),
+                                    conflicting_chunk_ids=pool_hits_here,
+                                )
+                            else:
+                                effective_summary = None
+
+                            if effective_summary and effective_summary.conflict_count > 0:
+                                section_conflict_count = effective_summary.conflict_count
                                 total_conflict_count += section_conflict_count
-                                if section_conflict_count > 0:
-                                    before_scores = dict(score_map)
-                                    apply_conflict_boost(
-                                        score_map, summary,
-                                        boost=_CONFLICT_SELECTION_BOOST,
-                                    )
-                                    boosted_chunk_ids = sorted(
-                                        cid for cid in summary.conflicting_chunk_ids
-                                        if score_map.get(cid, 0.0) > before_scores.get(cid, 0.0)
-                                    )
-                                    for c in deduped:
-                                        if c.chunk_id in score_map:
-                                            delta = max(
-                                                0.0,
-                                                score_map[c.chunk_id] - before_scores.get(c.chunk_id, 0.0),
-                                            )
-                                            c.composite_score = score_map[c.chunk_id]
-                                            c.attention_score = score_map[c.chunk_id]
-                                            if delta > 0:
-                                                c.score_conflict_value = round(delta, 4)
-                                                if "conflict_boost" not in c.score_reason:
-                                                    c.score_reason = (
-                                                        f"{c.score_reason},conflict_boost"
-                                                        if c.score_reason else "conflict_boost"
-                                                    )
-                                            scored_chunks[c.chunk_id] = c
-                                    section_conflict_pairs = [cp.to_dict() for cp in summary.conflicts]
+                                before_scores = dict(score_map)
+                                apply_conflict_boost(
+                                    score_map, effective_summary,
+                                    boost=_CONFLICT_SELECTION_BOOST,
+                                )
+                                boosted_chunk_ids = sorted(
+                                    cid for cid in effective_summary.conflicting_chunk_ids
+                                    if score_map.get(cid, 0.0) > before_scores.get(cid, 0.0)
+                                )
+                                for c in deduped:
+                                    if c.chunk_id in score_map:
+                                        delta = max(
+                                            0.0,
+                                            score_map[c.chunk_id] - before_scores.get(c.chunk_id, 0.0),
+                                        )
+                                        c.composite_score = score_map[c.chunk_id]
+                                        c.attention_score = score_map[c.chunk_id]
+                                        if delta > 0:
+                                            c.score_conflict_value = round(delta, 4)
+                                            if "conflict_boost" not in c.score_reason:
+                                                c.score_reason = (
+                                                    f"{c.score_reason},conflict_boost"
+                                                    if c.score_reason else "conflict_boost"
+                                                )
+                                        scored_chunks[c.chunk_id] = c
+                                section_conflict_pairs = [cp.to_dict() for cp in effective_summary.conflicts]
                         except Exception:
                             _log.warning(
                                 "conflict_detector failed; using scored sort",
@@ -876,12 +1075,52 @@ class EvidenceStore:
                     reverse=True,
                 )
 
+            # Compute tokens reserved by OTHER sections' reserved chunks
+            # (not yet selected), so we don't steal their budget.
+            other_reserved_tokens = 0
+            for other_sec in section_prepared:
+                if other_sec["section_title"] == section_title:
+                    continue
+                rc: EvidenceChunk | None = other_sec["reserved_chunk"]
+                if rc is not None and rc.chunk_id not in seen_chunk_ids:
+                    other_reserved_tokens += rc.token_estimate
+
             section_items: list[ContextPackItem] = []
             skipped_over_budget = 0
+
+            # Ensure reserved chunk is selected first if available
+            if reserved_chunk is not None and reserved_chunk.chunk_id not in seen_chunk_ids:
+                rc = reserved_chunk
+                if tokens_used + rc.token_estimate <= token_budget:
+                    rc.used_in_brief = True
+                    cs = score_map.get(rc.chunk_id, rc.importance)
+                    item = ContextPackItem(
+                        chunk_id=rc.chunk_id,
+                        agent_name=rc.agent_name,
+                        text=rc.content,
+                        relevance_score=cs,
+                        token_estimate=rc.token_estimate,
+                        composite_score=rc.composite_score,
+                        attention_score=rc.attention_score,
+                    )
+                    section_items.append(item)
+                    seen_chunk_ids.add(rc.chunk_id)
+                    url_key_rc, _, _ = self._source_identity(rc.source)
+                    if url_key_rc:
+                        seen_urls.add(url_key_rc)
+                    tokens_used += rc.token_estimate
+
+            section_tokens_used = sum(it.token_estimate for it in section_items)
             for c in deduped:
                 if len(section_items) >= max_chunks_per_section:
                     break
-                if tokens_used + c.token_estimate > token_budget:
+                if c.chunk_id in seen_chunk_ids:
+                    continue
+                available = token_budget - tokens_used - other_reserved_tokens
+                if c.token_estimate > available:
+                    skipped_over_budget += 1
+                    continue
+                if section_reserve and section_tokens_used + c.token_estimate > section_reserve:
                     skipped_over_budget += 1
                     continue
                 c.used_in_brief = True
@@ -901,6 +1140,7 @@ class EvidenceStore:
                 if url_key:
                     seen_urls.add(url_key)
                 tokens_used += c.token_estimate
+                section_tokens_used += c.token_estimate
 
             all_items.extend(section_items)
 
@@ -945,6 +1185,7 @@ class EvidenceStore:
                 conflict_pairs=section_conflict_pairs,
                 boosted_chunk_ids=boosted_chunk_ids,
                 scoring_method=scoring_method,
+                fallback_reason=fallback_reason,
             )
             self.insert_trace(trace, task_id=task.task_id)
             traces.append(trace)
@@ -1033,6 +1274,16 @@ class EvidenceStore:
             if target & set(f.chunk_ids):
                 results.append(f)
         return results
+
+    def _query_all_directed_findings(self, task_id: str) -> list[EvidenceFinding]:
+        """Return ALL findings with non-null direction for the given task."""
+        rows = self._conn.execute(
+            "SELECT * FROM evidence_findings "
+            "WHERE task_id = ? AND direction IS NOT NULL "
+            "AND direction NOT IN ('neutral', 'mixed', 'unknown')",
+            (task_id,),
+        ).fetchall()
+        return [self._row_to_finding(r) for r in rows]
 
     # ── 清理 ─────────────────────────────────────────────────────────────────
 
@@ -1144,4 +1395,5 @@ class EvidenceStore:
             conflict_pairs=list(_json_col("conflict_pairs_json", [])),
             boosted_chunk_ids=list(_json_col("boosted_chunk_ids_json", [])),
             scoring_method=_col("scoring_method", ""),
+            fallback_reason=_col("fallback_reason", ""),
         )

@@ -94,6 +94,12 @@ _BANNED_TERMS: tuple[str, ...] = (
 )
 _SAFE_REPLACEMENT = "（已移除确定性建议）"
 _VALID_DIRECTIONS = {"bullish_aud", "bearish_aud", "neutral"}
+
+# Only these high-level signal keys may carry a directional claim.
+_DIRECTIONAL_KEYS: frozenset[str] = frozenset({
+    "macro_rba", "macro_pboc", "macro_usd", "macro_trade",
+})
+
 _CACHE_TTL_SECONDS: float = 180.0
 _COLLECT_CACHE: dict[tuple[int, int], tuple[float, dict[str, Any]]] = {}
 
@@ -333,13 +339,8 @@ def _parse_llm_response(
                         source_ids=_source_ids_for_signal(field),
                     ))
 
-                overall_direction = data.get("overall_direction")
-                detail_direction = (
-                    _safe_direction(overall_direction)
-                    if overall_direction in _VALID_DIRECTIONS
-                    else None
-                )
-                # Facts in detail findings come only from retrieved search titles.
+                # Detail findings are news headlines — they carry no independent
+                # directional analysis, so direction is always None.
                 for i, r in enumerate(results[: max(0, _MAX_FINDINGS - len(findings))]):
                     title = r.get("title", "").strip()
                     if not title:
@@ -347,7 +348,7 @@ def _parse_llm_response(
                     findings.append(Finding(
                         key=f"macro_detail_{i}",
                         summary=title[:220],
-                        direction=detail_direction,
+                        direction=None,
                         source_ids=[r.get("url", "")] if r.get("url") else [],
                     ))
 
@@ -368,6 +369,64 @@ def _parse_llm_response(
             ))
     summary = f"基于 {len(results)} 条搜索结果（LLM分析不可用）"
     return findings, [], summary, [], False
+
+
+# ── Direction stabilisation ───────────────────────────────────────────────────
+
+def _stabilise_directions(
+    findings: list[Finding],
+    results: list[dict[str, Any]],
+) -> tuple[list[Finding], list[str]]:
+    """Post-process findings to ensure direction stability.
+
+    Rules:
+      1. Only _DIRECTIONAL_KEYS may carry a non-None direction.
+      2. Invalid direction values are reset to None.
+      3. macro_usd: if no USD-related search results exist, direction is
+         downgraded to None and a data_gap is emitted.
+      4. macro_detail_* / macro_raw_* always get direction=None.
+
+    Returns (stabilised_findings, extra_data_gaps).
+    """
+    usd_patterns = ("fed", "federal reserve", "usd", "dollar", "美元", "美联储")
+    has_usd_evidence = any(
+        any(p in " ".join(str(r.get(k, "") or "") for k in ("query", "title", "snippet")).lower()
+            for p in usd_patterns)
+        for r in results
+    )
+
+    extra_gaps: list[str] = []
+    stable: list[Finding] = []
+    for f in findings:
+        if f.key not in _DIRECTIONAL_KEYS:
+            if f.direction is not None:
+                f = Finding(
+                    key=f.key, summary=f.summary, direction=None,
+                    category=f.category, importance=f.importance,
+                    source_ids=f.source_ids,
+                    time_sensitivity=f.time_sensitivity,
+                    evidence_score=f.evidence_score,
+                )
+            stable.append(f)
+            continue
+
+        direction = f.direction
+        if direction is not None and direction not in _VALID_DIRECTIONS:
+            direction = None
+
+        if f.key == "macro_usd" and not has_usd_evidence:
+            if direction and direction != "neutral":
+                direction = None
+                extra_gaps.append("macro_usd_no_source_evidence")
+
+        stable.append(Finding(
+            key=f.key, summary=f.summary, direction=direction,
+            category=f.category, importance=f.importance,
+            source_ids=f.source_ids,
+            time_sensitivity=f.time_sensitivity,
+            evidence_score=f.evidence_score,
+        ))
+    return stable, extra_gaps
 
 
 # ── Combined blocking task ────────────────────────────────────────────────────
@@ -488,8 +547,10 @@ def _build_macro_output(
     findings, llm_risks, summary, data_gaps, unsafe_removed = _parse_llm_response(
         llm_text, results, successful
     )
+    findings, direction_gaps = _stabilise_directions(findings, results)
     risks.extend(llm_risks)
     missing.extend(data_gaps)
+    missing.extend(direction_gaps)
     if unsafe_removed:
         missing.append("unsafe_llm_terms_removed")
         risks.append("LLM 输出包含确定性建议词，已清洗后再进入结果。")

@@ -156,13 +156,21 @@ def check_news(
     keywords: list[str] | None = None,
     max_per_keyword: int = 3,
     mark_seen: bool = True,
+    ignore_seen: bool = False,
 ) -> dict:
     """
-    Fetch news for each keyword, return only articles not yet seen.
+    Fetch news for each keyword.
+
+    Modes:
+      - notify (default): filter by seen_urls, mark new URLs as seen,
+        update cache only when new articles found.
+      - research (ignore_seen=True, mark_seen=False): skip seen_urls filter,
+        don't mutate seen state, always refresh cache with fetched articles.
 
     Returns:
       {
         "new_articles": [...],
+        "all_articles": [...],   # present only when ignore_seen=True
         "checked_keywords": [...],
         "fetched_at": "...",
         "total_new": int,
@@ -170,7 +178,6 @@ def check_news(
       }
     """
     if not keywords:
-        # Flatten default groups
         keywords = [kw for group in DEFAULT_KEYWORD_GROUPS.values() for kw in group]
 
     state = _load_state()
@@ -178,6 +185,8 @@ def check_news(
     now_utc = datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z"
 
     new_articles: list[dict] = []
+    all_articles: list[dict] = []
+    seen_dedup: set[str] = set()
 
     for kw in keywords:
         articles = _fetch_google_news_rss(kw, max_items=max_per_keyword)
@@ -185,8 +194,14 @@ def check_news(
             if "error" in art:
                 continue
             url = art.get("url", "")
-            if url and url not in seen:
-                art["keyword"] = kw
+            if not url:
+                continue
+            if url in seen_dedup:
+                continue
+            seen_dedup.add(url)
+            art["keyword"] = kw
+            all_articles.append(art)
+            if url not in seen:
                 new_articles.append(art)
                 if mark_seen:
                     seen.add(url)
@@ -195,12 +210,14 @@ def check_news(
         state["seen_urls"] = list(seen)
         state["last_check"] = now_utc
         _save_state(state)
-        # Update recent article cache (prepend new articles, newest first)
         if new_articles:
             cached = _load_recent_cache()
             _save_recent_cache(new_articles + cached)
 
-    return {
+    if ignore_seen and all_articles:
+        _save_recent_cache(all_articles)
+
+    result: dict = {
         "new_articles": new_articles,
         "checked_keywords": keywords,
         "fetched_at_utc": now_utc,
@@ -208,6 +225,10 @@ def check_news(
         "has_breaking": len(new_articles) > 0,
         "data_source": "Google News RSS (free, no API key)",
     }
+    if ignore_seen:
+        result["all_articles"] = all_articles
+        result["total_all"] = len(all_articles)
+    return result
 
 
 def _format_text(result: dict) -> str:

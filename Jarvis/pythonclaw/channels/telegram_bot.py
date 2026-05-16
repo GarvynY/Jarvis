@@ -1255,6 +1255,7 @@ class TelegramBot:
             _coord  = _importlib.import_module("coordinator")
             _super  = _importlib.import_module("supervisor")
             _schema = _importlib.import_module("schema")
+            _baseline = _importlib.import_module("baseline_recorder")
 
             run_research          = _coord.run_research
             SupervisorWriter      = _super.SupervisorReportWriter
@@ -1294,6 +1295,23 @@ class TelegramBot:
             )
 
             text = _format_research_brief(brief, latency_s)
+            metrics_result = _baseline.record_fx_research_run(
+                task=task,
+                preset=preset,
+                outputs=outputs,
+                brief=brief,
+                latency_s=latency_s,
+                trigger="telegram",
+                user_id=user_id,
+                followup_requests=[],
+                record_baseline=False,
+            )
+            if metrics_result.error:
+                logger.warning(
+                    "[Telegram] /fx_research metrics record failed task_id=%s error=%s",
+                    task.task_id[:8],
+                    metrics_result.error,
+                )
 
             try:
                 await notice.delete()

@@ -955,6 +955,7 @@ async def _debug_fx_research_page(request: Request):
     label {{ display: block; margin: 14px 0 6px; color: #cbd5e1; font-size: 13px; }}
     input, button, textarea {{ font: inherit; }}
     input {{ width: 100%; box-sizing: border-box; border: 1px solid #334155; border-radius: 8px; padding: 10px 12px; background: #111827; color: #e5e7eb; }}
+    input[type="checkbox"] {{ width: auto; margin-right: 8px; }}
     button {{ margin-top: 16px; border: 0; border-radius: 8px; padding: 10px 14px; background: #38bdf8; color: #082f49; font-weight: 700; cursor: pointer; }}
     button:disabled {{ opacity: .6; cursor: wait; }}
     pre {{ white-space: pre-wrap; word-break: break-word; border: 1px solid #334155; border-radius: 8px; padding: 14px; background: #020617; min-height: 240px; }}
@@ -982,6 +983,10 @@ async def _debug_fx_research_page(request: Request):
         <input id="userId" inputmode="numeric" placeholder="Telegram user id；留空则使用 0">
       </div>
     </div>
+    <label>
+      <input id="recordBaseline" type="checkbox">
+      Record sanitized baseline snapshot
+    </label>
     <button id="run">Run /fx_research</button>
     <p id="meta" class="muted"></p>
     <section class="panel">
@@ -1044,7 +1049,8 @@ async def _debug_fx_research_page(request: Request):
           }},
           body: JSON.stringify({{
             user_id: document.getElementById('userId').value || 0,
-            preset_name: 'fx_cnyaud'
+            preset_name: 'fx_cnyaud',
+            record_baseline: document.getElementById('recordBaseline').checked
           }})
         }});
         const data = await res.json();
@@ -1108,6 +1114,11 @@ async def _api_debug_fx_research(request: Request):
             {"ok": False, "error": "user_id must be an integer."},
             status_code=400,
         )
+    raw_record_baseline = body.get("record_baseline", False)
+    record_baseline = (
+        raw_record_baseline is True
+        or str(raw_record_baseline).strip().lower() in {"1", "true", "yes", "on"}
+    )
 
     t0 = time.monotonic()
     try:
@@ -1123,6 +1134,7 @@ async def _api_debug_fx_research(request: Request):
         _schema = importlib.import_module("schema")
         _followup = importlib.import_module("followup_router")
         _evidence_store = importlib.import_module("evidence_store")
+        _baseline = importlib.import_module("baseline_recorder")
 
         task, outputs, cost_estimate = await _coord.run_research(
             preset_name=preset_name,
@@ -1168,6 +1180,18 @@ async def _api_debug_fx_research(request: Request):
             context_pack=None,
             conflict_summary={"conflict_count": trace_summary["conflict_count"]},
         )
+        baseline_result = _baseline.record_fx_research_run(
+            task=task,
+            preset=preset,
+            outputs=outputs,
+            brief=brief,
+            latency_s=latency_s,
+            trigger="debug_api",
+            user_id=user_id,
+            followup_requests=followup_requests,
+            record_baseline=record_baseline,
+            phase10=phase10,
+        )
         return JSONResponse({
             "ok": True,
             "brief_id": brief.task_id[:8],
@@ -1179,6 +1203,13 @@ async def _api_debug_fx_research(request: Request):
             "phase10": phase10,
             "followup_execution_enabled": False,
             "followup_requests": [req.to_dict() for req in followup_requests],
+            "baseline_recording": {
+                "metrics_written": baseline_result.metrics_written,
+                "baseline_written": baseline_result.baseline_written,
+                "metrics_db_path": baseline_result.metrics_db_path,
+                "baseline_path": baseline_result.baseline_path,
+                "error": baseline_result.error,
+            },
             "text": text,
         })
     except Exception as exc:

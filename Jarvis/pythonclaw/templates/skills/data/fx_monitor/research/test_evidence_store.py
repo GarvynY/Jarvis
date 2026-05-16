@@ -573,9 +573,9 @@ def test_ingest_default_category_importance() -> None:
         assert chunk.category == ""
         assert chunk.importance == 0.5
         assert chunk.confidence == 0.5
-        assert chunk.source is None
+        assert chunk.source == "finding_key=bare"
         assert "未分类" in chunk.content
-        assert "未知" in chunk.content
+        assert "finding_key=bare" in chunk.content
     print("  ingest 默认值安全       OK")
 
 
@@ -946,7 +946,7 @@ def test_pack_skips_oversized_candidate_and_keeps_section_covered() -> None:
             source="url=https://example.com/small",
         ))
 
-        pack = store.build_context_pack(task, preset, [], token_budget=6000)
+        pack = store.build_context_pack(task, preset, [], token_budget=6000, max_chunk_tokens=0)
         assert [item.chunk_id for item in pack.items] == ["macro-small"]
         trace = store.list_traces("task-budget-skip")[0]
         assert trace.section_covered is True
@@ -1686,6 +1686,616 @@ def test_preselection_no_conflict_keeps_rank() -> None:
     print("  10C.1D: 无冲突排名不变        OK")
 
 
+# ── Phase 10.5.1A: FX evidence deduplication fix ─────────────────────────────
+
+def test_fx_finding_key_dedup_keeps_all_five() -> None:
+    """5 FX chunks with same source URL but different finding_key should not collapse."""
+    preset = ResearchPreset(
+        name="fx_dedup_test",
+        research_type="fx",
+        default_agents=[],
+        report_sections=["汇率事实"],
+        banned_terms=[],
+        default_time_horizon="short_term",
+    )
+    with EvidenceStore(":memory:") as store:
+        task = _make_task(task_id="t-fx-dedup")
+        fx_keys = ["current_rate", "bank_spread", "historical_trend", "recent_range", "target_rate_gap"]
+        for i, fk in enumerate(fx_keys):
+            store.insert_chunk(_make_chunk(
+                chunk_id=f"fx-{fk}", task_id="t-fx-dedup", category="fx_price",
+                agent_name="fx_agent", importance=0.85 - i * 0.02,
+                content=f"FX finding: {fk} data here" * 3,
+                source=f"url=https://open.er-api.com/v6/latest/CNY | title=CNY/AUD 市场实时汇率 | provider=er-api | finding_key={fk}",
+            ))
+
+        pack = store.build_context_pack(task, preset, [], max_chunks_per_section=5, token_budget=50000)
+        ids = [it.chunk_id for it in pack.items]
+        for fk in fx_keys:
+            assert f"fx-{fk}" in ids, f"fx-{fk} missing from pack: {ids}"
+        assert len(ids) == 5
+    print("  10.5.1A: FX 5 findings 同 URL 不折叠  OK")
+
+
+def test_news_same_url_still_deduped() -> None:
+    """Duplicate news chunks with same canonical URL (no finding_key) should still dedup."""
+    preset = ResearchPreset(
+        name="news_dedup_test",
+        research_type="fx",
+        default_agents=[],
+        report_sections=["新闻驱动"],
+        banned_terms=[],
+        default_time_horizon="short_term",
+    )
+    with EvidenceStore(":memory:") as store:
+        task = _make_task(task_id="t-news-dedup")
+        store.insert_chunk(_make_chunk(
+            chunk_id="news-1", task_id="t-news-dedup", category="news_event",
+            agent_name="news_agent", importance=0.9, content="RBA holds rate" * 5,
+            source="url=https://reuters.com/rba-hold | title=RBA holds rates | provider=google_news_rss",
+        ))
+        store.insert_chunk(_make_chunk(
+            chunk_id="news-2", task_id="t-news-dedup", category="news_event",
+            agent_name="news_agent", importance=0.8, content="RBA rate hold" * 5,
+            source="url=https://www.reuters.com/rba-hold/ | title=RBA holds rates copy | provider=tavily",
+        ))
+
+        pack = store.build_context_pack(task, preset, [], max_chunks_per_section=5, token_budget=50000)
+        ids = [it.chunk_id for it in pack.items]
+        selected_news = [i for i in ids if i in ("news-1", "news-2")]
+        assert len(selected_news) == 1, f"Expected 1 news chunk after URL dedup, got {selected_news}"
+    print("  10.5.1A: 新闻同 URL 仍正常去重       OK")
+
+
+def test_context_pack_fx_section_multi_select() -> None:
+    """ContextPack for 汇率事实 can select more than one FX evidence if budget allows."""
+    preset = ResearchPreset(
+        name="fx_multi_select",
+        research_type="fx",
+        default_agents=[],
+        report_sections=["汇率事实"],
+        banned_terms=[],
+        default_time_horizon="short_term",
+    )
+    with EvidenceStore(":memory:") as store:
+        task = _make_task(task_id="t-fx-multi")
+        out = AgentOutput(
+            agent_name="fx_agent",
+            status="ok",
+            confidence=0.85,
+            findings=[
+                Finding(key="current_rate", summary="1 AUD = 4.9200 CNY", category="fx_price", importance=0.85),
+                Finding(key="bank_spread", summary="银行牌价样本10家", category="fx_price", importance=0.80),
+                Finding(key="historical_trend", summary="90日趋势数据", direction="bearish_aud", category="fx_price", importance=0.75),
+            ],
+            sources=[SourceRef(title="CNY/AUD 市场实时汇率", url="https://open.er-api.com/v6/latest/CNY", source="er-api", retrieved_at=now_iso())],
+        )
+        enriched = store.ingest_outputs(task, [out])
+
+        pack = store.build_context_pack(task, preset, enriched, max_chunks_per_section=5, token_budget=50000)
+        fx_items = [it for it in pack.items if it.agent_name == "fx_agent"]
+        assert len(fx_items) >= 3, f"Expected >=3 FX items, got {len(fx_items)}: {[it.chunk_id for it in fx_items]}"
+    print("  10.5.1A: 汇率事实多选 FX evidence OK")
+
+
+# ── Phase 10.5.1B: News section fallback restriction ─────────────────────────
+
+def test_news_section_no_fallback_to_macro() -> None:
+    """news_agent=0 → 新闻驱动 section must NOT pull macro/risk chunks."""
+    preset = ResearchPreset(
+        name="news_no_fallback",
+        research_type="fx",
+        default_agents=[],
+        report_sections=["新闻驱动", "宏观信号"],
+        banned_terms=[],
+        default_time_horizon="short_term",
+    )
+    with EvidenceStore(":memory:") as store:
+        task = _make_task(task_id="t-news-nofb")
+        store.insert_chunk(_make_chunk(
+            chunk_id="macro-1", task_id="t-news-nofb", category="macro",
+            agent_name="macro_agent", importance=0.9, content="RBA rate hold" * 5,
+            source="url=https://rba.gov.au/rate | finding_key=rba_hold",
+        ))
+        store.insert_chunk(_make_chunk(
+            chunk_id="macro-2", task_id="t-news-nofb", category="macro",
+            agent_name="macro_agent", importance=0.8, content="PBoC rate cut" * 5,
+            source="url=https://pboc.gov.cn/rate | finding_key=pboc_cut",
+        ))
+
+        pack = store.build_context_pack(task, preset, [], max_chunks_per_section=5, token_budget=50000)
+
+        news_trace = next(t for t in store.list_traces("t-news-nofb") if t.section_title == "新闻驱动")
+        assert news_trace.section_covered is False
+        assert news_trace.selected_chunk_ids == []
+        assert news_trace.retrieved_count == 0
+        assert "fallback=blocked" in news_trace.query
+
+        macro_items = [it for it in pack.items if it.agent_name == "macro_agent"]
+        assert len(macro_items) == 2, f"Expected 2 macro items, got {len(macro_items)}: {[it.chunk_id for it in macro_items]}"
+    print("  10.5.1B: 新闻无数据不抢占宏观 chunks  OK")
+
+
+def test_macro_section_retains_chunks_with_empty_news() -> None:
+    """With news_agent=0, macro section retains all its chunks."""
+    preset = ResearchPreset(
+        name="macro_retain",
+        research_type="fx",
+        default_agents=[],
+        report_sections=["新闻驱动", "宏观信号", "风险评估"],
+        banned_terms=[],
+        default_time_horizon="short_term",
+    )
+    with EvidenceStore(":memory:") as store:
+        task = _make_task(task_id="t-macro-retain")
+        for i in range(3):
+            store.insert_chunk(_make_chunk(
+                chunk_id=f"m-{i}", task_id="t-macro-retain", category="macro",
+                agent_name="macro_agent", importance=0.9 - i * 0.1,
+                content=f"Macro signal {i}" * 5,
+                source=f"url=https://macro.example.com/{i} | finding_key=signal_{i}",
+            ))
+        store.insert_chunk(_make_chunk(
+            chunk_id="risk-0", task_id="t-macro-retain", category="risk",
+            agent_name="risk_agent", importance=0.85,
+            content="Risk assessment data" * 5,
+            source="url=https://risk.example.com/0 | finding_key=geopolitical",
+        ))
+
+        pack = store.build_context_pack(task, preset, [], max_chunks_per_section=5, token_budget=50000)
+
+        macro_items = [it for it in pack.items if it.agent_name == "macro_agent"]
+        risk_items = [it for it in pack.items if it.agent_name == "risk_agent"]
+        assert len(macro_items) == 3, f"Macro should have 3 items, got {len(macro_items)}"
+        assert len(risk_items) == 1, f"Risk should have 1 item, got {len(risk_items)}"
+    print("  10.5.1B: 宏观 section 保留全部 chunks OK")
+
+
+def test_news_data_gap_trace_for_supervisor() -> None:
+    """Supervisor receives a data_gap trace with fallback_reason for empty news."""
+    preset = ResearchPreset(
+        name="data_gap_trace",
+        research_type="fx",
+        default_agents=[],
+        report_sections=["新闻驱动"],
+        banned_terms=[],
+        default_time_horizon="short_term",
+    )
+    with EvidenceStore(":memory:") as store:
+        task = _make_task(task_id="t-data-gap")
+        store.insert_chunk(_make_chunk(
+            chunk_id="macro-filler", task_id="t-data-gap", category="macro",
+            agent_name="macro_agent", importance=0.9, content="macro data" * 5,
+        ))
+
+        pack = store.build_context_pack(task, preset, [], max_chunks_per_section=5, token_budget=50000)
+        traces = store.list_traces("t-data-gap")
+        assert len(traces) == 1
+        news_trace = traces[0]
+        assert news_trace.section_title == "新闻驱动"
+        assert news_trace.section_covered is False
+        assert news_trace.fallback_reason == "no_news_event_evidence"
+        assert "no_news_event_evidence" in news_trace.query
+        assert len(pack.items) == 0
+    print("  10.5.1B: Supervisor 收到 data_gap trace OK")
+
+
+# ── Phase 10.5.1D: Pool-level conflict detection ─────────────────────────────
+
+def test_pool_conflict_rba_vs_pboc() -> None:
+    """RBA bullish + PBoC bearish is always detected even across sections."""
+    preset = ResearchPreset(
+        name="pool_conflict",
+        research_type="fx",
+        default_agents=[],
+        report_sections=["宏观信号"],
+        banned_terms=[],
+        default_time_horizon="short_term",
+    )
+    with EvidenceStore(":memory:") as store:
+        task = _make_task(task_id="t-pool-cd")
+        out_rba = AgentOutput(
+            agent_name="macro_agent", status="ok", confidence=0.7,
+            findings=[
+                Finding(key="macro_rba", summary="RBA bullish",
+                        direction="bullish_aud", category="macro", importance=0.7),
+            ],
+        )
+        out_pboc = AgentOutput(
+            agent_name="macro_agent", status="ok", confidence=0.7,
+            findings=[
+                Finding(key="macro_pboc", summary="PBoC bearish",
+                        direction="bearish_aud", category="macro", importance=0.7),
+            ],
+        )
+        store.ingest_outputs(task, [out_rba, out_pboc])
+
+        pack = store.build_context_pack(task, preset, [], max_chunks_per_section=5, token_budget=50000)
+        traces = store.list_traces("t-pool-cd")
+        macro_trace = next(t for t in traces if t.section_title == "宏观信号")
+        assert macro_trace.conflict_count >= 1, (
+            f"Expected conflict_count >= 1, got {macro_trace.conflict_count}"
+        )
+        assert len(macro_trace.conflict_pairs) >= 1
+        assert len(macro_trace.boosted_chunk_ids) >= 1
+    print("  10.5.1D: RBA+PBoC 冲突始终被检测到  OK")
+
+
+def test_pool_conflict_neutral_no_conflict() -> None:
+    """macro_usd=neutral does not generate conflicts."""
+    preset = ResearchPreset(
+        name="neutral_no_conflict",
+        research_type="fx",
+        default_agents=[],
+        report_sections=["宏观信号"],
+        banned_terms=[],
+        default_time_horizon="short_term",
+    )
+    with EvidenceStore(":memory:") as store:
+        task = _make_task(task_id="t-neutral")
+        out = AgentOutput(
+            agent_name="macro_agent", status="ok", confidence=0.7,
+            findings=[
+                Finding(key="macro_rba", summary="RBA bullish",
+                        direction="bullish_aud", category="macro", importance=0.7),
+                Finding(key="macro_usd", summary="USD neutral",
+                        direction="neutral", category="macro", importance=0.7),
+            ],
+        )
+        store.ingest_outputs(task, [out])
+
+        pack = store.build_context_pack(task, preset, [], max_chunks_per_section=5, token_budget=50000)
+        traces = store.list_traces("t-neutral")
+        macro_trace = next(t for t in traces if t.section_title == "宏观信号")
+        assert macro_trace.conflict_count == 0, (
+            f"Neutral should not conflict, got conflict_count={macro_trace.conflict_count}"
+        )
+    print("  10.5.1D: neutral 不产生冲突           OK")
+
+
+def test_pool_conflict_boosts_unselected_side() -> None:
+    """Even if one conflict side would not be top-k, pool boost brings it in."""
+    import unittest.mock
+    import evidence_store as es_mod
+    from evidence_scorer import EvidenceScore
+
+    preset = ResearchPreset(
+        name="pool_boost_unselected",
+        research_type="fx",
+        default_agents=[],
+        report_sections=["宏观信号"],
+        banned_terms=[],
+        default_time_horizon="short_term",
+    )
+    with EvidenceStore(":memory:") as store:
+        task = _make_task(task_id="t-pool-boost")
+        out = AgentOutput(
+            agent_name="macro_agent", status="ok", confidence=0.7,
+            findings=[
+                Finding(key="macro_rba", summary="RBA bullish",
+                        direction="bullish_aud", category="macro", importance=0.9),
+                Finding(key="filler", summary="Filler data",
+                        direction=None, category="macro", importance=0.8),
+                Finding(key="macro_pboc", summary="PBoC bearish",
+                        direction="bearish_aud", category="macro", importance=0.3),
+            ],
+        )
+        enriched = store.ingest_outputs(task, [out])
+        rba_id, filler_id, pboc_id = enriched[0].chunk_ids
+
+        base_scores = {rba_id: 0.80, filler_id: 0.65, pboc_id: 0.58}
+
+        def _score(chunk, *_args, **_kwargs):
+            score = base_scores.get(chunk.chunk_id, 0.5)
+            return EvidenceScore(chunk_id=chunk.chunk_id, composite_score=score, attention_score=score)
+
+        with unittest.mock.patch.object(es_mod, "compute_evidence_score", _score):
+            pack = store.build_context_pack(
+                task, preset, [], max_chunks_per_section=2, token_budget=50000,
+            )
+
+        ids = [it.chunk_id for it in pack.items]
+        assert rba_id in ids, f"RBA chunk should be selected: {ids}"
+        assert pboc_id in ids, f"PBoC chunk should be boosted into top-2: {ids}"
+        assert filler_id not in ids, f"Filler should be displaced: {ids}"
+    print("  10.5.1D: 冲突加权使低分方进入 top-k   OK")
+
+
+def test_pool_conflict_detection_failure_fallback() -> None:
+    """If pool-level detection fails, per-section still works; if both fail, scored sort."""
+    import unittest.mock
+    import evidence_store as es_mod
+
+    preset = ResearchPreset(
+        name="pool_fail_fallback",
+        research_type="fx",
+        default_agents=[],
+        report_sections=["宏观信号"],
+        banned_terms=[],
+        default_time_horizon="short_term",
+    )
+
+    call_count = {"n": 0}
+    original_detect = es_mod.detect_conflicts
+
+    def _fail_first_then_ok(*args, **kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            raise RuntimeError("pool detection crash")
+        return original_detect(*args, **kwargs)
+
+    with EvidenceStore(":memory:") as store:
+        task = _make_task(task_id="t-pool-fail")
+        out = AgentOutput(
+            agent_name="macro_agent", status="ok", confidence=0.7,
+            findings=[
+                Finding(key="macro_rba", summary="RBA bullish",
+                        direction="bullish_aud", category="macro", importance=0.7),
+                Finding(key="macro_pboc", summary="PBoC bearish",
+                        direction="bearish_aud", category="macro", importance=0.7),
+            ],
+        )
+        store.ingest_outputs(task, [out])
+
+        with unittest.mock.patch.object(es_mod, "detect_conflicts", _fail_first_then_ok):
+            pack = store.build_context_pack(task, preset, [], max_chunks_per_section=5, token_budget=50000)
+
+        assert len(pack.items) >= 2
+        traces = store.list_traces("t-pool-fail")
+        macro_trace = next(t for t in traces if t.section_title == "宏观信号")
+        assert macro_trace.conflict_count >= 1, (
+            f"Section-level detection should still find conflict, got {macro_trace.conflict_count}"
+        )
+    print("  10.5.1D: 池级检测失败回退到段级检测   OK")
+
+
+# ── Phase 10.5.1E: Section-level token reserve ──────────────────────────────
+
+def test_section_reserve_risk_not_starved() -> None:
+    """Risk section gets at least 1 chunk even when FX+macro eat most budget."""
+    preset = ResearchPreset(
+        name="reserve_test",
+        research_type="fx",
+        default_agents=[],
+        report_sections=["汇率事实", "宏观信号", "风险与矛盾"],
+        banned_terms=[],
+        default_time_horizon="short_term",
+    )
+    with EvidenceStore(":memory:") as store:
+        task = _make_task(task_id="t-reserve")
+        # FX chunks: 5 x 300 chars = 1500
+        for i in range(5):
+            store.insert_chunk(_make_chunk(
+                chunk_id=f"fx-{i}", task_id="t-reserve", category="fx_price",
+                agent_name="fx_agent", importance=0.85,
+                content="A" * 300, source=f"url=https://fx.com/{i} | finding_key=fx_{i}",
+            ))
+        # Macro chunks: 3 x 800 chars = 2400
+        for i in range(3):
+            store.insert_chunk(_make_chunk(
+                chunk_id=f"macro-{i}", task_id="t-reserve", category="macro",
+                agent_name="macro_agent", importance=0.75,
+                content="B" * 800, source=f"url=https://macro.com/{i} | finding_key=m_{i}",
+            ))
+        # Risk chunks: 2 x 200 chars = 400
+        for i in range(2):
+            store.insert_chunk(_make_chunk(
+                chunk_id=f"risk-{i}", task_id="t-reserve", category="risk",
+                agent_name="risk_agent", importance=0.5,
+                content="C" * 200, source=f"finding_key=risk_{i}",
+            ))
+
+        # Budget: 1500+2400+400=4300 total, set budget to 4000 so it's tight
+        pack = store.build_context_pack(
+            task, preset, [], max_chunks_per_section=5, token_budget=4000,
+        )
+        risk_items = [it for it in pack.items if it.agent_name == "risk_agent"]
+        assert len(risk_items) >= 1, (
+            f"Risk section should have at least 1 chunk via reservation, got {len(risk_items)}"
+        )
+        assert pack.total_tokens <= 4000, (
+            f"Total tokens {pack.total_tokens} exceeds budget 4000"
+        )
+        traces = store.list_traces("t-reserve")
+        risk_trace = next(t for t in traces if t.section_title == "风险与矛盾")
+        assert risk_trace.section_covered is True, "Risk section should be covered"
+    print("  10.5.1E: risk section 至少保留 1 chunk  OK")
+
+
+def test_section_reserve_four_sections_covered() -> None:
+    """When all 4 section categories have data, all 4 sections are covered."""
+    preset = ResearchPreset(
+        name="four_sections",
+        research_type="fx",
+        default_agents=[],
+        report_sections=["汇率事实", "新闻驱动", "宏观信号", "风险与矛盾"],
+        banned_terms=[],
+        default_time_horizon="short_term",
+    )
+    with EvidenceStore(":memory:") as store:
+        task = _make_task(task_id="t-4sec")
+        store.insert_chunk(_make_chunk(
+            chunk_id="fx-0", task_id="t-4sec", category="fx_price",
+            agent_name="fx_agent", importance=0.85,
+            content="A" * 300, source="url=https://fx.com/1 | finding_key=fx_0",
+        ))
+        store.insert_chunk(_make_chunk(
+            chunk_id="news-0", task_id="t-4sec", category="news_event",
+            agent_name="news_agent", importance=0.6,
+            content="D" * 250, source="url=https://news.com/1 | finding_key=news_0",
+        ))
+        store.insert_chunk(_make_chunk(
+            chunk_id="macro-0", task_id="t-4sec", category="macro",
+            agent_name="macro_agent", importance=0.75,
+            content="B" * 400, source="url=https://macro.com/1 | finding_key=m_0",
+        ))
+        store.insert_chunk(_make_chunk(
+            chunk_id="risk-0", task_id="t-4sec", category="risk",
+            agent_name="risk_agent", importance=0.5,
+            content="C" * 200, source="finding_key=risk_0",
+        ))
+
+        pack = store.build_context_pack(
+            task, preset, [], max_chunks_per_section=5, token_budget=6000,
+        )
+        traces = store.list_traces("t-4sec")
+        covered = sum(1 for t in traces if t.section_covered)
+        assert covered == 4, f"Expected 4/4 sections covered, got {covered}/4"
+    print("  10.5.1E: 4/4 section 全覆盖             OK")
+
+
+def test_section_reserve_budget_respected() -> None:
+    """Even with reservation, total tokens must not exceed budget."""
+    preset = ResearchPreset(
+        name="budget_strict",
+        research_type="fx",
+        default_agents=[],
+        report_sections=["汇率事实", "宏观信号", "风险与矛盾"],
+        banned_terms=[],
+        default_time_horizon="short_term",
+    )
+    with EvidenceStore(":memory:") as store:
+        task = _make_task(task_id="t-budget")
+        # Each chunk ~500 chars, budget only allows 2 chunks total
+        for i in range(3):
+            store.insert_chunk(_make_chunk(
+                chunk_id=f"fx-{i}", task_id="t-budget", category="fx_price",
+                agent_name="fx_agent", importance=0.85,
+                content="A" * 500, source=f"url=https://fx.com/{i} | finding_key=fx_{i}",
+            ))
+        store.insert_chunk(_make_chunk(
+            chunk_id="macro-0", task_id="t-budget", category="macro",
+            agent_name="macro_agent", importance=0.75,
+            content="B" * 500, source="url=https://macro.com/1 | finding_key=m_0",
+        ))
+        store.insert_chunk(_make_chunk(
+            chunk_id="risk-0", task_id="t-budget", category="risk",
+            agent_name="risk_agent", importance=0.5,
+            content="C" * 500, source="finding_key=risk_0",
+        ))
+
+        pack = store.build_context_pack(
+            task, preset, [], max_chunks_per_section=5, token_budget=1600,
+        )
+        assert pack.total_tokens <= 1600, (
+            f"Total tokens {pack.total_tokens} exceeds budget 1600"
+        )
+        # With reservation, each section gets 1 reserved chunk (3 x 500 = 1500 <= 1600)
+        agents = {it.agent_name for it in pack.items}
+        assert "risk_agent" in agents, (
+            f"Risk agent should be represented, got agents: {agents}"
+        )
+    print("  10.5.1E: 总 token 预算仍严格遵守       OK")
+
+
+def test_section_reserve_max_chunk_tokens_filter() -> None:
+    """Chunks exceeding max_chunk_tokens are filtered out in both phases."""
+    preset = ResearchPreset(
+        name="chunk_cap",
+        research_type="fx",
+        default_agents=[],
+        report_sections=["宏观信号"],
+        banned_terms=[],
+        default_time_horizon="short_term",
+    )
+    with EvidenceStore(":memory:") as store:
+        task = _make_task(task_id="t-cap")
+        store.insert_chunk(_make_chunk(
+            chunk_id="macro-big", task_id="t-cap", category="macro",
+            agent_name="macro_agent", importance=0.95,
+            content="X" * 1500, source="url=https://macro.com/big | finding_key=m_big",
+        ))
+        store.insert_chunk(_make_chunk(
+            chunk_id="macro-ok", task_id="t-cap", category="macro",
+            agent_name="macro_agent", importance=0.70,
+            content="Y" * 400, source="url=https://macro.com/ok | finding_key=m_ok",
+        ))
+
+        pack = store.build_context_pack(
+            task, preset, [], max_chunk_tokens=1200, token_budget=50000,
+        )
+        ids = [it.chunk_id for it in pack.items]
+        assert "macro-big" not in ids, f"1500-char chunk should be filtered by max_chunk_tokens=1200"
+        assert "macro-ok" in ids
+    print("  10.5.1E: max_chunk_tokens 过滤超大 chunk OK")
+
+
+def test_section_reserve_with_section_token_reserves() -> None:
+    """Section token reserves cap per-section usage, leaving room for others."""
+    preset = ResearchPreset(
+        name="reserve_cap",
+        research_type="fx",
+        default_agents=[],
+        report_sections=["汇率事实", "风险与矛盾"],
+        banned_terms=[],
+        default_time_horizon="short_term",
+    )
+    with EvidenceStore(":memory:") as store:
+        task = _make_task(task_id="t-rescap")
+        # FX: 5 x 400 = 2000, but reserve = 800 → should cap at ~2 chunks
+        for i in range(5):
+            store.insert_chunk(_make_chunk(
+                chunk_id=f"fx-{i}", task_id="t-rescap", category="fx_price",
+                agent_name="fx_agent", importance=0.85,
+                content="A" * 400, source=f"url=https://fx.com/{i} | finding_key=fx_{i}",
+            ))
+        store.insert_chunk(_make_chunk(
+            chunk_id="risk-0", task_id="t-rescap", category="risk",
+            agent_name="risk_agent", importance=0.5,
+            content="C" * 300, source="finding_key=risk_0",
+        ))
+
+        pack = store.build_context_pack(
+            task, preset, [],
+            max_chunks_per_section=5, token_budget=6000,
+            section_token_reserves={"fx_price": 800, "risk": 1000},
+        )
+        fx_items = [it for it in pack.items if it.agent_name == "fx_agent"]
+        risk_items = [it for it in pack.items if it.agent_name == "risk_agent"]
+        fx_tokens = sum(it.token_estimate for it in fx_items)
+        assert fx_tokens <= 800, f"FX tokens {fx_tokens} should be capped at reserve 800"
+        assert len(risk_items) >= 1, "Risk should be covered"
+    print("  10.5.1E: section_token_reserves 限额生效 OK")
+
+
+def test_section_reserve_news_empty_stays_uncovered() -> None:
+    """When news has no data, reservation doesn't force coverage; fallback_reason is set."""
+    preset = ResearchPreset(
+        name="news_empty",
+        research_type="fx",
+        default_agents=[],
+        report_sections=["汇率事实", "新闻驱动", "风险与矛盾"],
+        banned_terms=[],
+        default_time_horizon="short_term",
+    )
+    with EvidenceStore(":memory:") as store:
+        task = _make_task(task_id="t-news-empty")
+        store.insert_chunk(_make_chunk(
+            chunk_id="fx-0", task_id="t-news-empty", category="fx_price",
+            agent_name="fx_agent", importance=0.85,
+            content="A" * 300, source="url=https://fx.com/1 | finding_key=fx_0",
+        ))
+        store.insert_chunk(_make_chunk(
+            chunk_id="risk-0", task_id="t-news-empty", category="risk",
+            agent_name="risk_agent", importance=0.5,
+            content="C" * 200, source="finding_key=risk_0",
+        ))
+
+        pack = store.build_context_pack(
+            task, preset, [], max_chunks_per_section=5, token_budget=6000,
+        )
+        traces = store.list_traces("t-news-empty")
+        news_trace = next(t for t in traces if t.section_title == "新闻驱动")
+        assert news_trace.section_covered is False, "News should NOT be covered"
+        assert news_trace.fallback_reason == "no_news_event_evidence"
+
+        fx_trace = next(t for t in traces if t.section_title == "汇率事实")
+        assert fx_trace.section_covered is True
+        risk_trace = next(t for t in traces if t.section_title == "风险与矛盾")
+        assert risk_trace.section_covered is True
+    print("  10.5.1E: news=0 保持未覆盖状态          OK")
+
+
 # ── 运行 ─────────────────────────────────────────────────────────────────────
 
 def run_all() -> None:
@@ -1755,6 +2365,26 @@ def run_all() -> None:
         test_preselection_conflict_boost_bounded,
         test_preselection_conflict_detector_failure_keeps_scored_sort,
         test_preselection_no_conflict_keeps_rank,
+        # Phase 10.5.1A — FX evidence deduplication fix
+        test_fx_finding_key_dedup_keeps_all_five,
+        test_news_same_url_still_deduped,
+        test_context_pack_fx_section_multi_select,
+        # Phase 10.5.1B — news section fallback restriction
+        test_news_section_no_fallback_to_macro,
+        test_macro_section_retains_chunks_with_empty_news,
+        test_news_data_gap_trace_for_supervisor,
+        # Phase 10.5.1D — pool-level conflict detection
+        test_pool_conflict_rba_vs_pboc,
+        test_pool_conflict_neutral_no_conflict,
+        test_pool_conflict_boosts_unselected_side,
+        test_pool_conflict_detection_failure_fallback,
+        # Phase 10.5.1E — section-level token reserve
+        test_section_reserve_risk_not_starved,
+        test_section_reserve_four_sections_covered,
+        test_section_reserve_budget_respected,
+        test_section_reserve_news_empty_stays_uncovered,
+        test_section_reserve_max_chunk_tokens_filter,
+        test_section_reserve_with_section_token_reserves,
     ]
     print("Phase 9.1 + 10B + 10C — EvidenceStore 测试")
     print("=" * 50)

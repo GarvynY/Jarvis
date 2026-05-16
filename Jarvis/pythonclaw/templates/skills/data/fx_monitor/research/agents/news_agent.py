@@ -115,15 +115,16 @@ def _read_news_cache() -> tuple[list[dict[str, Any]], str | None, str]:
 
 def _refresh_news_via_monitor() -> tuple[list[dict[str, Any]], str | None, str]:
     """
-    Fallback when the daemon-maintained cache is missing or corrupt.
+    Fallback when the daemon-maintained cache is missing or stale.
 
-    Uses news_monitor.check_news(mark_seen=False) so research can degrade to a
-    live RSS pull without mutating the daemon's seen-URL state.
+    Uses research mode (ignore_seen=True, mark_seen=False) so the refresh
+    returns ALL current RSS articles regardless of seen_urls, and writes
+    them to news_recent_cache.json without polluting the notification state.
     """
     try:
         from news_monitor import check_news
-        data = check_news(mark_seen=False)
-        articles: list[dict[str, Any]] = data.get("new_articles", [])
+        data = check_news(mark_seen=False, ignore_seen=True)
+        articles: list[dict[str, Any]] = data.get("all_articles", [])
         updated_at: str = data.get("fetched_at_utc", "")
         if not articles:
             return [], "news_monitor_refresh_empty", updated_at

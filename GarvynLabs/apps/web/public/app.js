@@ -22,7 +22,7 @@ const CATEGORY_META = {
     label: "Jarvis",
     description: "个人 AI Agent 系统的开发过程、架构演进与实验记录。",
     homeText: "Jarvis 是我的个人 AI Agent 系统，也是很多工程实验的起点。"
-  }
+  },
 };
 
 const JARVIS_SUBCATEGORIES = [
@@ -30,6 +30,19 @@ const JARVIS_SUBCATEGORIES = [
   { key: "product-iteration", title: "产品迭代" },
   { key: "product-analysis", title: "产品分析" }
 ];
+
+const THINKING_SUBCATEGORIES = [
+  { key: "general", title: "AI产品思考" },
+  { key: "retro-general", title: "Jarvis 深度复盘" },
+  { key: "retro-part1", title: "Part 1：产品定位与架构演进" },
+  { key: "retro-part2", title: "Part 2：证据系统与可信输出" },
+  { key: "retro-part3", title: "Part 3：Token 与上下文治理" },
+  { key: "retro-part4", title: "Part 4：数据质量与垂直金融场景" },
+  { key: "retro-part5", title: "Part 5：用户信任与个性化" },
+  { key: "retro-part6", title: "Part 6：审计、评估与系统进化" }
+];
+
+const RETRO_PARTS = THINKING_SUBCATEGORIES.filter((s) => s.key.startsWith("retro-") && s.key !== "retro-general");
 
 const PROJECT_ITEMS = [
   {
@@ -131,7 +144,9 @@ function currentRoute() {
     return { type: "project-detail", slug: path.split("/")[2] };
   }
   const key = path.slice(1);
-  if (CATEGORY_META[key]) return { type: key === "jarvis" ? "jarvis" : "category", category: key };
+  if (key === "jarvis") return { type: "jarvis", category: "jarvis" };
+  if (key === "ai-thinking") return { type: "ai-thinking", category: "ai-thinking" };
+  if (CATEGORY_META[key]) return { type: "category", category: key };
   return { type: "home" };
 }
 
@@ -183,11 +198,29 @@ function jarvisSubcategoryLabel(article) {
   return JARVIS_SUBCATEGORIES.find((item) => item.key === jarvisSubcategoryKey(article))?.title || "产品迭代";
 }
 
+function thinkingSubcategoryKey(article) {
+  return THINKING_SUBCATEGORIES.some((item) => item.key === article.subcategory) ? article.subcategory : "general";
+}
+
+function thinkingSubcategoryLabel(article) {
+  const key = thinkingSubcategoryKey(article);
+  if (key === "general") return "AI产品思考";
+  if (key === "retro-general") return "Jarvis 深度复盘";
+  const part = RETRO_PARTS.find((item) => item.key === key);
+  return part ? `Jarvis 深度复盘 · ${part.title}` : "AI产品思考";
+}
+
+function subcategoryLabelFor(article) {
+  if (article.category === "jarvis") return jarvisSubcategoryLabel(article);
+  if (article.category === "ai-thinking") return thinkingSubcategoryLabel(article);
+  return "";
+}
+
 function articleCard(article) {
   const isPdf = article.kind === "pdf" || String(article.file || "").toLowerCase().endsWith(".pdf");
   return `
     <a class="article-card" href="/article/?slug=${encodeURIComponent(article.slug)}">
-      <span class="article-meta">${article.date || ""} · ${CATEGORY_META[article.category]?.title || ""}${article.category === "jarvis" ? ` · ${jarvisSubcategoryLabel(article)}` : ""}${isPdf ? " · PDF" : ""}</span>
+      <span class="article-meta">${article.date || ""} · ${CATEGORY_META[article.category]?.title || ""}${subcategoryLabelFor(article) ? ` · ${subcategoryLabelFor(article)}` : ""}${isPdf ? " · PDF" : ""}</span>
       <h2>${escapeHtml(article.title)}</h2>
       <p>${escapeHtml(article.summary || "")}</p>
     </a>
@@ -445,6 +478,67 @@ function renderJarvis() {
   `;
 }
 
+function renderThinking() {
+  const meta = CATEGORY_META["ai-thinking"];
+  const articles = articlesFor("ai-thinking");
+  const generalArticles = articles.filter((a) => thinkingSubcategoryKey(a) === "general");
+  const retroIntroArticles = articles.filter((a) => thinkingSubcategoryKey(a) === "retro-general");
+  const retroGroups = RETRO_PARTS.map((part) => {
+    const grouped = articles.filter((a) => thinkingSubcategoryKey(a) === part.key);
+    return { ...part, articles: grouped };
+  }).filter((g) => g.articles.length);
+  const retroTotal = retroIntroArticles.length + retroGroups.reduce((n, g) => n + g.articles.length, 0);
+  const hasRetro = retroTotal > 0;
+  const hasGeneral = generalArticles.length > 0;
+  app.innerHTML = `
+    <section class="page-hero">
+      <div class="section-inner">
+        <span class="eyebrow">${meta.label}</span>
+        <h1>${meta.title}</h1>
+        <p>${meta.description}</p>
+      </div>
+    </section>
+    <section class="section">
+      <div class="section-inner">
+        ${hasGeneral ? `
+          <div class="articles" style="margin-bottom:36px">
+            ${generalArticles.map(articleCard).join("")}
+          </div>
+        ` : ""}
+        ${hasRetro ? `
+          <div class="jarvis-groups">
+            <section class="jarvis-group">
+              <div class="jarvis-group-heading">
+                <h2>Jarvis 深度复盘系列</h2>
+                <span>${retroTotal}</span>
+              </div>
+              ${retroIntroArticles.length ? `
+                <div class="articles">
+                  ${retroIntroArticles.map(articleCard).join("")}
+                </div>
+              ` : ""}
+              <div class="retro-parts">
+                ${retroGroups.map((group) => `
+                  <section class="jarvis-group" style="margin-left:16px">
+                    <div class="jarvis-group-heading">
+                      <h3>${group.title}</h3>
+                      <span>${group.articles.length}</span>
+                    </div>
+                    <div class="articles">
+                      ${group.articles.map(articleCard).join("")}
+                    </div>
+                  </section>
+                `).join("")}
+              </div>
+            </section>
+          </div>
+        ` : ""}
+        ${!hasGeneral && !hasRetro ? `<div class="empty">这里还没有发布的笔记。</div>` : ""}
+      </div>
+    </section>
+  `;
+}
+
 async function renderArticle(slug) {
   const article = (manifest.articles || []).find((item) => item.slug === slug);
   if (!article) {
@@ -463,7 +557,7 @@ async function renderArticle(slug) {
       <section class="article-shell">
         <aside class="article-toc" id="articleToc" aria-label="文章目录"></aside>
         <article class="article">
-          <span class="article-meta">${article.date || ""} · ${CATEGORY_META[article.category]?.title || ""}${article.category === "jarvis" ? ` · ${jarvisSubcategoryLabel(article)}` : ""}</span>
+          <span class="article-meta">${article.date || ""} · ${CATEGORY_META[article.category]?.title || ""}${subcategoryLabelFor(article) ? ` · ${subcategoryLabelFor(article)}` : ""}</span>
           <h1>${escapeHtml(article.title)}</h1>
           <div class="article-body">${body}</div>
         </article>
@@ -638,6 +732,7 @@ async function route(options = {}) {
   if (next.type === "project-detail") await renderProjectDetail(next.slug);
   if (next.type === "category") renderCategory(next.category);
   if (next.type === "jarvis") renderJarvis();
+  if (next.type === "ai-thinking") renderThinking();
   if (next.type === "article") await renderArticle(next.slug);
   trackPageview();
 }

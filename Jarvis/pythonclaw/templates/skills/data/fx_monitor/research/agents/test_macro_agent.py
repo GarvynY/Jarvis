@@ -36,7 +36,10 @@ if str(_RESEARCH_DIR) not in sys.path:
     sys.path.insert(0, str(_RESEARCH_DIR))
 
 from schema import ResearchTask, SafeUserContext, AgentOutput, FX_CNYAUD_PRESET  # noqa: E402
-from agents.macro_agent import MacroAgent, _MACRO_QUERIES, _MAX_CONFIDENCE        # noqa: E402
+from agents.macro_agent import (  # noqa: E402
+    MacroAgent, _MACRO_QUERIES, _MAX_CONFIDENCE,
+    _stabilise_directions, _DIRECTIONAL_KEYS,
+)
 
 
 # ── Mock search results ───────────────────────────────────────────────────────
@@ -397,10 +400,159 @@ async def test_banned_terms_and_fabricated_findings_sanitized() -> None:
     print("   PASS")
 
 
+# ── Phase 10.5.1C — direction stabilisation tests ────────────────────────────
+
+async def test_detail_direction_cleared() -> None:
+    """macro_detail_* findings must have direction=None even when LLM sets overall_direction."""
+    llm_json = json.dumps({
+        "summary": "整体偏多AUD",
+        "rba_signal": "bullish_aud",
+        "pboc_signal": "neutral",
+        "usd_signal": "bullish_aud",
+        "overall_direction": "bullish_aud",
+        "key_findings": [],
+        "risks": [],
+        "data_gaps": [],
+    }, ensure_ascii=False)
+    with _mock_search_ok(), _mock_llm_text(llm_json):
+        output = await MacroAgent().run(_make_task())
+
+    details = [f for f in output.findings if f.key.startswith("macro_detail_")]
+    assert len(details) > 0, "Expected macro_detail findings"
+    for f in details:
+        assert f.direction is None, (
+            f"{f.key} should have direction=None, got {f.direction!r}"
+        )
+
+    print("\n-- test_detail_direction_cleared")
+    print(f"   {len(details)} detail findings, all direction=None")
+    print("   PASS")
+
+
+async def test_macro_usd_weak_evidence() -> None:
+    """macro_usd with no USD-related search results → direction=None + data_gap."""
+    no_usd_results = [
+        {
+            "title": "RBA holds cash rate at 4.35%",
+            "url": "https://example.com/rba",
+            "snippet": "Reserve Bank of Australia kept rates unchanged.",
+            "source": "google_news_rss",
+            "query": "RBA interest rate",
+        },
+        {
+            "title": "PBoC cuts reserve ratio",
+            "url": "https://example.com/pboc",
+            "snippet": "People's Bank of China easing.",
+            "source": "google_news_rss",
+            "query": "PBoC monetary policy",
+        },
+    ]
+    llm_json = json.dumps({
+        "summary": "RBA持稳，PBoC宽松",
+        "rba_signal": "neutral",
+        "pboc_signal": "bullish_aud",
+        "usd_signal": "bearish_aud",
+        "overall_direction": "bullish_aud",
+        "key_findings": [],
+        "risks": [],
+        "data_gaps": [],
+    }, ensure_ascii=False)
+    with _mock_search_ok(no_usd_results), _mock_llm_text(llm_json):
+        output = await MacroAgent().run(_make_task())
+
+    usd_findings = [f for f in output.findings if f.key == "macro_usd"]
+    assert len(usd_findings) == 1
+    assert usd_findings[0].direction is None, (
+        f"macro_usd without USD evidence should be None, got {usd_findings[0].direction!r}"
+    )
+    assert "macro_usd_no_source_evidence" in output.missing_data
+
+    print("\n-- test_macro_usd_weak_evidence")
+    print(f"   macro_usd direction={usd_findings[0].direction}")
+    print(f"   missing_data includes data_gap: {'macro_usd_no_source_evidence' in output.missing_data}")
+    print("   PASS")
+
+
+async def test_rba_pboc_directions_preserved() -> None:
+    """High-level RBA/PBoC directions are preserved when evidence exists."""
+    with _mock_search_ok(), _mock_llm_ok():
+        output = await MacroAgent().run(_make_task())
+
+    by_key = {f.key: f for f in output.findings}
+    if "macro_rba" in by_key:
+        assert by_key["macro_rba"].direction == "neutral"
+    if "macro_pboc" in by_key:
+        assert by_key["macro_pboc"].direction == "bullish_aud"
+
+    print("\n-- test_rba_pboc_directions_preserved")
+    for k in ("macro_rba", "macro_pboc"):
+        if k in by_key:
+            print(f"   [{k}] direction={by_key[k].direction}")
+    print("   PASS")
+
+
+async def test_risk_agent_direction_count_stable() -> None:
+    """With same mock input, macro output direction counts are deterministic for RiskAgent."""
+    counts = []
+    for _ in range(3):
+        with _mock_search_ok(), _mock_llm_ok():
+            output = await MacroAgent().run(_make_task())
+        bull = sum(1 for f in output.findings if f.direction == "bullish_aud")
+        bear = sum(1 for f in output.findings if f.direction == "bearish_aud")
+        counts.append((bull, bear))
+
+    assert all(c == counts[0] for c in counts), (
+        f"Direction counts should be stable across runs, got {counts}"
+    )
+    # With stabilisation: detail findings have no direction,
+    # so only signal findings (rba=neutral, pboc=bullish_aud, usd=bearish_aud) count.
+    bull, bear = counts[0]
+    assert bull == 1, f"Expected 1 bullish (pboc), got {bull}"
+    assert bear == 1, f"Expected 1 bearish (usd), got {bear}"
+
+    print("\n-- test_risk_agent_direction_count_stable")
+    print(f"   direction counts (bullish, bearish) stable: {counts[0]}")
+    print("   PASS")
+
+
+def test_stabilise_directions_unit() -> None:
+    """Unit test for _stabilise_directions function."""
+    from schema import Finding
+    findings = [
+        Finding(key="macro_rba", summary="RBA", direction="bullish_aud"),
+        Finding(key="macro_usd", summary="USD", direction="bearish_aud"),
+        Finding(key="macro_detail_0", summary="headline", direction="bullish_aud"),
+        Finding(key="macro_detail_1", summary="headline2", direction="neutral"),
+        Finding(key="macro_raw_0", summary="raw", direction="bearish_aud"),
+        Finding(key="bad_key", summary="unknown", direction="invalid_value"),
+    ]
+    results_with_usd = [{"title": "Fed holds rates", "query": "Federal Reserve USD"}]
+    results_no_usd = [{"title": "RBA holds", "query": "RBA rates"}]
+
+    stable, gaps = _stabilise_directions(findings, results_with_usd)
+    by_key = {f.key: f for f in stable}
+    assert by_key["macro_rba"].direction == "bullish_aud"
+    assert by_key["macro_usd"].direction == "bearish_aud"
+    assert by_key["macro_detail_0"].direction is None
+    assert by_key["macro_detail_1"].direction is None
+    assert by_key["macro_raw_0"].direction is None
+    assert by_key["bad_key"].direction is None
+    assert gaps == []
+
+    stable2, gaps2 = _stabilise_directions(findings, results_no_usd)
+    by_key2 = {f.key: f for f in stable2}
+    assert by_key2["macro_usd"].direction is None
+    assert "macro_usd_no_source_evidence" in gaps2
+
+    print("\n-- test_stabilise_directions_unit")
+    print("   detail/raw directions cleared, USD without evidence → None")
+    print("   PASS")
+
+
 # ── Runner ────────────────────────────────────────────────────────────────────
 
 async def main() -> None:
-    print("Phase 9 Step 3c -- MacroAgent tests (mocked search + LLM)")
+    print("Phase 9 Step 3c + 10.5.1C -- MacroAgent tests (mocked search + LLM)")
     print(f"Queries: {_MACRO_QUERIES}")
     print("=" * 60)
 
@@ -414,9 +566,15 @@ async def main() -> None:
     await test_signal_source_ids_are_compact()
     await test_json_safe()
     await test_banned_terms_and_fabricated_findings_sanitized()
+    # Phase 10.5.1C — direction stabilisation
+    await test_detail_direction_cleared()
+    await test_macro_usd_weak_evidence()
+    await test_rba_pboc_directions_preserved()
+    await test_risk_agent_direction_count_stable()
+    test_stabilise_directions_unit()
 
     print("\n" + "=" * 60)
-    print("All 10 tests passed.")
+    print("All 15 tests passed.")
 
 
 if __name__ == "__main__":

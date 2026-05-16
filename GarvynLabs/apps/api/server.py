@@ -36,6 +36,16 @@ JARVIS_SUBCATEGORIES = {
     "product-iteration": "产品迭代",
     "product-analysis": "产品分析",
 }
+THINKING_SUBCATEGORIES = {
+    "general": "AI产品思考",
+    "retro-general": "Jarvis 深度复盘",
+    "retro-part1": "Part 1：产品定位与架构演进",
+    "retro-part2": "Part 2：证据系统与可信输出",
+    "retro-part3": "Part 3：Token 与上下文治理",
+    "retro-part4": "Part 4：数据质量与垂直金融场景",
+    "retro-part5": "Part 5：用户信任与个性化",
+    "retro-part6": "Part 6：审计、评估与系统进化",
+}
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
 ASSET_TTL_SECONDS = 24 * 60 * 60
 ANALYTICS_MAX_EVENTS = 20000
@@ -80,7 +90,12 @@ ADMIN_HTML = """<!doctype html>
     .group-title { margin:8px 0 0; padding-bottom:6px; border-bottom:1px solid var(--line); font-size:13px; color:var(--muted); font-weight:700; cursor:pointer; display:flex; align-items:center; gap:6px; user-select:none; }
     .group-title::before { content:"▼"; font-size:10px; transition:transform .2s; }
     .group.collapsed .group-title::before { transform:rotate(-90deg); }
-    .group.collapsed .item { display:none; }
+    .group.collapsed .item, .group.collapsed .subgroup { display:none; }
+    .subgroup { display:grid; gap:6px; margin-left:12px; padding-left:10px; border-left:2px solid var(--line); }
+    .subgroup-title { margin:6px 0 0; padding-bottom:4px; font-size:12px; color:var(--muted); font-weight:600; cursor:pointer; display:flex; align-items:center; gap:5px; user-select:none; }
+    .subgroup-title::before { content:"▼"; font-size:9px; transition:transform .2s; }
+    .subgroup.collapsed .subgroup-title::before { transform:rotate(-90deg); }
+    .subgroup.collapsed .item { display:none; }
     .item { display:grid; grid-template-columns:24px minmax(0,1fr); gap:8px; align-items:start; text-align:left; padding:10px; border:1px solid var(--line); border-radius:6px; background:#fff; }
     .item input { width:auto; margin-top:3px; }
     .item strong { display:block; }
@@ -136,7 +151,7 @@ ADMIN_HTML = """<!doctype html>
         </div>
         <label>Slug</label><input id="slug" placeholder="article-slug">
         <div class="subgrid hidden" id="subcategoryRow">
-          <div><label>Jarvis 二级栏目</label><select id="subcategory"><option value="fix-updates">修复更新</option><option value="product-iteration">产品迭代</option><option value="product-analysis">产品分析</option></select></div>
+          <div><label id="subcategoryLabel">二级栏目</label><select id="subcategory"></select></div>
         </div>
         <label>摘要</label><input id="summary" placeholder="列表页显示的简介">
         <label id="bodyLabel">Markdown</label><textarea id="body" spellcheck="false"></textarea>
@@ -161,8 +176,25 @@ ADMIN_HTML = """<!doctype html>
     const $ = (id) => document.getElementById(id);
     const CATS = ['ai-news', 'ai-thinking', 'ai-technology', 'jarvis'];
     const CAT_LABELS = { 'jarvis': 'Jarvis', 'ai-news': 'AI动态', 'ai-thinking': 'AI产品思考', 'ai-technology': 'AI产品技术' };
-    const JARVIS_SUBCATS = ['fix-updates', 'product-iteration', 'product-analysis'];
-    const JARVIS_SUBCAT_LABELS = { 'fix-updates': '修复更新', 'product-iteration': '产品迭代', 'product-analysis': '产品分析' };
+    const SUBCATS_BY_CAT = {
+      'jarvis': [
+        { key: 'fix-updates', label: '修复更新' },
+        { key: 'product-iteration', label: '产品迭代' },
+        { key: 'product-analysis', label: '产品分析' }
+      ],
+      'ai-thinking': [
+        { key: 'general', label: 'AI产品思考（通用）' },
+        { key: 'retro-general', label: 'Jarvis 深度复盘（总纲）' },
+        { key: 'retro-part1', label: 'Jarvis 深度复盘 · Part 1：产品定位与架构演进' },
+        { key: 'retro-part2', label: 'Jarvis 深度复盘 · Part 2：证据系统与可信输出' },
+        { key: 'retro-part3', label: 'Jarvis 深度复盘 · Part 3：Token 与上下文治理' },
+        { key: 'retro-part4', label: 'Jarvis 深度复盘 · Part 4：数据质量与垂直金融场景' },
+        { key: 'retro-part5', label: 'Jarvis 深度复盘 · Part 5：用户信任与个性化' },
+        { key: 'retro-part6', label: 'Jarvis 深度复盘 · Part 6：审计、评估与系统进化' }
+      ]
+    };
+    const SUBCAT_LABELS_BY_CAT = { 'jarvis': 'Jarvis 二级栏目', 'ai-thinking': '产品思考分区' };
+    const collapsedGroups = new Set();
 
     function parseFrontmatter(text) {
       const m = text.match(/^---\\r?\\n([\\s\\S]*?)\\r?\\n---\\r?\\n?([\\s\\S]*)$/);
@@ -200,16 +232,32 @@ ADMIN_HTML = """<!doctype html>
     function updateDeleteSelectedState() {
       $("deleteSelectedBtn").disabled = selectedSlugs().length === 0;
     }
-    function normalizeJarvisSubcategory(value) {
-      return JARVIS_SUBCATS.includes(value) ? value : "product-iteration";
+    function subcatsForCategory(cat) { return SUBCATS_BY_CAT[cat] || []; }
+    function normalizeSubcategory(cat, value) {
+      const subs = subcatsForCategory(cat);
+      if (!subs.length) return "";
+      return subs.some((s) => s.key === value) ? value : subs[0].key;
+    }
+    function subcatLabel(cat, value) {
+      const subs = subcatsForCategory(cat);
+      const found = subs.find((s) => s.key === value);
+      return found ? found.label : "";
     }
     function syncSubcategoryVisibility() {
-      const isJarvis = $("category").value === "jarvis";
-      $("subcategoryRow").classList.toggle("hidden", !isJarvis);
-      if (isJarvis) $("subcategory").value = normalizeJarvisSubcategory($("subcategory").value);
+      const cat = $("category").value;
+      const subs = subcatsForCategory(cat);
+      const hasSubs = subs.length > 0;
+      $("subcategoryRow").classList.toggle("hidden", !hasSubs);
+      if (hasSubs) {
+        $("subcategoryLabel").textContent = SUBCAT_LABELS_BY_CAT[cat] || "二级栏目";
+        const sel = $("subcategory");
+        const prev = sel.value;
+        sel.innerHTML = subs.map((s) => `<option value="${s.key}">${escapeHtml(s.label)}</option>`).join("");
+        sel.value = normalizeSubcategory(cat, prev);
+      }
     }
     function subcategoryValue() {
-      return $("category").value === "jarvis" ? normalizeJarvisSubcategory($("subcategory").value) : "";
+      return normalizeSubcategory($("category").value, $("subcategory").value);
     }
     function clearEditor(status) {
       current = null;
@@ -219,7 +267,6 @@ ADMIN_HTML = """<!doctype html>
       $("date").value = today();
       $("slug").value = "";
       $("summary").value = "";
-      $("subcategory").value = "product-iteration";
       syncSubcategoryVisibility();
       $("body").value = "";
       $("body").disabled = false;
@@ -347,6 +394,30 @@ ADMIN_HTML = """<!doctype html>
         $("analyticsMetrics").innerHTML = `<div class="status">${escapeHtml(error.message || "统计加载失败")}</div>`;
       }
     }
+    function renderItem(a) {
+      return `
+        <div class="item" data-slug="${escapeHtml(a.slug)}">
+          <input class="article-check" type="checkbox" value="${escapeHtml(a.slug)}" aria-label="选择 ${escapeHtml(a.title)}">
+          <button type="button" data-open="${escapeHtml(a.slug)}" style="padding:0;border:0;background:transparent;text-align:left">
+            <strong>${escapeHtml(a.title)}${a.kind === "pdf" ? '<span class="pill">PDF</span>' : ''}</strong><span>${escapeHtml(a.date || "")} · ${escapeHtml(a.slug)}</span>
+          </button>
+        </div>`;
+    }
+    function renderSubgroups(category, articles) {
+      const subs = subcatsForCategory(category);
+      if (!subs.length) return articles.map(renderItem).join("");
+      return subs.map((sub) => {
+        const items = articles.filter((a) => normalizeSubcategory(category, a.subcategory) === sub.key);
+        if (!items.length) return "";
+        const key = category + ":" + sub.key;
+        const collapsed = collapsedGroups.has(key) ? " collapsed" : "";
+        return `
+          <div class="subgroup${collapsed}" data-subkey="${escapeHtml(key)}">
+            <div class="subgroup-title">${escapeHtml(sub.label)} · ${items.length}</div>
+            ${items.map(renderItem).join("")}
+          </div>`;
+      }).join("");
+    }
     async function load() {
       manifest = await api("/api/articles");
       const groups = CATS.map((category) => {
@@ -354,31 +425,38 @@ ADMIN_HTML = """<!doctype html>
           .filter((a) => a.category === category)
           .sort((a, b) => String(b.date || "").localeCompare(String(a.date || "")) || String(a.title || "").localeCompare(String(b.title || "")));
         if (!articles.length) return "";
+        const collapsed = collapsedGroups.has(category) ? " collapsed" : "";
         return `
-          <div class="group">
+          <div class="group${collapsed}" data-cat="${category}">
             <div class="group-title">${CAT_LABELS[category]} · ${articles.length}</div>
-            ${articles.map((a) => `
-              <div class="item" data-slug="${escapeHtml(a.slug)}">
-                <input class="article-check" type="checkbox" value="${escapeHtml(a.slug)}" aria-label="选择 ${escapeHtml(a.title)}">
-                <button type="button" data-open="${escapeHtml(a.slug)}" style="padding:0;border:0;background:transparent;text-align:left">
-                  <strong>${escapeHtml(a.title)}${a.kind === "pdf" ? '<span class="pill">PDF</span>' : ''}</strong><span>${escapeHtml(a.date || "")} · ${escapeHtml(a.slug)}</span>
-                  ${a.category === "jarvis" ? `<span>${escapeHtml(JARVIS_SUBCAT_LABELS[normalizeJarvisSubcategory(a.subcategory)] || "")}</span>` : ""}
-                </button>
-              </div>`).join("")}
+            ${renderSubgroups(category, articles)}
           </div>`;
       }).join("");
       $("articles").innerHTML = groups || `<div class="empty">还没有 Markdown 文档。</div>`;
       document.querySelectorAll("[data-open]").forEach((item) => item.onclick = () => openArticle(item.dataset.open));
       document.querySelectorAll(".article-check").forEach((item) => item.onchange = updateDeleteSelectedState);
-      document.querySelectorAll(".group-title").forEach((title) => title.onclick = () => title.parentElement.classList.toggle("collapsed"));
+      document.querySelectorAll(".group-title").forEach((title) => title.onclick = () => {
+        const group = title.parentElement;
+        group.classList.toggle("collapsed");
+        const cat = group.dataset.cat;
+        if (group.classList.contains("collapsed")) collapsedGroups.add(cat);
+        else collapsedGroups.delete(cat);
+      });
+      document.querySelectorAll(".subgroup-title").forEach((title) => title.onclick = () => {
+        const sub = title.parentElement;
+        sub.classList.toggle("collapsed");
+        const key = sub.dataset.subkey;
+        if (sub.classList.contains("collapsed")) collapsedGroups.add(key);
+        else collapsedGroups.delete(key);
+      });
       updateDeleteSelectedState();
     }
     async function openArticle(slug) {
       current = manifest.articles.find((a) => a.slug === slug);
       $("title").value = current.title || "";
       $("category").value = current.category || "ai-news";
-      $("subcategory").value = normalizeJarvisSubcategory(current.subcategory);
       syncSubcategoryVisibility();
+      $("subcategory").value = normalizeSubcategory(current.category, current.subcategory);
       $("date").value = current.date || today();
       $("slug").value = current.slug || "";
       $("summary").value = current.summary || "";
@@ -399,7 +477,6 @@ ADMIN_HTML = """<!doctype html>
       $("date").value = today();
       $("slug").value = "";
       $("summary").value = "";
-      $("subcategory").value = "product-iteration";
       syncSubcategoryVisibility();
       setEditorMode("md", "# 新笔记\\n\\n");
       $("status").textContent = "新建中";
@@ -475,7 +552,6 @@ ADMIN_HTML = """<!doctype html>
         current = null;
         $("title").value = title;
         $("category").value = "ai-news";
-        $("subcategory").value = "product-iteration";
         syncSubcategoryVisibility();
         $("date").value = today();
         $("slug").value = slugify(title);
@@ -505,8 +581,8 @@ ADMIN_HTML = """<!doctype html>
         pendingPdf = null;
         $("title").value = title;
         $("category").value = CATS.includes(meta.category) ? meta.category : 'ai-news';
-        $("subcategory").value = normalizeJarvisSubcategory(meta.subcategory);
         syncSubcategoryVisibility();
+        $("subcategory").value = normalizeSubcategory($("category").value, meta.subcategory);
         $("date").value = meta.date || today();
         $("slug").value = meta.slug ? slugify(meta.slug) : slugify(title);
         $("summary").value = meta.summary || '';
@@ -856,8 +932,17 @@ def _jarvis_subcategory(value: str) -> str:
     return value if value in JARVIS_SUBCATEGORIES else "product-iteration"
 
 
+def _thinking_subcategory(value: str) -> str:
+    return value if value in THINKING_SUBCATEGORIES else "general"
+
+
 def _article_subcategory(category: str, payload_or_meta: dict) -> str:
-    return _jarvis_subcategory(str(payload_or_meta.get("subcategory", ""))) if category == "jarvis" else ""
+    sub = str(payload_or_meta.get("subcategory", ""))
+    if category == "jarvis":
+        return _jarvis_subcategory(sub)
+    if category == "ai-thinking":
+        return _thinking_subcategory(sub)
+    return ""
 
 
 def _article_from_path(path: Path) -> dict | None:
@@ -999,7 +1084,7 @@ def _save_article(payload: dict) -> dict:
         f"date: {article['date']}",
         f"category: {category}",
     ]
-    if category == "jarvis":
+    if article.get("subcategory"):
         frontmatter_lines.append(f"subcategory: {article['subcategory']}")
     frontmatter_lines.extend([f"summary: {article['summary']}", "---", ""])
     frontmatter = "\n".join(frontmatter_lines) + "\n"
@@ -1064,7 +1149,7 @@ def _save_pdf(payload: dict) -> dict:
         f"date: {article['date']}",
         f"category: {category}",
     ]
-    if category == "jarvis":
+    if article.get("subcategory"):
         frontmatter_lines.append(f"subcategory: {article['subcategory']}")
     frontmatter_lines.extend([
         f"summary: {article['summary']}",
