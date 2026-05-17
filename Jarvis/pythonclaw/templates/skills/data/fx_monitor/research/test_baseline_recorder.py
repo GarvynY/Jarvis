@@ -58,9 +58,35 @@ def _fake_evidence_rows(_task_id: str):
             "score_source_quality": 0.95,
             "score_reason": "premium_source",
             "token_estimate": 42,
+            "confidence": 0.9,
+            "content": "fx",
+            "source_metadata_json": "{}",
+        }),
+        _Row({
+            "chunk_id": "policy-1",
+            "agent_name": "policy_signal_agent",
+            "category": "policy_signal",
+            "source": "url=https://news.google.com/x | finding_key=policy_pboc",
+            "used_in_brief": 0,
+            "composite_score": 0.67,
+            "attention_score": 0.67,
+            "score_source_quality": 0.6,
+            "score_reason": "fresh",
+            "token_estimate": 320,
+            "confidence": 0.81,
+            "content": "policy evidence",
+            "source_metadata_json": json.dumps({"source_tier": 3}),
         })
     ]
-    findings = [_Row({"finding_id": "finding-1"})]
+    findings = [
+        _Row({"finding_id": "finding-1", "chunk_ids_json": "[]"}),
+        _Row({
+            "finding_id": "finding-policy",
+            "key": "policy_pboc",
+            "chunk_ids_json": json.dumps(["policy-1"]),
+            "evidence_score": 0.81,
+        }),
+    ]
     trace = SimpleNamespace(
         selected_chunk_ids=["chunk-1"],
         section_covered=True,
@@ -107,6 +133,14 @@ def test_run_metrics_are_structured_and_private() -> None:
             privacy = json.loads(row["privacy_policy_json"])
             assert privacy["prompt_text_stored"] is False
             assert privacy["evidence_text_stored"] is False
+            quality = json.loads(row["quality_metrics_json"])
+            policy = quality["policy_candidates"][0]
+            assert policy["finding_key"] == "policy_pboc"
+            assert policy["evidence_score"] == 0.81
+            assert policy["confidence"] == 0.81
+            assert policy["composite_score"] == 0.67
+            assert policy["source_tier"] == 3
+            assert policy["valid_for_policy_reserve"] is True
         finally:
             br._load_evidence_rows = original_loader
             br._base_dir = original_base_dir
@@ -162,4 +196,3 @@ def run_all() -> None:
 
 if __name__ == "__main__":
     run_all()
-

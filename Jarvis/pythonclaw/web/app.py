@@ -1174,6 +1174,11 @@ async def _api_debug_fx_research(request: Request):
             traces,
             _evidence_store.EvidenceStore,
         )
+        trace_summary["conflict_breakdown"] = (
+            phase10.get("conflicts", {}).get("breakdown", {})
+            if isinstance(phase10, dict)
+            else {}
+        )
         followup_requests = _followup.generate_followup_requests(
             task,
             outputs,

@@ -142,7 +142,7 @@ class TestFormatBriefEvidenceTrace(unittest.TestCase):
         self.assertIn("证据追踪", text)
         self.assertIn("从 10 个证据片段中筛选出 3 个", text)
         self.assertIn("覆盖 2/2 个章节", text)
-        self.assertIn("识别出 0 组方向冲突", text)
+        self.assertIn("未发现明显方向分歧", text)
 
     def test_dedup_chunk_ids_across_sections(self):
         """Same chunk_id in two sections is counted once."""
@@ -215,7 +215,7 @@ class TestFormatBriefEvidenceTrace(unittest.TestCase):
         )
         text = _format_research_brief(brief, 1.0)
         self.assertNotIn(cid, text)
-        self.assertIn("[证据 1]", text)
+        self.assertIn("证据 1", text)
 
     def test_multiple_chunk_ids_numbered(self):
         """Multiple chunk_ids get sequential numbers across sections."""
@@ -228,8 +228,8 @@ class TestFormatBriefEvidenceTrace(unittest.TestCase):
             ],
         )
         text = _format_research_brief(brief, 1.0)
-        self.assertIn("[证据 1]", text)
-        self.assertIn("[证据 2]", text)
+        self.assertIn("证据 1", text)
+        self.assertIn("证据 2", text)
         self.assertNotIn("chunk-", text)
 
     def test_no_chunk_ids_no_replacement(self):
@@ -254,7 +254,11 @@ class TestFormatBriefEvidenceTrace(unittest.TestCase):
         )
         text = _format_research_brief(brief, 1.0)
         evidence_line = next(line for line in text.splitlines() if "证据追踪" in line)
-        self.assertIn("识别出 2 组方向冲突", evidence_line)
+        self.assertNotIn("识别出 2 组方向冲突", evidence_line)
+        self.assertNotIn("方向冲突", evidence_line)
+        self.assertIn("方向分歧主要来自", text)
+        self.assertIn("新闻事件与市场驱动方向不一致", text)
+        self.assertIn("部分政策新闻与市场价格走势不一致", text)
         self.assertNotIn("c1", evidence_line)
 
 

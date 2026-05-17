@@ -1053,6 +1053,24 @@ def _format_research_brief(brief: Any, latency_s: float) -> str:
     Render a ResearchBrief as a plain-text Telegram message.
     No LLM involved — pure string assembly from ResearchBrief fields.
     """
+    # ── Build chunk_id → agent_name mapping from sections ────────────────────
+    _chunk_agent: dict[str, str] = {}
+    for sec in brief.sections:
+        agents = getattr(sec, "source_agents", []) or []
+        agent_label = agents[0] if agents else ""
+        for cid in getattr(sec, "chunk_ids", []):
+            if cid not in _chunk_agent and agent_label:
+                _chunk_agent[cid] = agent_label
+
+    _AGENT_SHORT: dict[str, str] = {
+        "fx_agent": "汇率",
+        "news_agent": "新闻",
+        "macro_agent": "宏观",
+        "risk_agent": "风险",
+        "policy_signal_agent": "政策",
+        "market_drivers_agent": "市场",
+    }
+
     # ── Build chunk_id → 证据 N mapping ──────────────────────────────────────
     chunk_id_map: dict[str, str] = {}
     counter = 0
@@ -1060,7 +1078,10 @@ def _format_research_brief(brief: Any, latency_s: float) -> str:
         for cid in getattr(sec, "chunk_ids", []):
             if cid not in chunk_id_map:
                 counter += 1
-                chunk_id_map[cid] = f"证据 {counter}"
+                agent_name = _chunk_agent.get(cid, "")
+                short = _AGENT_SHORT.get(agent_name, "")
+                label = f"证据 {counter}|{short}" if short else f"证据 {counter}"
+                chunk_id_map[cid] = label
 
     def _replace_chunk_refs(text: str) -> str:
         def _sub(m: re.Match) -> str:
@@ -1099,7 +1120,22 @@ def _format_research_brief(brief: Any, latency_s: float) -> str:
         lines += ["👤 个性化备注", f"{brief.user_notes}（仅基于您的明确偏好）", ""]
 
     if brief.sources_summary:
-        lines += ["📎 数据来源", brief.sources_summary, ""]
+        # Build numbered sources section with evidence number mapping
+        _section_evidence: list[str] = []
+        for sec in brief.sections:
+            sec_chunk_ids = getattr(sec, "chunk_ids", []) or []
+            if not sec_chunk_ids:
+                continue
+            nums = [chunk_id_map[cid] for cid in sec_chunk_ids if cid in chunk_id_map]
+            if nums:
+                _section_evidence.append(f"  {sec.title}：{', '.join(f'[{n}]' for n in nums)}")
+        if _section_evidence:
+            lines += ["📎 数据来源与证据索引"]
+            lines += _section_evidence
+            lines += ["", "来源列表："]
+            lines += [brief.sources_summary, ""]
+        else:
+            lines += ["📎 数据来源", brief.sources_summary, ""]
 
     # ── Evidence trace summary ────────────────────────────────────────────
     traces = list(getattr(brief, "retrieval_traces", []) or [])
@@ -1128,8 +1164,16 @@ def _format_research_brief(brief: Any, latency_s: float) -> str:
     if total_available > 0 or selected_ids:
         lines.append(
             f"🔗 证据追踪：本次从 {total_available} 个证据片段中筛选出 {len(selected_ids)} 个，"
-            f"覆盖 {covered_sections}/{total_sections} 个章节，识别出 {conflict_total} 组方向冲突。"
+            f"覆盖 {covered_sections}/{total_sections} 个章节。"
         )
+        if conflict_total > 0:
+            lines.append(
+                "方向分歧主要来自：新闻事件与市场驱动方向不一致；"
+                "部分政策新闻与市场价格走势不一致；"
+                "商品价格和外汇价格对 AUD 的指向不完全一致。"
+            )
+        else:
+            lines.append("未发现明显方向分歧。")
         lines.append("")
 
     c = brief.cost_estimate

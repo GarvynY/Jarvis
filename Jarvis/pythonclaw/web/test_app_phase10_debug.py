@@ -39,6 +39,9 @@ class _Trace:
 
 class _Store:
     chunks: dict[str, Any] = {}
+    findings: dict[str, Any] = {}
+    policy_chunks: list[Any] = []
+    findings_by_chunk: dict[str, list[Any]] = {}
 
     def __enter__(self) -> "_Store":
         return self
@@ -48,6 +51,20 @@ class _Store:
 
     def get_chunk(self, chunk_id: str) -> Any:
         return self.chunks.get(chunk_id)
+
+    def get_finding(self, finding_id: str) -> Any:
+        return self.findings.get(finding_id)
+
+    def query_chunks(self, task_id: str, **kwargs: Any) -> list[Any]:
+        if kwargs.get("category") == "policy_signal":
+            return list(self.policy_chunks)
+        return []
+
+    def _findings_by_chunk_ids_all(self, chunk_ids: list[str], task_id: str) -> dict[str, list[Any]]:
+        return {
+            chunk_id: self.findings_by_chunk.get(chunk_id, [])
+            for chunk_id in chunk_ids
+        }
 
 
 def _chunk(chunk_id: str, **overrides: Any) -> Any:
@@ -76,6 +93,9 @@ def _chunk(chunk_id: str, **overrides: Any) -> Any:
 
 
 def test_phase10_debug_payload_includes_selected_score_breakdown() -> None:
+    _Store.findings = {}
+    _Store.policy_chunks = []
+    _Store.findings_by_chunk = {}
     _Store.chunks = {
         "c1": _chunk("c1"),
         "c2": _chunk(
@@ -115,6 +135,56 @@ def test_phase10_debug_payload_includes_selected_score_breakdown() -> None:
         "conflict_value": 0.1,
     }
     assert len(payload["selected_chunks"][0]["text_preview"]) == 220
+
+
+def test_phase10_debug_payload_includes_policy_candidates_and_conflict_breakdown() -> None:
+    policy_chunk = _chunk(
+        "p1",
+        agent_name="policy_signal_agent",
+        category="policy_signal",
+        source="url=https://news.google.com/policy | finding_key=policy_rba",
+        source_metadata_json='{"source_tier": 3, "domain": "news.google.com"}',
+        used_in_brief=True,
+        composite_score=0.71,
+        score_reason="baseline",
+    )
+    _Store.chunks = {"p1": policy_chunk}
+    _Store.policy_chunks = [policy_chunk]
+    _Store.findings_by_chunk = {
+        "p1": [SimpleNamespace(evidence_score=0.72)],
+    }
+    _Store.findings = {
+        "n1": SimpleNamespace(agent_name="news_agent", category="news_event"),
+        "m1": SimpleNamespace(agent_name="market_drivers_agent", category="market_driver"),
+        "pfind": SimpleNamespace(agent_name="policy_signal_agent", category="policy_signal"),
+        "fx1": SimpleNamespace(agent_name="fx_agent", category="fx_price"),
+    }
+
+    payload = build_phase10_debug_payload(
+        "task-policy",
+        [
+            _Trace(
+                selected_chunk_ids=["p1"],
+                conflict_count=2,
+                conflict_pairs=[
+                    {"finding_id_a": "n1", "finding_id_b": "m1", "rule": "shared_entity_opposite_direction"},
+                    {"finding_id_a": "pfind", "finding_id_b": "fx1", "rule": "shared_entity_opposite_direction"},
+                ],
+            )
+        ],
+        _Store,
+    )
+
+    assert payload["policy_candidates"][0]["finding_key"] == "policy_rba"
+    assert payload["policy_candidates"][0]["evidence_score"] == 0.72
+    assert payload["policy_candidates"][0]["source_tier"] == 3
+    assert payload["policy_candidates"][0]["selected"] is True
+    assert payload["policy_candidates"][0]["skip_reason"] == ""
+    breakdown = payload["conflicts"]["breakdown"]
+    assert breakdown["raw_conflict_count"] == 2
+    assert breakdown["unique_conflict_count"] == 2
+    assert breakdown["news_vs_market_driver"] == 1
+    assert breakdown["policy_vs_fx"] == 1
 
 
 def test_phase10_debug_payload_reports_store_failure() -> None:
@@ -182,6 +252,7 @@ def test_query_plan_in_debug_payload() -> None:
 def run_all() -> None:
     tests = [
         test_phase10_debug_payload_includes_selected_score_breakdown,
+        test_phase10_debug_payload_includes_policy_candidates_and_conflict_breakdown,
         test_phase10_debug_payload_reports_store_failure,
         test_query_plan_summary_returns_budget_stats,
         test_query_plan_summary_no_raw_queries,

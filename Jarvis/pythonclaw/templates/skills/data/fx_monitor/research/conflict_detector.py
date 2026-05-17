@@ -110,6 +110,14 @@ def _is_conflict_eligible(finding: EvidenceFinding) -> bool:
             return False
         if importance < 0.4:
             return False
+
+    if category == "policy_signal":
+        if evidence_score is not None and evidence_score < 0.4:
+            return False
+        evidence_basis = getattr(finding, "evidence_basis", "") or ""
+        if "(demoted:" in evidence_basis:
+            return False
+
     return True
 
 

@@ -137,6 +137,36 @@ def _round(value: Any, digits: int = 4) -> float:
         return 0.0
 
 
+def _json_load(value: Any, default: Any) -> Any:
+    if value in (None, ""):
+        return default
+    try:
+        return json.loads(value)
+    except Exception:
+        return default
+
+
+def _finding_key_from_source(source: Any) -> str:
+    text = str(source or "")
+    marker = "finding_key="
+    if marker not in text:
+        return ""
+    value = text.split(marker, 1)[1]
+    for sep in ("|", ",", ";", " "):
+        value = value.split(sep, 1)[0]
+    return value.strip()
+
+
+def _source_tier_from_metadata(raw_meta: Any) -> int:
+    meta = _json_load(raw_meta, {})
+    if not isinstance(meta, dict):
+        return 3
+    try:
+        return int(meta.get("source_tier", 3))
+    except (TypeError, ValueError):
+        return 3
+
+
 @dataclass
 class BaselineRecordResult:
     metrics_written: bool = False
@@ -298,6 +328,133 @@ def _load_evidence_rows(task_id: str) -> tuple[list[sqlite3.Row], list[sqlite3.R
         return [], [], []
 
 
+def _conflict_pair_dict(pair: Any) -> dict[str, Any]:
+    if isinstance(pair, dict):
+        return pair
+    return {
+        "finding_id_a": getattr(pair, "finding_id_a", ""),
+        "finding_id_b": getattr(pair, "finding_id_b", ""),
+        "rule": getattr(pair, "rule", ""),
+    }
+
+
+def _conflict_pair_key(pair: dict[str, Any]) -> tuple[str, str, str]:
+    ids = sorted([
+        str(pair.get("finding_id_a", "") or ""),
+        str(pair.get("finding_id_b", "") or ""),
+    ])
+    return ids[0], ids[1], str(pair.get("rule", "") or "")
+
+
+def _classify_conflict_pair(pair: dict[str, Any], finding_by_id: dict[str, sqlite3.Row]) -> str:
+    fa = finding_by_id.get(str(pair.get("finding_id_a", "") or ""))
+    fb = finding_by_id.get(str(pair.get("finding_id_b", "") or ""))
+    if fa is None or fb is None:
+        return "other"
+
+    agents = {fa["agent_name"], fb["agent_name"]}
+    cats = {fa["category"], fb["category"]}
+    has_market = "market_drivers_agent" in agents or bool(cats & {"market_driver", "commodity_trade"})
+    has_policy = "policy_signal_agent" in agents or "policy_signal" in cats
+    has_news = "news_agent" in agents or "news_event" in cats
+    has_fx = "fx_agent" in agents or "fx_price" in cats
+
+    if agents == {"news_agent"} or cats == {"news_event"}:
+        return "news_internal"
+    if has_news and has_fx:
+        return "news_vs_fx"
+    if has_news and has_market:
+        return "news_vs_market_driver"
+    if has_policy and has_fx:
+        return "policy_vs_fx"
+    if has_policy and has_market:
+        return "policy_vs_market_driver"
+    if agents == {"policy_signal_agent"} or cats == {"policy_signal"}:
+        return "policy_internal"
+    return "other"
+
+
+def _build_conflict_breakdown(traces: list[Any], findings: list[sqlite3.Row]) -> dict[str, int]:
+    buckets = {
+        "raw_conflict_count": 0,
+        "unique_conflict_count": 0,
+        "duplicate_conflict_count": 0,
+        "reportable_conflict_count": 0,
+        "news_internal": 0,
+        "news_vs_fx": 0,
+        "news_vs_market_driver": 0,
+        "policy_vs_fx": 0,
+        "policy_vs_market_driver": 0,
+        "policy_internal": 0,
+        "other": 0,
+    }
+    finding_by_id = {row["finding_id"]: row for row in findings}
+    seen: set[tuple[str, str, str]] = set()
+    for trace in traces:
+        for raw_pair in (getattr(trace, "conflict_pairs", None) or []):
+            pair = _conflict_pair_dict(raw_pair)
+            buckets["raw_conflict_count"] += 1
+            key = _conflict_pair_key(pair)
+            if key in seen:
+                buckets["duplicate_conflict_count"] += 1
+                continue
+            seen.add(key)
+            bucket = _classify_conflict_pair(pair, finding_by_id)
+            buckets[bucket] = buckets.get(bucket, 0) + 1
+    buckets["unique_conflict_count"] = len(seen)
+    buckets["reportable_conflict_count"] = len(seen)
+    return buckets
+
+
+def _build_policy_candidate_metrics(
+    chunks: list[sqlite3.Row],
+    findings: list[sqlite3.Row],
+    selected_ids: list[str],
+) -> list[dict[str, Any]]:
+    finding_by_chunk: dict[str, sqlite3.Row] = {}
+    for finding in findings:
+        for chunk_id in _json_load(finding["chunk_ids_json"], []):
+            finding_by_chunk[chunk_id] = finding
+
+    selected = set(selected_ids)
+    rows: list[dict[str, Any]] = []
+    for chunk in chunks:
+        if chunk["agent_name"] != "policy_signal_agent" or chunk["category"] != "policy_signal":
+            continue
+        finding = finding_by_chunk.get(chunk["chunk_id"])
+        evidence_score = _round(finding["evidence_score"] if finding is not None else 0.0)
+        confidence = _round(chunk["confidence"])
+        source_tier = _source_tier_from_metadata(chunk["source_metadata_json"])
+        content = str(chunk["content"] or "").lower()
+        valid = (
+            (confidence >= 0.5 or evidence_score >= 0.6)
+            and source_tier <= 3
+            and "insufficient_evidence" not in content
+        )
+        skip_reason = ""
+        if not valid:
+            if source_tier > 3:
+                skip_reason = "source_tier_gt_3"
+            elif "insufficient_evidence" in content:
+                skip_reason = "insufficient_evidence"
+            elif confidence < 0.5 and evidence_score < 0.6:
+                skip_reason = "weak_policy_signal"
+        rows.append({
+            "finding_key": (
+                finding["key"] if finding is not None else _finding_key_from_source(chunk["source"])
+            ),
+            "evidence_score": evidence_score,
+            "confidence": confidence,
+            "composite_score": _round(chunk["composite_score"]),
+            "score_reason": _safe_enum(chunk["score_reason"], max_len=160),
+            "source_tier": source_tier,
+            "valid_for_policy_reserve": valid,
+            "selected": chunk["chunk_id"] in selected,
+            "skip_reason": "" if chunk["chunk_id"] in selected else skip_reason,
+        })
+    return rows
+
+
 def build_run_metrics(
     *,
     task: Any,
@@ -378,12 +535,14 @@ def build_run_metrics(
     raw_conflict_count = sum(int(getattr(trace, "conflict_count", 0) or 0) for trace in traces)
     for trace in traces:
         for cp in (getattr(trace, "conflict_pairs", None) or []):
-            if isinstance(cp, dict):
-                dk = tuple(sorted([cp.get("finding_id_a", ""), cp.get("finding_id_b", "")])) + (cp.get("rule", ""),)
-            else:
-                dk = tuple(sorted([getattr(cp, "finding_id_a", ""), getattr(cp, "finding_id_b", "")])) + (getattr(cp, "rule", ""),)
-            _seen_conflict_keys.add(dk)
+            _seen_conflict_keys.add(_conflict_pair_key(_conflict_pair_dict(cp)))
     conflict_count = len(_seen_conflict_keys) if _seen_conflict_keys else raw_conflict_count
+    conflict_breakdown = _build_conflict_breakdown(traces, findings)
+    policy_candidate_metrics = _build_policy_candidate_metrics(
+        chunks,
+        findings,
+        selected_ids,
+    )
     boosted_ids: set[str] = set()
     for trace in traces:
         boosted_ids.update(getattr(trace, "boosted_chunk_ids", []) or [])
@@ -443,6 +602,8 @@ def build_run_metrics(
             "section_total": trace_count,
             "fallback_count": fallback_count,
             "conflict_count": conflict_count,
+            "conflict_breakdown": conflict_breakdown,
+            "policy_candidates": policy_candidate_metrics,
             "boosted_chunk_count": len(boosted_ids),
             "data_gaps_present": bool(getattr(brief, "data_gaps", "")),
         },

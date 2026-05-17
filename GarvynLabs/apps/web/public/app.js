@@ -420,7 +420,7 @@ function renderJarvis() {
       <div class="jarvis-panel">
         <span class="eyebrow">Personal AI Agent System</span>
         <h1>Jarvis</h1>
-        <p>Jarvis 是一个从人民币兑澳元汇率监控场景起步、逐步演进为隐私可控型多智能体金融研究工作流的人工智能系统，旨在支持多源信息检索、结构化证据聚合、风险识别与可审计研究简报生成。</p>
+        <p>Jarvis 是一个从人民币兑澳元汇率监控切入的隐私可控多智能体研究系统，当前聚焦汇率相关信息检索、证据聚合、风险识别与可追踪研究简报生成，并为更广泛的金融研究工作流扩展打下基础。</p>
       </div>
     </section>
     <section class="section jarvis-vision">

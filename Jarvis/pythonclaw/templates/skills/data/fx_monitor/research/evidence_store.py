@@ -562,7 +562,12 @@ class EvidenceStore:
                 source_label = self._resolve_source(
                     finding.source_ids, output.sources, source_map,
                 )
-                if finding.key:
+                if output.agent_name == "policy_signal_agent":
+                    source_label = self._compact_policy_source_label(
+                        source_label,
+                        finding_key=finding.key,
+                    )
+                elif finding.key:
                     source_label = f"{source_label} | finding_key={finding.key}" if source_label else f"finding_key={finding.key}"
                 entities = list(finding.entities) if finding.entities else (
                     list(task.focus_assets) if task.focus_assets else []
@@ -582,9 +587,16 @@ class EvidenceStore:
                 )
                 category = raw_cat.value if hasattr(raw_cat, "value") else raw_cat
                 importance = finding.importance if finding.importance > 0 else output.confidence
+                confidence = output.confidence
+                if output.agent_name == "policy_signal_agent" and finding.evidence_score is not None:
+                    confidence = max(confidence, float(finding.evidence_score))
 
                 source_meta_json = "{}"
-                if source_metadata_from_source_ref is not None:
+                # Prefer agent-provided metadata (e.g. PolicySignalAgent bucket-level)
+                _agent_meta = getattr(finding, "_source_metadata_json", None)
+                if _agent_meta and _agent_meta != "{}":
+                    source_meta_json = _agent_meta
+                elif source_metadata_from_source_ref is not None:
                     src_ref = None
                     if finding.source_ids:
                         for sid in finding.source_ids:
@@ -606,7 +618,7 @@ class EvidenceStore:
                     source=source_label or None,
                     category=category,
                     importance=importance,
-                    confidence=output.confidence,
+                    confidence=confidence,
                     entities=entities,
                     token_estimate=len(content),
                     source_metadata_json=source_meta_json,
@@ -666,6 +678,53 @@ class EvidenceStore:
         if sources:
             return _format_source(sources[0])
         return ""
+
+    @staticmethod
+    def _compact_policy_source_label(source_label: str, *, finding_key: str = "") -> str:
+        """Keep policy source provenance compact enough for chunk token limits.
+
+        PolicySignalAgent can attach up to five search hits per bucket. Joining
+        those full Google News RSS URLs into the context header made otherwise
+        valid policy chunks exceed max_chunk_tokens before scoring. We keep the
+        first traceable source plus a source_count marker; full source quality is
+        still carried by source_metadata_json.
+        """
+        raw = (source_label or "").strip()
+        source_count = len([part for part in raw.split(", ") if part.strip()]) if raw else 0
+        first = raw.split(", ", 1)[0].strip() if raw else ""
+
+        if len(first) > 520:
+            url = ""
+            title = ""
+            provider = ""
+            m_url = re.search(r"\burl=([^|,;\s]+)", first, flags=re.IGNORECASE)
+            if m_url:
+                url = m_url.group(1).strip()
+            else:
+                m_raw_url = re.search(r"https?://[^\s,;|)]+", first)
+                if m_raw_url:
+                    url = m_raw_url.group(0).rstrip("。.,;")
+            m_title = re.search(r"\btitle=([^|]+)", first, flags=re.IGNORECASE)
+            if m_title:
+                title = re.sub(r"\s+", " ", m_title.group(1)).strip()[:140]
+            m_provider = re.search(r"\bprovider=([^|,;\s]+)", first, flags=re.IGNORECASE)
+            if m_provider:
+                provider = m_provider.group(1).strip()
+            parts = []
+            if url:
+                parts.append(f"url={url}")
+            if title:
+                parts.append(f"title={title}")
+            if provider:
+                parts.append(f"provider={provider}")
+            first = " | ".join(parts) if parts else first[:520]
+
+        parts = [first] if first else []
+        if source_count > 1:
+            parts.append(f"source_count={source_count}")
+        if finding_key:
+            parts.append(f"finding_key={finding_key}")
+        return " | ".join(parts)
 
     @staticmethod
     def _build_context_content(
@@ -811,6 +870,104 @@ class EvidenceStore:
             provider = text.lower()
 
         return url_key, title_domain_key, provider
+
+    @staticmethod
+    def _source_metadata_dict(chunk: EvidenceChunk) -> dict[str, Any]:
+        try:
+            data = json.loads(chunk.source_metadata_json or "{}")
+        except (json.JSONDecodeError, TypeError):
+            data = {}
+        return data if isinstance(data, dict) else {}
+
+    @classmethod
+    def _source_tier_for_chunk(cls, chunk: EvidenceChunk) -> int:
+        meta = cls._source_metadata_dict(chunk)
+        try:
+            return int(meta.get("source_tier", 3))
+        except (TypeError, ValueError):
+            return 3
+
+    @staticmethod
+    def _finding_key_for_chunk(chunk: EvidenceChunk) -> str:
+        text = chunk.source or ""
+        m_fk = re.search(r"\bfinding_key=([^|,;\s]+)", text, flags=re.IGNORECASE)
+        if m_fk:
+            return m_fk.group(1).strip()
+        return ""
+
+    @staticmethod
+    def _is_market_driver_chunk(chunk: EvidenceChunk) -> bool:
+        return (
+            chunk.agent_name == "market_drivers_agent"
+            or chunk.category in {"market_driver", "commodity_trade"}
+        )
+
+    def _findings_by_chunk_ids_all(
+        self, chunk_ids: list[str], task_id: str,
+    ) -> dict[str, list[EvidenceFinding]]:
+        """Return all findings keyed by chunk_id, including neutral findings."""
+        results: dict[str, list[EvidenceFinding]] = {cid: [] for cid in chunk_ids}
+        if not chunk_ids:
+            return results
+        target = set(chunk_ids)
+        rows = self._conn.execute(
+            "SELECT * FROM evidence_findings WHERE task_id = ?",
+            (task_id,),
+        ).fetchall()
+        for row in rows:
+            finding = self._row_to_finding(row)
+            for chunk_id in finding.chunk_ids:
+                if chunk_id in target:
+                    results.setdefault(chunk_id, []).append(finding)
+        return results
+
+    def _policy_candidate_status(
+        self,
+        chunk: EvidenceChunk,
+        task_id: str,
+        findings_by_chunk: dict[str, list[EvidenceFinding]],
+        *,
+        max_chunk_tokens: int,
+    ) -> dict[str, Any]:
+        """Evaluate whether a policy_signal chunk is strong enough to reserve."""
+        findings = findings_by_chunk.get(chunk.chunk_id, [])
+        evidence_scores = [
+            float(f.evidence_score)
+            for f in findings
+            if f.evidence_score is not None
+        ]
+        evidence_score = max(evidence_scores) if evidence_scores else 0.0
+        source_tier = self._source_tier_for_chunk(chunk)
+        basis_text = (chunk.content or "").lower()
+        evidence_basis_insufficient = "insufficient_evidence" in basis_text
+        under_token_limit = not max_chunk_tokens or chunk.token_estimate <= max_chunk_tokens
+        has_strength = chunk.confidence >= 0.5 or evidence_score >= 0.6
+        valid = (
+            has_strength
+            and source_tier <= 3
+            and not evidence_basis_insufficient
+            and under_token_limit
+        )
+
+        skip_reason = ""
+        if valid:
+            skip_reason = ""
+        elif not under_token_limit:
+            skip_reason = "over_token_limit"
+        elif source_tier > 3:
+            skip_reason = "source_tier_gt_3"
+        elif evidence_basis_insufficient:
+            skip_reason = "insufficient_evidence"
+        elif not has_strength:
+            skip_reason = "weak_policy_signal"
+
+        return {
+            "finding_key": self._finding_key_for_chunk(chunk),
+            "evidence_score": round(evidence_score, 4),
+            "source_tier": source_tier,
+            "valid": valid,
+            "skip_reason": skip_reason,
+        }
 
     def build_context_pack(
         self,
@@ -986,6 +1143,7 @@ class EvidenceStore:
                 break
 
             t0 = time.monotonic()
+            categories = self._infer_categories(section_title)
             candidates = sec["candidates_all"]
             pre_dedup_count = sec["pre_dedup_count"]
             filter_desc_parts = sec["filter_desc_parts"]
@@ -1204,12 +1362,154 @@ class EvidenceStore:
                         seen_urls.add(url_key_rc)
                     tokens_used += rc.token_estimate
 
+            # Reserve a small policy slice inside macro sections. Policy signals
+            # share the macro section with market drivers, so validity must be
+            # explicit; weak policy evidence is not forced into the pack.
+            _POLICY_RESERVE_MAX = 2
+            policy_selected_count = sum(
+                1 for it in section_items if it.agent_name == "policy_signal_agent"
+            )
+            if categories and "policy_signal" in categories:
+                all_policy_in_section = [
+                    c for c in deduped
+                    if c.agent_name == "policy_signal_agent"
+                    and c.chunk_id not in seen_chunk_ids
+                ]
+                policy_findings_by_chunk = self._findings_by_chunk_ids_all(
+                    [c.chunk_id for c in all_policy_in_section],
+                    task.task_id,
+                )
+                policy_status_by_chunk = {
+                    c.chunk_id: self._policy_candidate_status(
+                        c,
+                        task.task_id,
+                        policy_findings_by_chunk,
+                        max_chunk_tokens=max_chunk_tokens,
+                    )
+                    for c in all_policy_in_section
+                }
+                policy_candidates = [
+                    c for c in all_policy_in_section
+                    if policy_status_by_chunk.get(c.chunk_id, {}).get("valid")
+                ]
+                for pc in all_policy_in_section:
+                    _meta = self._source_metadata_dict(pc)
+                    _status = policy_status_by_chunk.get(pc.chunk_id, {})
+                    _log.debug(
+                        "[policy_reserve] candidate: key=%s domain=%s type=%s tier=%s "
+                        "conf=%.2f evidence=%.4f composite=%.4f reason=%s "
+                        "valid=%s skip=%s",
+                        _status.get("finding_key") or pc.category, _meta.get("domain", "?"),
+                        _meta.get("source_type", "?"), _meta.get("source_tier", "?"),
+                        pc.confidence,
+                        float(_status.get("evidence_score", 0.0) or 0.0),
+                        score_map.get(pc.chunk_id, 0.0),
+                        pc.score_reason,
+                        bool(_status.get("valid")),
+                        _status.get("skip_reason", ""),
+                    )
+                remaining_slots = _POLICY_RESERVE_MAX - policy_selected_count
+                market_selected_count = sum(
+                    1 for it in section_items
+                    if (chunk := self.get_chunk(it.chunk_id)) is not None
+                    and self._is_market_driver_chunk(chunk)
+                )
+                valid_market_available = any(
+                    self._is_market_driver_chunk(c)
+                    and c.chunk_id not in seen_chunk_ids
+                    and (not max_chunk_tokens or c.token_estimate <= max_chunk_tokens)
+                    for c in deduped
+                )
+                for pc in sorted(
+                    policy_candidates,
+                    key=lambda c: score_map.get(c.chunk_id, c.importance),
+                    reverse=True,
+                )[:max(0, remaining_slots)]:
+                    if len(section_items) >= max_chunks_per_section:
+                        break
+                    slots_left = max_chunks_per_section - len(section_items)
+                    if valid_market_available and market_selected_count == 0 and slots_left <= 1:
+                        break
+                    available = token_budget - tokens_used - other_reserved_tokens
+                    if pc.token_estimate > available:
+                        continue
+                    section_tokens_used = sum(it.token_estimate for it in section_items)
+                    if section_reserve and section_tokens_used + pc.token_estimate > section_reserve:
+                        continue
+                    pc.used_in_brief = True
+                    cs = score_map.get(pc.chunk_id, pc.importance)
+                    item = ContextPackItem(
+                        chunk_id=pc.chunk_id,
+                        agent_name=pc.agent_name,
+                        text=pc.content,
+                        relevance_score=cs,
+                        token_estimate=pc.token_estimate,
+                        composite_score=pc.composite_score,
+                        attention_score=pc.attention_score,
+                    )
+                    section_items.append(item)
+                    seen_chunk_ids.add(pc.chunk_id)
+                    url_key_pc, _, _ = self._source_identity(pc.source)
+                    if url_key_pc:
+                        seen_urls.add(url_key_pc)
+                    tokens_used += pc.token_estimate
+                    policy_selected_count += 1
+
+                if (
+                    valid_market_available
+                    and market_selected_count == 0
+                    and len(section_items) < max_chunks_per_section
+                ):
+                    market_candidates = [
+                        c for c in deduped
+                        if self._is_market_driver_chunk(c)
+                        and c.chunk_id not in seen_chunk_ids
+                        and (not max_chunk_tokens or c.token_estimate <= max_chunk_tokens)
+                    ]
+                    for mc in sorted(
+                        market_candidates,
+                        key=lambda c: score_map.get(c.chunk_id, c.importance),
+                        reverse=True,
+                    ):
+                        available = token_budget - tokens_used - other_reserved_tokens
+                        if mc.token_estimate > available:
+                            continue
+                        section_tokens_used = sum(it.token_estimate for it in section_items)
+                        if section_reserve and section_tokens_used + mc.token_estimate > section_reserve:
+                            continue
+                        mc.used_in_brief = True
+                        cs = score_map.get(mc.chunk_id, mc.importance)
+                        item = ContextPackItem(
+                            chunk_id=mc.chunk_id,
+                            agent_name=mc.agent_name,
+                            text=mc.content,
+                            relevance_score=cs,
+                            token_estimate=mc.token_estimate,
+                            composite_score=mc.composite_score,
+                            attention_score=mc.attention_score,
+                        )
+                        section_items.append(item)
+                        seen_chunk_ids.add(mc.chunk_id)
+                        url_key_mc, _, _ = self._source_identity(mc.source)
+                        if url_key_mc:
+                            seen_urls.add(url_key_mc)
+                        tokens_used += mc.token_estimate
+                        market_selected_count += 1
+                        break
+
             section_tokens_used = sum(it.token_estimate for it in section_items)
             for c in deduped:
                 if len(section_items) >= max_chunks_per_section:
                     break
                 if c.chunk_id in seen_chunk_ids:
                     continue
+                # Policy chunks only enter via the reservation mechanism above;
+                # the greedy loop must not add more beyond what reservation allowed.
+                if (c.agent_name == "policy_signal_agent"
+                        and categories and "policy_signal" in categories):
+                    cur_policy = sum(1 for it in section_items if it.agent_name == "policy_signal_agent")
+                    if cur_policy >= policy_selected_count or cur_policy >= _POLICY_RESERVE_MAX:
+                        continue
                 available = token_budget - tokens_used - other_reserved_tokens
                 if c.token_estimate > available:
                     skipped_over_budget += 1

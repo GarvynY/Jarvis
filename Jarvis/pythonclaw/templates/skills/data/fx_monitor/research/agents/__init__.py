@@ -27,5 +27,6 @@ from .news_agent  import NewsAgent
 from .macro_agent import MacroAgent
 from .risk_agent  import RiskAgent
 from .market_drivers_agent import MarketDriversAgent, _ENABLE_MARKET_DRIVERS_AGENT
+from .policy_signal_agent import PolicySignalAgent, _ENABLE_POLICY_AGENT
 
-__all__ = ["FXAgent", "NewsAgent", "MacroAgent", "RiskAgent", "MarketDriversAgent"]
+__all__ = ["FXAgent", "NewsAgent", "MacroAgent", "RiskAgent", "MarketDriversAgent", "PolicySignalAgent"]

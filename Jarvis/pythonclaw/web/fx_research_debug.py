@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import re
 from typing import Any
 
 
@@ -75,6 +77,159 @@ def phase10_chunk_debug(chunk: Any) -> dict[str, Any]:
     }
 
 
+def _source_meta(chunk: Any) -> dict[str, Any]:
+    if hasattr(chunk, "source_debug_info"):
+        info = chunk.source_debug_info()
+        return info if isinstance(info, dict) else {}
+    try:
+        data = json.loads(getattr(chunk, "source_metadata_json", "") or "{}")
+    except (json.JSONDecodeError, TypeError):
+        data = {}
+    return data if isinstance(data, dict) else {}
+
+
+def _finding_key(chunk: Any) -> str:
+    text = str(getattr(chunk, "source", "") or "")
+    match = re.search(r"\bfinding_key=([^|,;\s]+)", text, flags=re.IGNORECASE)
+    return match.group(1).strip() if match else ""
+
+
+def _policy_skip_reason(chunk: Any, evidence_score: float, source_tier: int) -> str:
+    confidence = _round_score(getattr(chunk, "confidence", 0.0))
+    content = str(getattr(chunk, "content", "") or "").lower()
+    if source_tier > 3:
+        return "source_tier_gt_3"
+    if "insufficient_evidence" in content:
+        return "insufficient_evidence"
+    if confidence < 0.5 and evidence_score < 0.6:
+        return "weak_policy_signal"
+    return ""
+
+
+def _load_policy_candidates(store: Any, task_id: str, selected_ids: set[str]) -> list[dict[str, Any]]:
+    if not hasattr(store, "query_chunks"):
+        return []
+    try:
+        chunks = store.query_chunks(
+            task_id,
+            category="policy_signal",
+            agent_name="policy_signal_agent",
+            top_k=50,
+        )
+    except Exception:
+        return []
+
+    findings_by_chunk: dict[str, list[Any]] = {}
+    finder = getattr(store, "_findings_by_chunk_ids_all", None)
+    if callable(finder):
+        try:
+            findings_by_chunk = finder([getattr(c, "chunk_id", "") for c in chunks], task_id)
+        except Exception:
+            findings_by_chunk = {}
+
+    rows: list[dict[str, Any]] = []
+    for chunk in chunks:
+        chunk_id = getattr(chunk, "chunk_id", "")
+        findings = findings_by_chunk.get(chunk_id, []) if isinstance(findings_by_chunk, dict) else []
+        evidence_scores = [
+            _round_score(getattr(f, "evidence_score", 0.0))
+            for f in findings
+            if getattr(f, "evidence_score", None) is not None
+        ]
+        evidence_score = max(evidence_scores) if evidence_scores else 0.0
+        meta = _source_meta(chunk)
+        try:
+            source_tier = int(meta.get("source_tier", 3))
+        except (TypeError, ValueError):
+            source_tier = 3
+        selected = chunk_id in selected_ids
+        skip_reason = "" if selected else _policy_skip_reason(chunk, evidence_score, source_tier)
+        rows.append({
+            "chunk_id": chunk_id,
+            "finding_key": _finding_key(chunk),
+            "evidence_score": evidence_score,
+            "composite_score": _round_score(getattr(chunk, "composite_score", 0.0)),
+            "score_reason": getattr(chunk, "score_reason", "") or "",
+            "source_tier": source_tier,
+            "selected": selected,
+            "skip_reason": skip_reason,
+        })
+    return rows
+
+
+def _conflict_pair_key(pair: dict[str, Any]) -> tuple[str, str, str]:
+    a = str(pair.get("finding_id_a", "") or "")
+    b = str(pair.get("finding_id_b", "") or "")
+    rule = str(pair.get("rule", "") or "")
+    ids = sorted([a, b])
+    return ids[0], ids[1], rule
+
+
+def _classify_conflict_pair(pair: dict[str, Any], store: Any) -> str:
+    get_finding = getattr(store, "get_finding", None)
+    if not callable(get_finding):
+        return "other"
+    try:
+        fa = get_finding(pair.get("finding_id_a", ""))
+        fb = get_finding(pair.get("finding_id_b", ""))
+    except Exception:
+        return "other"
+    if fa is None or fb is None:
+        return "other"
+
+    agents = {getattr(fa, "agent_name", ""), getattr(fb, "agent_name", "")}
+    cats = {getattr(fa, "category", ""), getattr(fb, "category", "")}
+    has_market = "market_drivers_agent" in agents or bool(cats & {"market_driver", "commodity_trade"})
+    has_policy = "policy_signal_agent" in agents or "policy_signal" in cats
+    has_news = "news_agent" in agents or "news_event" in cats
+    has_fx = "fx_agent" in agents or "fx_price" in cats
+
+    if agents == {"news_agent"} or cats == {"news_event"}:
+        return "news_internal"
+    if has_news and has_fx:
+        return "news_vs_fx"
+    if has_news and has_market:
+        return "news_vs_market_driver"
+    if has_policy and has_fx:
+        return "policy_vs_fx"
+    if has_policy and has_market:
+        return "policy_vs_market_driver"
+    if agents == {"policy_signal_agent"} or cats == {"policy_signal"}:
+        return "policy_internal"
+    return "other"
+
+
+def _build_conflict_breakdown(conflict_pairs: list[dict[str, Any]], store: Any) -> dict[str, Any]:
+    buckets = {
+        "news_internal": 0,
+        "news_vs_fx": 0,
+        "news_vs_market_driver": 0,
+        "policy_vs_fx": 0,
+        "policy_vs_market_driver": 0,
+        "policy_internal": 0,
+        "other": 0,
+    }
+    seen: set[tuple[str, str, str]] = set()
+    duplicate_count = 0
+    for pair in conflict_pairs:
+        if not isinstance(pair, dict):
+            continue
+        key = _conflict_pair_key(pair)
+        if key in seen:
+            duplicate_count += 1
+            continue
+        seen.add(key)
+        bucket = _classify_conflict_pair(pair, store)
+        buckets[bucket] = buckets.get(bucket, 0) + 1
+    return {
+        "raw_conflict_count": len(conflict_pairs),
+        "unique_conflict_count": len(seen),
+        "duplicate_conflict_count": duplicate_count,
+        "reportable_conflict_count": len(seen),
+        **buckets,
+    }
+
+
 def build_phase10_debug_payload(
     task_id: str,
     traces: list[Any],
@@ -91,6 +246,8 @@ def build_phase10_debug_payload(
                 seen.add(chunk_id)
 
     selected_chunks: list[dict[str, Any]] = []
+    policy_candidates: list[dict[str, Any]] = []
+    conflict_breakdown: dict[str, Any] = {}
     unavailable_error = ""
     try:
         with evidence_store_cls() as store:
@@ -98,6 +255,16 @@ def build_phase10_debug_payload(
                 chunk = store.get_chunk(chunk_id)
                 if chunk is not None:
                     selected_chunks.append(phase10_chunk_debug(chunk))
+            policy_candidates = _load_policy_candidates(store, task_id, set(selected_ids))
+            conflict_breakdown = _build_conflict_breakdown(
+                [
+                    pair
+                    for trace in traces
+                    for pair in (getattr(trace, "conflict_pairs", []) or [])
+                    if isinstance(pair, dict)
+                ],
+                store,
+            )
     except Exception as exc:
         unavailable_error = str(exc)
 
@@ -151,7 +318,9 @@ def build_phase10_debug_payload(
             "count": sum(int(getattr(t, "conflict_count", 0) or 0) for t in traces),
             "pairs": conflict_pairs,
             "boosted_chunk_ids": sorted(boosted_ids),
+            "breakdown": conflict_breakdown,
         },
+        "policy_candidates": policy_candidates,
         "retrieval_traces": trace_rows,
         "query_plan": _get_query_plan_summary(task_id),
     }

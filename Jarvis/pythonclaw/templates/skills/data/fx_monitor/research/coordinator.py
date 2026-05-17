@@ -42,6 +42,7 @@ try:
     from .runner import LocalAsyncRunner
     from .agents import FXAgent, MacroAgent, NewsAgent, RiskAgent
     from .agents import MarketDriversAgent, _ENABLE_MARKET_DRIVERS_AGENT
+    from .agents import PolicySignalAgent, _ENABLE_POLICY_AGENT
     from .evidence_store import EvidenceStore
 except ImportError:
     from schema import (  # type: ignore[no-redef]
@@ -51,6 +52,7 @@ except ImportError:
     from runner import LocalAsyncRunner  # type: ignore[no-redef]
     from agents import FXAgent, MacroAgent, NewsAgent, RiskAgent  # type: ignore[no-redef]
     from agents import MarketDriversAgent, _ENABLE_MARKET_DRIVERS_AGENT  # type: ignore[no-redef]
+    from agents import PolicySignalAgent, _ENABLE_POLICY_AGENT  # type: ignore[no-redef]
     from evidence_store import EvidenceStore  # type: ignore[no-redef]
 
 # Module-level import so tests can patch coordinator.build_safe_user_context.
@@ -85,6 +87,9 @@ AGENT_REGISTRY: dict[str, type] = {
 
 if _ENABLE_MARKET_DRIVERS_AGENT:
     AGENT_REGISTRY["market_drivers_agent"] = MarketDriversAgent
+
+if _ENABLE_POLICY_AGENT:
+    AGENT_REGISTRY["policy_signal_agent"] = PolicySignalAgent
 
 # ── DeepSeek pricing (USD per token) ──────────────────────────────────────────
 # Official deepseek-chat pricing, USD per 1M tokens:
@@ -132,6 +137,66 @@ def _compute_cost(
         estimated_cost_usd=round(estimated_cost_usd, 6),
         total_latency_ms=total_latency_ms,
     )
+
+
+# ── Policy signal deduplication ───────────────────────────────────────────────
+
+_POLICY_DEDUP_MAP: dict[str, str] = {
+    "macro_rba": "policy_rba",
+    "macro_pboc": "policy_pboc",
+    "macro_usd": "policy_fed",
+}
+
+
+def _dedup_policy_signals(outputs: list[AgentOutput]) -> list[AgentOutput]:
+    """When PolicySignalAgent is active, demote duplicate macro_agent policy findings.
+
+    If policy_signal_agent produced a finding for the same bucket (e.g. policy_rba),
+    the corresponding macro_agent finding (macro_rba) is downgraded: importance halved,
+    direction removed. This prevents double-counting in ContextPack selection and
+    conflict detection.
+    """
+    import copy as _copy
+
+    policy_output = next((o for o in outputs if o.agent_name == "policy_signal_agent"), None)
+    if policy_output is None or policy_output.status == "error":
+        return outputs
+
+    policy_keys = {f.key for f in policy_output.findings if f.category == "policy_signal"}
+
+    result: list[AgentOutput] = []
+    for output in outputs:
+        if output.agent_name != "macro_agent":
+            result.append(output)
+            continue
+        new_findings = []
+        for f in output.findings:
+            mapped_key = _POLICY_DEDUP_MAP.get(f.key)
+            if mapped_key and mapped_key in policy_keys:
+                demoted = _copy.copy(f)
+                demoted.importance = round(f.importance * 0.5, 2)
+                demoted.direction = None
+                demoted.direction_for_aud = None
+                demoted.direction_for_cny = None
+                demoted.direction_for_pair = None
+                demoted.evidence_basis = f"(demoted: policy_signal_agent active) {f.evidence_basis}"
+                new_findings.append(demoted)
+            else:
+                new_findings.append(f)
+        output_copy = AgentOutput(
+            agent_name=output.agent_name,
+            status=output.status,
+            summary=output.summary,
+            findings=new_findings,
+            sources=output.sources,
+            confidence=output.confidence,
+            latency_ms=output.latency_ms,
+            missing_data=output.missing_data,
+            as_of=output.as_of,
+            token_usage=output.token_usage,
+        )
+        result.append(output_copy)
+    return result
 
 
 # ── Main entry point ──────────────────────────────────────────────────────────
@@ -268,6 +333,10 @@ async def run_research(
 
     # ── 7. Assemble all outputs ──────────────────────────────────────────────
     all_outputs = phase1_outputs + [risk_output]
+
+    # ── 7b. Deduplicate policy signals (policy_signal_agent > macro_agent) ───
+    if _ENABLE_POLICY_AGENT:
+        all_outputs = _dedup_policy_signals(all_outputs)
 
     # ── 8. Ingest into EvidenceStore (non-fatal) ─────────────────────────────
     try:
