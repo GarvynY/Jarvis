@@ -2,6 +2,8 @@
 
 基于 PythonClaw 框架开发的 CNY/AUD 汇率监控 AI Agent，从零到云端部署的完整流程。
 
+> 当前状态更新（2026-05-18）：Jarvis 已从早期 CNY/AUD 监控 Agent 演进为 privacy-aware multi-agent financial research system。当前项目级开发入口见 `Jarvis/DEVELOPMENT.md`，10.6H/fix2 基准见 `Jarvis/docs/phase_10_6h_summary.md`。本文档保留历史开发记录和早期部署背景。
+
 ---
 
 ## 一、需求分析
@@ -911,7 +913,27 @@ run_research(preset_name, user_id, ...)
 | `agents/test_macro_agent.py` | Tavily/RSS mock、LLM mock、全部搜索失败场景 |
 | `agents/test_risk_agent.py` | 矛盾检测、数据缺口、低置信度、过期数据检测 |
 
-### 10.12 长期迁移路径（已通过代码注释预埋）
+### 10.12 Phase 10.6H 当前补充
+
+Phase 10.6H-fix2 后，当前研究链路增加了 MarketDriversAgent 与 PolicySignalAgent 的路由平衡：
+
+- PolicySignalAgent 输出的 `policy_signal` chunk 会进入标准 EvidenceScorer，生成 `score_breakdown`、`composite_score` 和 `score_reason`。
+- policy source label 会被压缩，避免因来源 URL 过长导致 `token_estimate > max_chunk_tokens` 而在评分前被过滤。
+- 宏观 section 会为有效 policy_signal 保留至少 1 个位置，同时保留有效 market_driver / commodity_trade。
+- debug 与 baseline metrics 持久化 `policy_candidates`、conflict breakdown、retrieval traces 和 selected chunk 信息。
+- 用户报告层不直接展示 raw conflict count；raw/unique/reportable count 仅保留在 debug/baseline 中。
+
+当前主要文档：
+
+| 文档 | 用途 |
+|---|---|
+| `Jarvis/README.md` | 项目定位和当前架构概览 |
+| `Jarvis/DEVELOPMENT.md` | 当前开发、测试、部署、baseline 流程 |
+| `Jarvis/docs/README.md` | baseline 报告索引 |
+| `Jarvis/docs/phase_10_6h_summary.md` | 10.6H/fix2 总结 |
+| `Jarvis/docs/baseline_073c7ec6.md` | 当前稳定性基准 |
+
+### 10.13 长期迁移路径（已通过代码注释预埋）
 
 ```
 Phase 9（当前）      Phase 10+（未来）
